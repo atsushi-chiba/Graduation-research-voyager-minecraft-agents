@@ -10,6 +10,7 @@ import com.minecolonies.api.colony.buildings.IBuilding;
 import com.minecolonies.api.colony.ICitizenData;
 import com.minecolonies.api.entity.citizen.AbstractEntityCitizen;
 import com.minecolonies.api.inventory.InventoryCitizen;
+import com.minecolonies.api.colony.requestsystem.request.IRequest;
 import com.minecolonies.core.tileentities.TileEntityColonyBuilding;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -74,6 +75,8 @@ public class VoyagerBridge {
             httpServer.createContext("/requestBuild", this::handleRequestBuild);
             httpServer.createContext("/giveToCitizen", this::handleGiveToCitizen);
             httpServer.createContext("/giveTexturedBlock", this::handleGiveTexturedBlock);
+            httpServer.createContext("/openRequests", this::handleOpenRequests);
+            httpServer.createContext("/resolveRequest", this::handleResolveRequest);
             httpServer.createContext("/ping", VoyagerBridge::handlePing);
             httpServer.setExecutor(null);
             httpServer.start();
@@ -535,6 +538,177 @@ public class VoyagerBridge {
                 inv.extractItem(slot, take, false);
                 remaining -= take;
             }
+        }
+    }
+
+    // GET /openRequests?x=..&y=..&z=..&citizenId=3
+    // Lists what a citizen's building still needs, straight from the
+    // colony's own request system (IBuilding.getOpenRequests), instead of
+    // guessing from blueprint files. Each entry's `displayStack` is exactly
+    // what /resolveRequest would hand back if asked to fulfill it - read it
+    // to decide whether raw materials need to be gathered first.
+    private void handleOpenRequests(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+            int citizenId = Integer.parseInt(params.get("citizenId"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IColony colony = IColonyManager.getInstance().getIColony(level, pos);
+                    if (colony == null) {
+                        result.complete("ERROR: no colony at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    IBuilding building = colony.getServerBuildingManager().getBuilding(pos);
+                    if (building == null) {
+                        result.complete("ERROR: no building registered at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    java.util.Collection<IRequest<?>> requests = building.getOpenRequests(citizenId);
+                    StringBuilder sb = new StringBuilder("[");
+                    boolean first = true;
+                    for (IRequest<?> req : requests) {
+                        if (!first) sb.append(",");
+                        first = false;
+                        java.util.List<ItemStack> displayStacks = req.getDisplayStacks();
+                        ItemStack stack = displayStacks.isEmpty() ? ItemStack.EMPTY : displayStacks.get(0);
+                        boolean textured = !stack.isEmpty() && stack.getTagElement("textureData") != null;
+                        sb.append("{")
+                          .append("\"description\":\"").append(escape(req.getShortDisplayString().getString())).append("\",")
+                          .append("\"item\":\"").append(stack.isEmpty() ? "" : escape(String.valueOf(ForgeRegistries.ITEMS.getKey(stack.getItem())))).append("\",")
+                          .append("\"count\":").append(stack.getCount()).append(",")
+                          .append("\"textured\":").append(textured)
+                          .append("}");
+                    }
+                    sb.append("]");
+                    result.complete(sb.toString());
+                } catch (Exception e) {
+                    LOGGER.error("openRequests failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, outcome);
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // POST /resolveRequest?x=..&y=..&z=..&citizenId=3
+    // Fulfills the citizen's oldest open request at this building using the
+    // request system's own IBuilding.overruleNextOpenRequestOfCitizenWithStack,
+    // which is what GM/creative-resolve style overrides use internally - but
+    // rather than conjuring it for free, this is an equivalent-exchange: if
+    // the request's own display stack carries Domum Ornamentum "textureData"
+    // (a Framed decorative block), we first check the citizen is actually
+    // holding one of each named raw material and consume them; plain
+    // material requests are granted as-is (creativeresolve in the server
+    // config already does this same thing automatically, so this endpoint
+    // mainly exists for the textured-block case and as an explicit,
+    // LLM-triggerable alternative to waiting on creativeresolve's own retry
+    // timing).
+    private void handleResolveRequest(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+            int citizenId = Integer.parseInt(params.get("citizenId"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IColony colony = IColonyManager.getInstance().getIColony(level, pos);
+                    if (colony == null) {
+                        result.complete("ERROR: no colony at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    IBuilding building = colony.getServerBuildingManager().getBuilding(pos);
+                    if (building == null) {
+                        result.complete("ERROR: no building registered at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    ICitizenData citizen = colony.getCitizenManager().getCivilian(citizenId);
+                    if (citizen == null) {
+                        result.complete("ERROR: no citizen with id " + citizenId);
+                        return;
+                    }
+                    java.util.Collection<IRequest<?>> requests = building.getOpenRequests(citizenId);
+                    if (requests.isEmpty()) {
+                        result.complete("ERROR: no open requests for citizen " + citizenId + " at this building");
+                        return;
+                    }
+                    IRequest<?> req = requests.iterator().next();
+                    java.util.List<ItemStack> displayStacks = req.getDisplayStacks();
+                    if (displayStacks.isEmpty()) {
+                        result.complete("ERROR: request has no display stack to fulfill with");
+                        return;
+                    }
+                    ItemStack stack = displayStacks.get(0);
+
+                    CompoundTag textureData = stack.getTagElement("textureData");
+                    if (textureData != null) {
+                        java.util.Optional<AbstractEntityCitizen> entityOpt = citizen.getEntity();
+                        if (entityOpt.isEmpty()) {
+                            result.complete("ERROR: citizen " + citizenId + " has no live entity right now");
+                            return;
+                        }
+                        InventoryCitizen inv = entityOpt.get().getInventoryCitizen();
+                        java.util.List<Item> materials = new java.util.ArrayList<>();
+                        for (String key : textureData.getAllKeys()) {
+                            String matId = textureData.getString(key);
+                            Item matItem = ForgeRegistries.ITEMS.getValue(new ResourceLocation(matId));
+                            if (matItem == null) {
+                                result.complete("ERROR: unknown material item " + matId);
+                                return;
+                            }
+                            materials.add(matItem);
+                        }
+                        for (Item mat : materials) {
+                            if (countItem(inv, mat) < stack.getCount()) {
+                                result.complete("ERROR: not enough " + ForgeRegistries.ITEMS.getKey(mat)
+                                        + " (need " + stack.getCount() + ") to craft " + req.getShortDisplayString().getString());
+                                return;
+                            }
+                        }
+                        for (Item mat : materials) {
+                            extractItem(inv, mat, stack.getCount());
+                        }
+                    }
+
+                    boolean resolved = building.overruleNextOpenRequestOfCitizenWithStack(citizen, stack);
+                    result.complete(resolved
+                            ? "resolved request for citizen " + citizenId + ": " + req.getShortDisplayString().getString()
+                            : "ERROR: overrule returned false (request may have already been resolved)");
+                } catch (Exception e) {
+                    LOGGER.error("resolveRequest failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
         }
     }
 
