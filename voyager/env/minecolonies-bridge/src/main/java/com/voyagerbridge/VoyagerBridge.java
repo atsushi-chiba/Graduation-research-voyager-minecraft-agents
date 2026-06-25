@@ -788,13 +788,14 @@ public class VoyagerBridge {
 
         level.setBlockAndUpdate(pos, state);
 
-        FakePlayer fakePlayer = new FakePlayer(level, AI_PROFILE);
-        ItemStack stack = item != null ? new ItemStack(item, 1) : ItemStack.EMPTY;
-        // setPlacedBy is a standard Block API hook; MineColonies overrides it on
-        // its hut blocks to register the building/colony, even though we never
-        // imported its (obfuscated) class - virtual dispatch finds it at runtime.
-        block.setPlacedBy(level, pos, state, fakePlayer, stack);
-
+        // The blueprint pack/path MUST be set on the tile entity before
+        // setPlacedBy runs below - setPlacedBy is what triggers MineColonies'
+        // own building registration internally, and the registered IBuilding
+        // object caches its own copy of the blueprint path at that moment.
+        // Setting it afterwards only updates the tile entity's copy, leaving
+        // the IBuilding with a stale empty path that breaks requestUpgrade()
+        // later with a StringIndexOutOfBoundsException ("Failed to get
+        // rotation of building ... with path: ").
         String blueprintNote = "";
         BlockEntity tileEntity = level.getBlockEntity(pos);
         if (tileEntity instanceof TileEntityColonyBuilding) {
@@ -811,6 +812,13 @@ public class VoyagerBridge {
                 blueprintNote = " (no known blueprint path for type '" + typeName + "', placed without one)";
             }
         }
+
+        FakePlayer fakePlayer = new FakePlayer(level, AI_PROFILE);
+        ItemStack stack = item != null ? new ItemStack(item, 1) : ItemStack.EMPTY;
+        // setPlacedBy is a standard Block API hook; MineColonies overrides it on
+        // its hut blocks to register the building/colony, even though we never
+        // imported its (obfuscated) class - virtual dispatch finds it at runtime.
+        block.setPlacedBy(level, pos, state, fakePlayer, stack);
 
         return "placed " + blockId + " at " + x + "," + y + "," + z + blueprintNote;
     }
