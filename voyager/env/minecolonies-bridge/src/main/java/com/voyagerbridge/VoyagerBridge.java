@@ -14,6 +14,7 @@ import com.minecolonies.core.tileentities.TileEntityColonyBuilding;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -72,6 +73,7 @@ public class VoyagerBridge {
             httpServer.createContext("/status", this::handleStatus);
             httpServer.createContext("/requestBuild", this::handleRequestBuild);
             httpServer.createContext("/giveToCitizen", this::handleGiveToCitizen);
+            httpServer.createContext("/giveTexturedBlock", this::handleGiveTexturedBlock);
             httpServer.createContext("/ping", VoyagerBridge::handlePing);
             httpServer.setExecutor(null);
             httpServer.start();
@@ -372,6 +374,105 @@ public class VoyagerBridge {
                     result.complete("gave " + given + "/" + count + " of " + itemId + " to citizen " + citizenId);
                 } catch (Exception e) {
                     LOGGER.error("giveToCitizen failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // POST /giveTexturedBlock?colonyId=1&citizenId=3&block=domum_ornamentum:double_crossed&count=1
+    //      &tex1=minecraft:block/oak_planks&mat1=minecraft:stripped_spruce_wood
+    //      &tex2=minecraft:block/dark_oak_planks&mat2=minecraft:stripped_oak_wood
+    //
+    // Domum Ornamentum's "Framed"/retexturable blocks (the ones the in-game
+    // resource list shows as e.g. "Framed Stripped Oak Wood") are not plain
+    // items - each instance carries a `textureData` compound on its block
+    // entity mapping texture-path ResourceLocations (from the block's model,
+    // e.g. "minecraft:block/oak_planks") to the actual material block used
+    // for that texture slot (e.g. "minecraft:stripped_spruce_wood" for the
+    // frame, "minecraft:stripped_oak_wood" for the centre). Normally you get
+    // such an item by combining frame+centre materials at an Architect's
+    // Cutter; this endpoint constructs the equivalent ItemStack directly by
+    // attaching the same NBT under the vanilla "BlockEntityTag" key (which
+    // BlockItem automatically applies to the block entity on placement), so
+    // the builder receives an item indistinguishable from a crafted one.
+    //
+    // We recovered the exact key/value format by reading a real example
+    // straight out of a shipped .blueprint file's tile_entities list rather
+    // than guessing - Domum Ornamentum's own classes that build this at
+    // runtime (e.g. ArchitectsCutterRecipe.assemble) override a vanilla
+    // Recipe method and are SRG-named in this un-deobfuscated jar, so they
+    // can't be called by name; constructing the NBT ourselves sidesteps that.
+    private void handleGiveTexturedBlock(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.get("colonyId"));
+            int citizenId = Integer.parseInt(params.get("citizenId"));
+            String blockId = params.get("block");
+            int count = Integer.parseInt(params.getOrDefault("count", "1"));
+
+            CompoundTag textureData = new CompoundTag();
+            for (int i = 1; params.containsKey("tex" + i); i++) {
+                String tex = params.get("tex" + i);
+                String mat = params.get("mat" + i);
+                textureData.putString(tex, mat);
+            }
+            if (textureData.isEmpty()) {
+                respond(exchange, 400, "{\"error\":\"no tex1/mat1 (etc) pairs given\"}");
+                return;
+            }
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, server.overworld());
+                    if (colony == null) {
+                        result.complete("ERROR: no colony with id " + colonyId);
+                        return;
+                    }
+                    ICitizenData citizen = colony.getCitizenManager().getCivilian(citizenId);
+                    if (citizen == null) {
+                        result.complete("ERROR: no citizen with id " + citizenId);
+                        return;
+                    }
+                    java.util.Optional<AbstractEntityCitizen> entityOpt = citizen.getEntity();
+                    if (entityOpt.isEmpty()) {
+                        result.complete("ERROR: citizen " + citizenId + " has no live entity right now");
+                        return;
+                    }
+                    Item item = ForgeRegistries.ITEMS.getValue(new ResourceLocation(blockId));
+                    if (item == null) {
+                        result.complete("ERROR: unknown item id " + blockId);
+                        return;
+                    }
+
+                    ItemStack stack = new ItemStack(item, count);
+                    // Domum Ornamentum reads this via ItemStack.getTagElement("textureData")
+                    // directly - it is NOT nested under the vanilla "BlockEntityTag" key.
+                    stack.getOrCreateTag().put("textureData", textureData);
+
+                    InventoryCitizen inv = entityOpt.get().getInventoryCitizen();
+                    ItemStack remainder = stack;
+                    int slots = inv.getSlots();
+                    for (int slot = 0; slot < slots && !remainder.isEmpty(); slot++) {
+                        remainder = inv.insertItem(slot, remainder, false);
+                    }
+                    int given = count - remainder.getCount();
+                    result.complete("gave " + given + "/" + count + " of " + blockId + " (textured) to citizen " + citizenId);
+                } catch (Exception e) {
+                    LOGGER.error("giveTexturedBlock failed", e);
                     result.complete("ERROR: " + e);
                 }
             });
