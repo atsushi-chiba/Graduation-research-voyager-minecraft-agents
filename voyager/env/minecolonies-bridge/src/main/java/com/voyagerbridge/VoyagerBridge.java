@@ -394,23 +394,25 @@ public class VoyagerBridge {
     //
     // Domum Ornamentum's "Framed"/retexturable blocks (the ones the in-game
     // resource list shows as e.g. "Framed Stripped Oak Wood") are not plain
-    // items - each instance carries a `textureData` compound on its block
-    // entity mapping texture-path ResourceLocations (from the block's model,
-    // e.g. "minecraft:block/oak_planks") to the actual material block used
-    // for that texture slot (e.g. "minecraft:stripped_spruce_wood" for the
-    // frame, "minecraft:stripped_oak_wood" for the centre). Normally you get
-    // such an item by combining frame+centre materials at an Architect's
-    // Cutter; this endpoint constructs the equivalent ItemStack directly by
-    // attaching the same NBT under the vanilla "BlockEntityTag" key (which
-    // BlockItem automatically applies to the block entity on placement), so
-    // the builder receives an item indistinguishable from a crafted one.
+    // items - each instance carries a `textureData` compound directly on the
+    // ItemStack's NBT (read via ItemStack.getTagElement("textureData") - NOT
+    // nested under vanilla's "BlockEntityTag", which was our first, wrong,
+    // guess and produced a buggy item whose frame/centre randomly reassigned
+    // on every render) mapping texture-path ResourceLocations (from the
+    // block's model, e.g. "minecraft:block/oak_planks") to the actual
+    // material block used for that texture slot (e.g.
+    // "minecraft:stripped_spruce_wood" for the frame).
     //
-    // We recovered the exact key/value format by reading a real example
-    // straight out of a shipped .blueprint file's tile_entities list rather
-    // than guessing - Domum Ornamentum's own classes that build this at
-    // runtime (e.g. ArchitectsCutterRecipe.assemble) override a vanilla
-    // Recipe method and are SRG-named in this un-deobfuscated jar, so they
-    // can't be called by name; constructing the NBT ourselves sidesteps that.
+    // Rather than conjuring the finished item from nothing (which is what
+    // MineColonies' own `creativeresolve` debug option does), this endpoint
+    // requires the citizen to actually be holding one of each named material
+    // (`mat1`, `mat2`, ...) per output item, and consumes them - an "exchange"
+    // rather than a cheat. This mirrors what an Architect's Cutter recipe
+    // would consume/produce, since we can't call that recipe's own assemble()
+    // method directly (it overrides a vanilla Recipe method and is SRG-named
+    // in this un-deobfuscated jar) - we recovered the exact NBT key/value
+    // format instead by reading a real placed instance out of a shipped
+    // .blueprint file's tile_entities list.
     private void handleGiveTexturedBlock(HttpExchange exchange) throws IOException {
         if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
             respond(exchange, 405, "{\"error\":\"use POST\"}");
@@ -424,10 +426,17 @@ public class VoyagerBridge {
             int count = Integer.parseInt(params.getOrDefault("count", "1"));
 
             CompoundTag textureData = new CompoundTag();
+            java.util.List<Item> materials = new java.util.ArrayList<>();
             for (int i = 1; params.containsKey("tex" + i); i++) {
                 String tex = params.get("tex" + i);
                 String mat = params.get("mat" + i);
                 textureData.putString(tex, mat);
+                Item matItem = ForgeRegistries.ITEMS.getValue(new ResourceLocation(mat));
+                if (matItem == null) {
+                    respond(exchange, 400, "{\"error\":\"unknown material item " + escape(mat) + "\"}");
+                    return;
+                }
+                materials.add(matItem);
             }
             if (textureData.isEmpty()) {
                 respond(exchange, 400, "{\"error\":\"no tex1/mat1 (etc) pairs given\"}");
@@ -458,19 +467,33 @@ public class VoyagerBridge {
                         return;
                     }
 
+                    InventoryCitizen inv = entityOpt.get().getInventoryCitizen();
+
+                    // Check first that every material is available in the required
+                    // quantity before consuming anything, so a partial shortage never
+                    // leaves the citizen short some materials with nothing to show for it.
+                    for (Item mat : materials) {
+                        if (countItem(inv, mat) < count) {
+                            result.complete("ERROR: not enough " + ForgeRegistries.ITEMS.getKey(mat)
+                                    + " (need " + count + ")");
+                            return;
+                        }
+                    }
+                    for (Item mat : materials) {
+                        extractItem(inv, mat, count);
+                    }
+
                     ItemStack stack = new ItemStack(item, count);
-                    // Domum Ornamentum reads this via ItemStack.getTagElement("textureData")
-                    // directly - it is NOT nested under the vanilla "BlockEntityTag" key.
                     stack.getOrCreateTag().put("textureData", textureData);
 
-                    InventoryCitizen inv = entityOpt.get().getInventoryCitizen();
                     ItemStack remainder = stack;
                     int slots = inv.getSlots();
                     for (int slot = 0; slot < slots && !remainder.isEmpty(); slot++) {
                         remainder = inv.insertItem(slot, remainder, false);
                     }
                     int given = count - remainder.getCount();
-                    result.complete("gave " + given + "/" + count + " of " + blockId + " (textured) to citizen " + citizenId);
+                    result.complete("crafted " + given + "/" + count + " of " + blockId
+                            + " from " + materials.size() + " material(s) for citizen " + citizenId);
                 } catch (Exception e) {
                     LOGGER.error("giveTexturedBlock failed", e);
                     result.complete("ERROR: " + e);
@@ -484,6 +507,34 @@ public class VoyagerBridge {
             }
         } catch (Exception e) {
             respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    private static int countItem(InventoryCitizen inv, Item item) {
+        int total = 0;
+        int slots = inv.getSlots();
+        for (int slot = 0; slot < slots; slot++) {
+            ItemStack stack = inv.getStackInSlot(slot);
+            if (!stack.isEmpty() && stack.getItem() == item) {
+                total += stack.getCount();
+            }
+        }
+        return total;
+    }
+
+    // Removes up to `amount` of `item` from the inventory, stopping early once
+    // enough has been pulled. Caller must have already confirmed via countItem()
+    // that at least `amount` exists, so this should never come up short.
+    private static void extractItem(InventoryCitizen inv, Item item, int amount) {
+        int remaining = amount;
+        int slots = inv.getSlots();
+        for (int slot = 0; slot < slots && remaining > 0; slot++) {
+            ItemStack stack = inv.getStackInSlot(slot);
+            if (!stack.isEmpty() && stack.getItem() == item) {
+                int take = Math.min(remaining, stack.getCount());
+                inv.extractItem(slot, take, false);
+                remaining -= take;
+            }
         }
     }
 
