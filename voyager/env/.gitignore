@@ -2,6 +2,7 @@
 MCP-Reborn/
 run/
 *.jar
+!minecolonies-bridge/gradle/wrapper/gradle-wrapper.jar
 config.json
 
 # Byte-compiled / optimized / DLL files
