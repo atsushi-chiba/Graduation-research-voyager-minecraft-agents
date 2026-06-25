@@ -65,6 +65,7 @@ public class VoyagerBridge {
             httpServer.createContext("/place", this::handlePlace);
             httpServer.createContext("/found", this::handleFound);
             httpServer.createContext("/spawnCitizen", this::handleSpawnCitizen);
+            httpServer.createContext("/status", this::handleStatus);
             httpServer.createContext("/ping", VoyagerBridge::handlePing);
             httpServer.setExecutor(null);
             httpServer.start();
@@ -164,14 +165,9 @@ public class VoyagerBridge {
         }
         TileEntityColonyBuilding hut = (TileEntityColonyBuilding) tileEntity;
 
-        StructurePacks.ensureSelectedPack();
-        StructurePackMeta pack = StructurePacks.getSelectedPack();
+        StructurePackMeta pack = getPinnedPack();
         if (pack == null) {
-            java.util.Collection<StructurePackMeta> metas = StructurePacks.getPackMetas();
-            if (metas.isEmpty()) {
-                return "ERROR: no structure packs registered";
-            }
-            pack = metas.iterator().next();
+            return "ERROR: no structure packs registered";
         }
         hut.setStructurePack(pack);
         hut.setBlueprintPath("fundamentals/townhall1.blueprint");
@@ -225,6 +221,98 @@ public class VoyagerBridge {
         }
     }
 
+    // GET /status - lists all colonies with id/name/center/citizen count, so
+    // an LLM agent can decide what to do next without needing a game client.
+    private void handleStatus(HttpExchange exchange) throws IOException {
+        java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+        server.execute(() -> {
+            try {
+                java.util.List<IColony> colonies = IColonyManager.getInstance().getAllColonies();
+                StringBuilder sb = new StringBuilder("[");
+                for (int i = 0; i < colonies.size(); i++) {
+                    IColony c = colonies.get(i);
+                    BlockPos center = c.getCenter();
+                    if (i > 0) sb.append(",");
+                    sb.append("{")
+                      .append("\"id\":").append(c.getID()).append(",")
+                      .append("\"name\":\"").append(escape(c.getName())).append("\",")
+                      .append("\"x\":").append(center.getX()).append(",")
+                      .append("\"y\":").append(center.getY()).append(",")
+                      .append("\"z\":").append(center.getZ()).append(",")
+                      .append("\"citizens\":").append(c.getCitizenManager().getCurrentCitizenCount())
+                      .append("}");
+                }
+                sb.append("]");
+                result.complete(sb.toString());
+            } catch (Exception e) {
+                LOGGER.error("status failed", e);
+                result.complete("ERROR: " + e);
+            }
+        });
+        try {
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, outcome);
+            }
+        } catch (Exception e) {
+            respond(exchange, 500, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // type name (the part of the block id after "blockhut") -> blueprint path
+    // relative to a structure pack's root, e.g. "blockhutbuilder" ->
+    // "fundamentals/builder1.blueprint". Discovered by listing the Colonial
+    // pack's bundled blueprints inside minecolonies-*.jar; folders are not
+    // consistent (fundamentals/, craftsmanship/<sub>/, military/, etc.) so
+    // this can't be derived from a simple naming rule - it's looked up here
+    // instead of resolved dynamically, since Structurize's Blueprint class
+    // overrides a vanilla method (getBlockState) whose name only resolves
+    // correctly when the dependency jar is properly deobfuscated, which
+    // `fg.deobf(files(...))` does not actually do for plain local file refs.
+    private static final java.util.Map<String, String> BLUEPRINT_PATHS = new java.util.HashMap<>();
+    static {
+        BLUEPRINT_PATHS.put("townhall", "fundamentals/townhall1.blueprint");
+        BLUEPRINT_PATHS.put("builder", "fundamentals/builder1.blueprint");
+        BLUEPRINT_PATHS.put("citizen", "fundamentals/house1.blueprint");
+        BLUEPRINT_PATHS.put("forester", "fundamentals/forester1.blueprint");
+        BLUEPRINT_PATHS.put("hospital", "fundamentals/hospital1.blueprint");
+        BLUEPRINT_PATHS.put("tavern", "fundamentals/tavern1.blueprint");
+        BLUEPRINT_PATHS.put("warehouse", "craftsmanship/storage/warehouse1.blueprint");
+        BLUEPRINT_PATHS.put("deliveryman", "craftsmanship/storage/courier1.blueprint");
+        BLUEPRINT_PATHS.put("sawmill", "craftsmanship/carpentry/sawmill1.blueprint");
+        BLUEPRINT_PATHS.put("blacksmith", "craftsmanship/metallurgy/blacksmith1.blueprint");
+        BLUEPRINT_PATHS.put("stonemason", "craftsmanship/masonry/stonemason1.blueprint");
+        BLUEPRINT_PATHS.put("library", "education/library1.blueprint");
+        BLUEPRINT_PATHS.put("school", "education/school1.blueprint");
+        BLUEPRINT_PATHS.put("farmer", "agriculture/horticulture/farm1.blueprint");
+        BLUEPRINT_PATHS.put("fisherman", "agriculture/husbandry/fisher1.blueprint");
+        BLUEPRINT_PATHS.put("guardtower", "military/guardtower1.blueprint");
+        BLUEPRINT_PATHS.put("barracks", "military/barracks1.blueprint");
+    }
+
+    // The BLUEPRINT_PATHS table was derived specifically from the "Colonial"
+    // pack's bundled blueprints, so pin to that pack explicitly rather than
+    // trusting StructurePacks.getSelectedPack() (which is whatever pack
+    // happened to register/select first and varies across server restarts -
+    // other packs may not share the same folder layout for every building).
+    private static final String PINNED_PACK_NAME = "Colonial";
+
+    private StructurePackMeta getPinnedPack() {
+        StructurePackMeta pack = StructurePacks.getStructurePack(PINNED_PACK_NAME);
+        if (pack != null) {
+            return pack;
+        }
+        StructurePacks.ensureSelectedPack();
+        pack = StructurePacks.getSelectedPack();
+        if (pack != null) {
+            return pack;
+        }
+        java.util.Collection<StructurePackMeta> metas = StructurePacks.getPackMetas();
+        return metas.isEmpty() ? null : metas.iterator().next();
+    }
+
     private String placeOnServerThread(int x, int y, int z, String blockId) {
         ServerLevel level = server.overworld();
         ResourceLocation rl = new ResourceLocation(blockId);
@@ -245,7 +333,24 @@ public class VoyagerBridge {
         // imported its (obfuscated) class - virtual dispatch finds it at runtime.
         block.setPlacedBy(level, pos, state, fakePlayer, stack);
 
-        return "placed " + blockId + " at " + x + "," + y + "," + z;
+        String blueprintNote = "";
+        BlockEntity tileEntity = level.getBlockEntity(pos);
+        if (tileEntity instanceof TileEntityColonyBuilding) {
+            String typeName = rl.getPath().replaceFirst("^blockhut", "");
+            String path = BLUEPRINT_PATHS.get(typeName);
+            if (path != null) {
+                StructurePackMeta pack = getPinnedPack();
+                if (pack != null) {
+                    ((TileEntityColonyBuilding) tileEntity).setStructurePack(pack);
+                    ((TileEntityColonyBuilding) tileEntity).setBlueprintPath(path);
+                    blueprintNote = " (blueprint " + pack.getName() + "/" + path + ")";
+                }
+            } else {
+                blueprintNote = " (no known blueprint path for type '" + typeName + "', placed without one)";
+            }
+        }
+
+        return "placed " + blockId + " at " + x + "," + y + "," + z + blueprintNote;
     }
 
     private static java.util.Map<String, String> parseQuery(String query) {
