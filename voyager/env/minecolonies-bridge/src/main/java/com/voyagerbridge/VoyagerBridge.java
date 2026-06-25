@@ -250,8 +250,19 @@ public class VoyagerBridge {
                       .append("\"x\":").append(center.getX()).append(",")
                       .append("\"y\":").append(center.getY()).append(",")
                       .append("\"z\":").append(center.getZ()).append(",")
-                      .append("\"citizens\":").append(c.getCitizenManager().getCurrentCitizenCount())
-                      .append("}");
+                      .append("\"citizens\":[");
+                    java.util.List<ICitizenData> citizens = c.getCitizenManager().getCitizens();
+                    for (int j = 0; j < citizens.size(); j++) {
+                        ICitizenData cit = citizens.get(j);
+                        if (j > 0) sb.append(",");
+                        String jobName = cit.getJob() == null ? "unemployed" : cit.getJob().getJobRegistryEntry().getKey().getPath();
+                        sb.append("{")
+                          .append("\"id\":").append(cit.getId()).append(",")
+                          .append("\"name\":\"").append(escape(cit.getName())).append("\",")
+                          .append("\"job\":\"").append(escape(jobName)).append("\"")
+                          .append("}");
+                    }
+                    sb.append("]}");
                 }
                 sb.append("]");
                 result.complete(sb.toString());

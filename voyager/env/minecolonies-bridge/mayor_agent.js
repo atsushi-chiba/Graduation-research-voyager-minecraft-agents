@@ -17,17 +17,23 @@ const TURN_DELAY_MS = 4000;
 // spawn-protection / min-distance-from-spawn checks don't reject placement.
 const ANCHOR = { x: 10, y: -60, z: 10 };
 
-const SYSTEM_PROMPT = `You are the autonomous mayor of a Minecraft MineColonies colony. You do not see the game directly - you only get a JSON status snapshot each turn, and you act by choosing ONE action as JSON. The actual construction (turning a placed hut block into a real building) is handled automatically by the colony's own builder NPCs once it has citizens - your job is only to decide WHERE buildings go and how the colony grows, not to build anything yourself.
+const SYSTEM_PROMPT = `You are the autonomous mayor of a Minecraft MineColonies colony. You do not see the game directly - you only get a JSON status snapshot each turn, and you act by choosing ONE action as JSON. The actual construction (turning a placed hut block into a real building) is handled automatically by the colony's own builder NPCs once it has citizens - your job is to decide WHERE buildings go, how the colony grows, and to keep builders supplied when they get stuck, not to place blocks yourself.
 
 Available actions (respond with exactly one JSON object, nothing else):
-- {"action":"place","x":<int>,"y":<int>,"z":<int>,"block":"minecolonies:blockhut<type>"} - place a hut block (e.g. blockhuttownhall, blockhutwarehouse, blockhutcitizen, blockhutbuilder, blockhutforester). Pick coordinates near the anchor (${ANCHOR.x},${ANCHOR.y},${ANCHOR.z}) but not overlapping existing buildings (leave a few blocks of gap).
+- {"action":"place","x":<int>,"y":<int>,"z":<int>,"block":"minecolonies:blockhut<type>"} - place a hut block (e.g. blockhuttownhall, blockhutwarehouse, blockhutcitizen, blockhutbuilder, blockhutforester, blockhutsawmill). Pick coordinates near the anchor (${ANCHOR.x},${ANCHOR.y},${ANCHOR.z}) but not overlapping existing buildings (leave a few blocks of gap). Remember the coordinates you used - you'll need them again for requestBuild/openRequests/resolveRequest on that same building.
 - {"action":"found","x":<int>,"y":<int>,"z":<int>,"name":"<colony name>"} - found a colony on a town hall hut block you already placed at that exact position.
+- {"action":"spawnCitizen","colonyId":<int>} - grow the colony's population by one.
+- {"action":"requestBuild","x":<int>,"y":<int>,"z":<int>} - queue the actual construction work order for a hut block you placed. Placing a block alone does NOT start construction - you must call this once per building, otherwise builders never touch it. A Builder's Hut can only take on work orders up to its own current level, so build/level up the Builder's Hut itself before queuing others.
+- {"action":"openRequests","x":<int>,"y":<int>,"z":<int>,"citizenId":<int>} - check what a citizen working at that building still needs (material name + whether it's a crafted "textured" decorative block). Most plain material requests resolve automatically; use this when a builder seems stuck.
+- {"action":"resolveRequest","x":<int>,"y":<int>,"z":<int>,"citizenId":<int>} - fulfill that citizen's oldest open request at that building. For decorative "textured" blocks the citizen must already be holding the raw materials (see giveToCitizen) or this fails.
+- {"action":"giveToCitizen","colonyId":<int>,"citizenId":<int>,"item":"minecraft:<item_id>","count":<int>} - hand raw materials/tools directly to a citizen (use stone/wood tier tools for low-level workers, never iron+ - they can't use it).
 - {"action":"spawnCitizen","colonyId":<int>} - grow the colony's population by one.
 - {"action":"wait"} - do nothing this turn (e.g. while waiting for the colony to develop).
 
 Rules:
 - You must found a colony (place a town hall + found) before placing any other building or spawning citizens.
 - Only one town hall/colony is needed for this whole run.
+- After placing any building, call requestBuild on it - otherwise it sits there forever unbuilt.
 - Vary the hut types you place once the colony exists, to build out a small village.
 - Respond with ONLY the JSON object, no explanation, no markdown fences.`;
 
@@ -104,6 +110,22 @@ async function runAction(action) {
     }
     case "spawnCitizen": {
       const path = `/spawnCitizen?colonyId=${action.colonyId}`;
+      return httpRequest("POST", path);
+    }
+    case "requestBuild": {
+      const path = `/requestBuild?x=${action.x}&y=${action.y}&z=${action.z}`;
+      return httpRequest("POST", path);
+    }
+    case "openRequests": {
+      const path = `/openRequests?x=${action.x}&y=${action.y}&z=${action.z}&citizenId=${action.citizenId}`;
+      return httpRequest("GET", path);
+    }
+    case "resolveRequest": {
+      const path = `/resolveRequest?x=${action.x}&y=${action.y}&z=${action.z}&citizenId=${action.citizenId}`;
+      return httpRequest("POST", path);
+    }
+    case "giveToCitizen": {
+      const path = `/giveToCitizen?colonyId=${action.colonyId}&citizenId=${action.citizenId}&item=${encodeURIComponent(action.item)}&count=${action.count}`;
       return httpRequest("POST", path);
     }
     case "wait":
