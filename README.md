@@ -37,6 +37,126 @@ solve novel tasks from scratch, while other techniques struggle to generalize.
 
 In this repo, we provide Voyager code. This codebase is under [MIT License](LICENSE).
 
+---
+
+# 卒業研究: マルチエージェントMinecraftデモ(このフォーク独自の内容)
+
+このフォークは本家Voyagerに、**複数のLLMエージェントが日本語で会話しながら協力/対立してMinecraft内のタスクをこなすデモ**を追加したものです。本家のAzureログイン/単一エージェント学習ループとは別に、`voyager/env/mineflayer/` 配下に独立したNode.jsスクリプト群があり、こちらが今回の研究で実際に動かしている実装です。
+
+詳しい設計(プロンプトの場所、LLMコードの実行方法など)は [`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md) を、これまでの作業履歴は [`WORK_LOG_2026-06-24.md`](WORK_LOG_2026-06-24.md) を参照してください。
+
+## 必要なもの
+
+- Node.js ≥ 16(本家と同じ)
+- Minecraft Java版サーバー本体(`server.jar`)。バニラ/Paperどちらでも可。今回の検証は **1.19** で実施
+- [OpenRouter](https://openrouter.ai/) のAPIキー(本家はOpenAI直叩きですが、このフォークはOpenRouter経由でLLMを呼ぶように改造済み。`voyager/agents/*.py` 内で `os.environ["OPENROUTER_API_KEY"]` を参照)
+
+## セットアップ手順
+
+### 1. リポジトリをclone
+
+```bash
+git clone git@github.com:atsushi-chiba/Graduation-research-voyager-minecraft-agents.git
+cd Graduation-research-voyager-minecraft-agents
+```
+
+### 2. Node.js依存をインストール
+
+```bash
+cd voyager/env/mineflayer
+npm install
+cd mineflayer-collectblock
+npx tsc
+cd ..
+```
+
+### 3. Minecraftサーバーを用意する
+
+公式サイトから `server.jar` を入手し、適当なディレクトリ(例: `~/mc-server/`)に置く。
+
+```bash
+mkdir -p ~/mc-server && cd ~/mc-server
+# server.jar をここに配置
+echo "eula=true" > eula.txt
+```
+
+`server.properties` に以下を設定(オフラインで複数のbotユーザー名を自由に使えるようにするため、また検証を地形に左右されないようにするため):
+
+```properties
+online-mode=false
+level-type=minecraft\:flat
+gamemode=survival
+difficulty=peaceful
+spawn-protection=16
+```
+
+> **注意**: `spawn-protection`範囲内(ワールド原点付近)ではOP権限のないbotのブロック設置・チェスト操作がサーバー側で無視されます。建設地やチェストは原点から十分離した場所に置いてください(過去に発生したバグ、詳細は`WORK_LOG_2026-06-24.md`参照)。
+
+サーバーを起動:
+
+```bash
+java -Xmx2G -Xms1G -jar server.jar --nogui
+```
+
+バックグラウンドで動かしつつ後からコンソールコマンド(`/tp`など)を送りたい場合は、named pipeを使うと便利:
+
+```bash
+mkfifo cmd_pipe
+java -Xmx2G -Xms1G -jar server.jar --nogui < cmd_pipe &
+echo "say hello" > cmd_pipe   # 以後はこれでコンソールコマンドを送れる
+```
+
+### 4. 環境変数を設定
+
+```bash
+export OPENROUTER_API_KEY="sk-or-..."
+```
+
+`village.js`・`house_build.js`を使う場合は、建設地の座標も指定できます(`village.js`は必須、`house_build.js`は省略するとbotの現在地が自動でアンカーになる):
+
+```bash
+export ANCHOR_X=200
+export ANCHOR_Y=64
+export ANCHOR_Z=200
+# village.js のみ追加で必要(共有チェストの座標)
+export CHEST_X=205
+export CHEST_Y=64
+export CHEST_Z=205
+```
+
+### 5. スクリプトを実行
+
+```bash
+cd voyager/env/mineflayer
+node village.js          # 4人で村づくり(木こり×2、建築家×2)
+node house_build.js      # 2人で家を建てる
+node lumber_team.js      # 2人で木材1スタック収集
+node pvp_duel.js         # 2人でPvPデュエル
+node chat_companion.js   # 人間と日本語で会話する単体コンパニオン
+```
+
+実行するとbotがMinecraftサーバーに参加するので、サーバーと同じワールドにMinecraftクライアントでログインして観戦できます(`online-mode=false`なら任意のユーザー名でログイン可)。各スクリプトのログは同名の`.log`ファイル(`village.log`など)に出力されます。
+
+## ファイル一覧
+
+| ファイル | 内容 |
+|---|---|
+| `chat_companion.js` | 人間と日本語で会話しつつ任意の行動を取れる単体コンパニオンボット |
+| `lumber_team.js` | 2体協力で木材1スタック収集 |
+| `pvp_duel.js` | 2体のPvP決闘 |
+| `house_build.js` | 2体で家を建てる |
+| `village.js` | 4体(木こり×2、建築家×2)で分業して村(家)を建てる |
+
+## Claude Codeで作業を引き継ぐ場合
+
+このリポジトリをcloneしたらまず以下をClaudeに伝えると、すぐに文脈を把握できます。
+
+> `/root/Voyager/IMPLEMENTATION_NOTES.md` と `/root/Voyager/WORK_LOG_2026-06-24.md` を読んで、実装内容と経緯を把握して
+
+その後、「次は農業(farming)エージェントをやりたい」のように残課題(`WORK_LOG_2026-06-24.md`末尾の「残課題」参照)から続きを指示すれば作業を再開できます。
+
+---
+
 # Installation
 Voyager requires Python ≥ 3.9 and Node.js ≥ 16.13.0. We have tested on Ubuntu 20.04, Windows 11, and macOS. You need to follow the instructions below to install Voyager.
 
