@@ -6,6 +6,10 @@ import com.mojang.authlib.GameProfile;
 import com.mojang.logging.LogUtils;
 import com.minecolonies.api.colony.IColony;
 import com.minecolonies.api.colony.IColonyManager;
+import com.minecolonies.api.colony.buildings.IBuilding;
+import com.minecolonies.api.colony.ICitizenData;
+import com.minecolonies.api.entity.citizen.AbstractEntityCitizen;
+import com.minecolonies.api.inventory.InventoryCitizen;
 import com.minecolonies.core.tileentities.TileEntityColonyBuilding;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -66,6 +70,8 @@ public class VoyagerBridge {
             httpServer.createContext("/found", this::handleFound);
             httpServer.createContext("/spawnCitizen", this::handleSpawnCitizen);
             httpServer.createContext("/status", this::handleStatus);
+            httpServer.createContext("/requestBuild", this::handleRequestBuild);
+            httpServer.createContext("/giveToCitizen", this::handleGiveToCitizen);
             httpServer.createContext("/ping", VoyagerBridge::handlePing);
             httpServer.setExecutor(null);
             httpServer.start();
@@ -258,6 +264,125 @@ public class VoyagerBridge {
             }
         } catch (Exception e) {
             respond(exchange, 500, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // POST /requestBuild?x=..&y=..&z=..
+    // Queues a work order for the building at this position, mirroring
+    // BuildRequestMessage (the network message the in-game "Build" button
+    // sends). Placing a hut block alone never creates a work order - that's
+    // a separate, deliberate step in the GUI, so the colony's builders sit
+    // idle forever without this.
+    private void handleRequestBuild(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IColony colony = IColonyManager.getInstance().getIColony(level, pos);
+                    if (colony == null) {
+                        result.complete("ERROR: no colony at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    IBuilding building = colony.getServerBuildingManager().getBuilding(pos);
+                    if (building == null) {
+                        result.complete("ERROR: no building registered at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    if (building.isPendingConstruction()) {
+                        result.complete("already has a pending work order");
+                        return;
+                    }
+                    Player fakePlayer = new FakePlayer(level, AI_PROFILE);
+                    building.requestUpgrade(fakePlayer, pos);
+                    result.complete("requested build for building at " + x + "," + y + "," + z);
+                } catch (Exception e) {
+                    LOGGER.error("requestBuild failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // POST /giveToCitizen?colonyId=1&citizenId=3&item=minecraft:oak_log&count=80
+    // Inserts items directly into a citizen's personal inventory. Used as a
+    // workaround while the colony's Warehouse is still level 0 (and so isn't
+    // a functioning storage building yet) - the builder can use materials
+    // it's personally carrying even before any warehouse exists.
+    private void handleGiveToCitizen(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.get("colonyId"));
+            int citizenId = Integer.parseInt(params.get("citizenId"));
+            String itemId = params.get("item");
+            int count = Integer.parseInt(params.getOrDefault("count", "1"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, server.overworld());
+                    if (colony == null) {
+                        result.complete("ERROR: no colony with id " + colonyId);
+                        return;
+                    }
+                    ICitizenData citizen = colony.getCitizenManager().getCivilian(citizenId);
+                    if (citizen == null) {
+                        result.complete("ERROR: no citizen with id " + citizenId);
+                        return;
+                    }
+                    java.util.Optional<AbstractEntityCitizen> entityOpt = citizen.getEntity();
+                    if (entityOpt.isEmpty()) {
+                        result.complete("ERROR: citizen " + citizenId + " has no live entity right now");
+                        return;
+                    }
+                    Item item = ForgeRegistries.ITEMS.getValue(new ResourceLocation(itemId));
+                    if (item == null) {
+                        result.complete("ERROR: unknown item id " + itemId);
+                        return;
+                    }
+                    InventoryCitizen inv = entityOpt.get().getInventoryCitizen();
+                    ItemStack remainder = new ItemStack(item, count);
+                    int slots = inv.getSlots();
+                    for (int slot = 0; slot < slots && !remainder.isEmpty(); slot++) {
+                        remainder = inv.insertItem(slot, remainder, false);
+                    }
+                    int given = count - remainder.getCount();
+                    result.complete("gave " + given + "/" + count + " of " + itemId + " to citizen " + citizenId);
+                } catch (Exception e) {
+                    LOGGER.error("giveToCitizen failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
         }
     }
 
