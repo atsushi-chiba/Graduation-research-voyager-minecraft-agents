@@ -1,3 +1,5 @@
+import os
+
 from voyager.prompts import load_prompt
 from voyager.utils.json_utils import fix_and_parse_json
 from langchain.chat_models import ChatOpenAI
@@ -16,6 +18,8 @@ class CriticAgent:
             model_name=model_name,
             temperature=temperature,
             request_timeout=request_timout,
+            openai_api_key=os.environ["OPENROUTER_API_KEY"],
+            openai_api_base="https://openrouter.ai/api/v1",
         )
         assert mode in ["auto", "manual"]
         self.mode = mode
@@ -27,6 +31,7 @@ class CriticAgent:
     def render_human_message(self, *, events, task, context, chest_observation):
         assert events[-1][0] == "observe", "Last event must be observe"
         biome = events[-1][1]["status"]["biome"]
+        
         time_of_day = events[-1][1]["status"]["timeOfDay"]
         voxels = events[-1][1]["voxels"]
         health = events[-1][1]["status"]["health"]

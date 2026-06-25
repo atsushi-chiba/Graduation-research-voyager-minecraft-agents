@@ -1,3 +1,4 @@
+import os
 import re
 import time
 
@@ -35,6 +36,8 @@ class ActionAgent:
             model_name=model_name,
             temperature=temperature,
             request_timeout=request_timout,
+            openai_api_key=os.environ["OPENROUTER_API_KEY"],
+            openai_api_base="https://openrouter.ai/api/v1",
         )
 
     def update_chest_memory(self, chests):

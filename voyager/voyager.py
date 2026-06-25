@@ -111,8 +111,9 @@ class Voyager:
         self.reset_placed_if_failed = reset_placed_if_failed
         self.max_iterations = max_iterations
 
-        # set openai api key
-        os.environ["OPENAI_API_KEY"] = openai_api_key
+        # set openai api key (only needed if using OpenAI directly, e.g. not via OpenRouter)
+        if openai_api_key:
+            os.environ["OPENAI_API_KEY"] = openai_api_key
 
         # init agents
         self.action_agent = ActionAgent(
