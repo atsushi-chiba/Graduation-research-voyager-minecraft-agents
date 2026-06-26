@@ -271,6 +271,18 @@ public class VoyagerBridge {
                           .append("\"pending\":").append(bld.isPendingConstruction())
                           .append("}");
                     }
+                    // Research-unlocked buildings: which research-gated building types
+                    // have had their unlock-research completed in this colony.
+                    sb.append("],\"researchUnlocked\":[");
+                    boolean firstR = true;
+                    for (String bType : RESEARCH_GATED_BUILDINGS) {
+                        ResourceLocation eff = new ResourceLocation("minecolonies", "effects/" + bType);
+                        if (c.getResearchManager().getResearchEffects().getEffectStrength(eff) > 0) {
+                            if (!firstR) sb.append(",");
+                            sb.append("\"").append(bType).append("\"");
+                            firstR = false;
+                        }
+                    }
                     sb.append("],\"citizens\":[");
                     java.util.List<ICitizenData> citizens = c.getCitizenManager().getCitizens();
                     for (int j = 0; j < citizens.size(); j++) {
@@ -340,24 +352,50 @@ public class VoyagerBridge {
                         result.complete("already has a pending work order");
                         return;
                     }
-                    // Gate: a Builder's Hut must be at level >= 1 before any
-                    // non-builder building can be queued, because level-0 builders
-                    // can only execute their own hut's upgrade (0→1). Queueing other
-                    // work orders when all builders are level 0 silently fails - the
-                    // work order sits unassigned forever and shows 0/0 steps in the UI.
                     Block targetBlock = level.getBlockState(pos).getBlock();
                     ResourceLocation targetKey = ForgeRegistries.BLOCKS.getKey(targetBlock);
                     boolean isBuilderHut = targetKey != null && "blockhutbuilder".equals(targetKey.getPath());
+
+                    // Research gate: some buildings require university research before
+                    // they can be built. The effect ID follows the naming convention
+                    // minecolonies:effects/<block_registry_path> (verified from JAR:
+                    // effects/blockhutsawmill.json, effects/blockhutflorist.json, etc.).
+                    // getResearchEffectIdFrom(Block) is unreliable server-side (returns
+                    // null before research is done), so we use a static list of
+                    // research-gated buildings derived from the JAR's effects/ directory,
+                    // and check effect strength directly via the constructed effect ID.
+                    if (!isBuilderHut && targetKey != null
+                            && RESEARCH_GATED_BUILDINGS.contains(targetKey.getPath())) {
+                        ResourceLocation effectId = new ResourceLocation("minecolonies",
+                                "effects/" + targetKey.getPath());
+                        double strength = colony.getResearchManager().getResearchEffects()
+                                .getEffectStrength(effectId);
+                        if (strength <= 0) {
+                            result.complete("ERROR: " + targetKey.getPath()
+                                + " requires university research (effect: " + effectId
+                                + "); complete that research at the University first");
+                            return;
+                        }
+                    }
+
+                    // Builder level gate: upgrading a building from level N to N+1
+                    // requires a Builder's Hut at level >= N+1. Level-0 builders can
+                    // only build their own hut (exempted above). Queueing a work order
+                    // no builder can execute leaves it stuck at 0/0 steps in the UI.
                     if (!isBuilderHut) {
+                        int targetLevel = building.getBuildingLevel();          // current level
+                        int requiredBuilderLevel = targetLevel + 1;             // need this to upgrade
                         boolean hasCapableBuilder = colony.getServerBuildingManager().getBuildings().values().stream()
                             .anyMatch(bld -> {
                                 ResourceLocation bldKey = ForgeRegistries.BLOCKS.getKey(
                                     level.getBlockState(bld.getPosition()).getBlock());
                                 return bldKey != null && "blockhutbuilder".equals(bldKey.getPath())
-                                    && bld.getBuildingLevel() >= 1;
+                                    && bld.getBuildingLevel() >= requiredBuilderLevel;
                             });
                         if (!hasCapableBuilder) {
-                            result.complete("ERROR: no Builder's Hut at level 1+ yet; build Builder's Huts first before requesting other buildings");
+                            result.complete("ERROR: upgrading this building (level " + targetLevel + "→" + (targetLevel + 1)
+                                + ") needs a Builder's Hut at level " + requiredBuilderLevel
+                                + "; upgrade a Builder's Hut first");
                             return;
                         }
                     }
@@ -764,6 +802,23 @@ public class VoyagerBridge {
             respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
         }
     }
+
+    // Buildings that require university research before they can be built.
+    // Derived from data/minecolonies/researches/effects/blockhu*.json entries
+    // in minecolonies-*.jar. Effect IDs follow the pattern
+    // minecolonies:effects/<block_registry_path>; effect strength > 0 = unlocked.
+    private static final java.util.Set<String> RESEARCH_GATED_BUILDINGS =
+        java.util.Set.of(
+            "blockhutalchemist", "blockhutarchery", "blockhutbarracks",
+            "blockhutblacksmith", "blockhutcombatacademy", "blockhutcomposter",
+            "blockhutconcretemixer", "blockhutcrusher", "blockhutdyer",
+            "blockhutenchanter", "blockhutfletcher", "blockhutflorist",
+            "blockhutglassblower", "blockhutgraveyard", "blockhuthospital",
+            "blockhutlibrary", "blockhutmechanic", "blockhutmysticalsite",
+            "blockhutnetherworker", "blockhutplantation", "blockhutsawmill",
+            "blockhutschool", "blockhutsifter", "blockhutsmeltery",
+            "blockhutstonemason", "blockhutstonesmeltery"
+        );
 
     // type name (the part of the block id after "blockhut") -> blueprint path
     // relative to a structure pack's root, e.g. "blockhutbuilder" ->
