@@ -16,13 +16,17 @@ const http = require("http");
 const fs = require("fs");
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const MODEL = "openai/gpt-5";
+// A fast/cheap model matters a lot more here than raw reasoning quality -
+// the real-time game (no /tick speedup available on vanilla 1.20.1) sets
+// the pace either way, so a slow model just means the chat lags behind
+// what's actually happening rather than the colony progressing faster.
+const MODEL = "anthropic/claude-haiku-4.5";
 const BRIDGE_HOST = "localhost";
 const BRIDGE_PORT = 8089;
 const CMD_PIPE = "/root/mc-server-forge/cmd_pipe";
 const COLONY_ID = 1;
 const MAX_CYCLES = 30;
-const TURN_DELAY_MS = 4000;
+const TURN_DELAY_MS = 2000;
 
 const ANCHOR = { x: 10, y: -60, z: 10 };
 
@@ -139,7 +143,13 @@ actionの種類:
 - 置いたら必ずrequestBuildを呼ぶ(呼ばないと永遠に着工しない)。
 - 道具は石/木製のみ(鉄以上は低レベル市民が使えない)。
 - 他の統治者の直前の発言や行動を踏まえて、被らないように調整すること。
-- アンカー座標(${ANCHOR.x},${ANCHOR.y},${ANCHOR.z})付近に建てる。`;
+- アンカー座標(${ANCHOR.x},${ANCHOR.y},${ANCHOR.z})付近に建てる。
+
+重要な仕組み(必ず守ること):
+- 「Builder」の職業を持つ市民は、それぞれ自分専用のBuilder's Hut(blockhutbuilder)が無いと一切働けない。1つのBuilder's Hutに対して実際に作業できる建築家は1人だけ。
+- つまりBuilder職の市民がN人いるなら、blockhutbuilderもN棟必要(各自のレベルが低いうちは、それぞれが受けられる工事もレベル1までに限られる)。
+- 同時に複数の建物を並行して建てたいなら、まずBuilder's Huts を複数棟 置いてrequestBuildし、手の空いている建築家(citizens配列のjob:"builder"で、実際に動いていなさそうな人)に割り当たるようにすること。
+- Builder's Hut自体が無い/全員埋まっている状態で他の建物にrequestBuildしても、誰も着工できず止まったままになる。状況確認のため、定期的にopenRequestsで進捗を確認すること。`;
 }
 
 async function governorTurn(gov, history, status) {
