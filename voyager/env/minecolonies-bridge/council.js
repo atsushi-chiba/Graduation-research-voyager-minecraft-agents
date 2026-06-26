@@ -14,6 +14,23 @@
 const https = require("https");
 const http = require("http");
 const fs = require("fs");
+const path = require("path");
+
+// Load building registry once at startup and pre-render as a compact table
+// so every governor's system prompt has the exact block IDs and blueprint
+// paths without guessing.
+const BUILDING_REGISTRY = JSON.parse(
+  fs.readFileSync(path.join(__dirname, "building_registry.json"), "utf8")
+);
+function buildingTable() {
+  const rows = Object.entries(BUILDING_REGISTRY)
+    .filter(([, v]) => v.blueprint !== null)
+    .map(([key, v]) => `${v.block}|${v.blueprint}|${v.job}|${v.role}`);
+  return (
+    "block_id|blueprint_path(Colonial)|職業名|役割\n" +
+    rows.join("\n")
+  );
+}
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 // A fast/cheap model matters a lot more here than raw reasoning quality -
@@ -130,13 +147,16 @@ function buildGovernorSystemPrompt(gov) {
 {"say":"<日本語で一言、40文字以内、他の統治者への発言や状況へのコメント>","action":{"action":"<action名>", ...パラメータ}}
 
 actionの種類:
-- {"action":"place","x":<int>,"y":<int>,"z":<int>,"block":"minecolonies:blockhut<type>"}
+- {"action":"place","x":<int>,"y":<int>,"z":<int>,"block":"<block_id>"} ← 下の対応表のblock_idをそのまま使うこと
 - {"action":"found","x":<int>,"y":<int>,"z":<int>,"name":"<colony name>"}
 - {"action":"spawnCitizen","colonyId":${COLONY_ID}}
 - {"action":"requestBuild","x":<int>,"y":<int>,"z":<int>}
 - {"action":"giveToCitizen","colonyId":${COLONY_ID},"citizenId":<int>,"item":"minecraft:<item_id>","count":<int>}
 - {"action":"resolveRequest","x":<int>,"y":<int>,"z":<int>,"citizenId":<int>}
 - {"action":"wait"}
+
+建物対応表(Colonialパック・block_idとblueprintパスの正確な一覧。これ以外のblock_idは存在しないので使わないこと):
+${buildingTable()}
 
 ルール:
 - 最初にtown hallを置いてfoundするまで他のactionは無効。
@@ -219,13 +239,31 @@ async function runGovernorAction(action) {
 
 // ---------- Citizen voice ----------
 
-const CITIZEN_VOICE_PROMPT = `あなたはMinecraft MineColoniesの植民地に住む市民です。与えられた自分の本当の状態(職業・座標・必要な資材など)に基づいて、その状況に合った短い日本語のセリフを一言だけ生成してください。
+// Build job descriptions once: schematic_name -> English description from lang file
+function jobDescriptions() {
+  return Object.entries(BUILDING_REGISTRY)
+    .filter(([, v]) => v.desc_en)
+    .map(([key, v]) => `${v.job}(${key}): ${v.desc_en.slice(0, 120)}`)
+    .join("\n");
+}
+
+const CITIZEN_VOICE_PROMPT = `あなたはMinecraft MineColoniesの植民地に住む市民です。与えられた自分の本当の状態(職業・必要な資材など)に基づいて、その状況に合った短い日本語のセリフを一言だけ生成してください。
 - 40文字以内、セリフのみ(説明や記号は不要)
-- 無職なら不安や期待を、Builderで資材待ちなら愚痛や催促を、というように状況に合わせること
-- 同じようなセリフを繰り返さない`;
+- 職業の仕事内容を踏まえたリアルな発言にすること(例: 木こりなら「また大木を切り倒すぞ」、農夫なら「今日の収穫は良さそうだ」)
+- 無職なら不安や期待を、Builderで資材待ちなら愚痴や催促を
+- 同じようなセリフを繰り返さない
+
+職業の説明(参考):
+${jobDescriptions()}`;
 
 async function citizenVoiceTurn(citizen, building) {
   let context = `名前: ${citizen.name}, 職業: ${citizen.job}`;
+  // Look up English job description for richer context
+  const jobEntry = Object.values(BUILDING_REGISTRY).find((v) => {
+    const key = Object.entries(BUILDING_REGISTRY).find(([, vv]) => vv === v)?.[0];
+    return citizen.job && (key === citizen.job || v.job === citizen.job);
+  });
+  if (jobEntry?.desc_en) context += `, 仕事内容: ${jobEntry.desc_en.slice(0, 100)}`;
   if (building) {
     const requests = await getOpenRequests(building.x, building.y, building.z, citizen.id);
     if (requests.length > 0) {
