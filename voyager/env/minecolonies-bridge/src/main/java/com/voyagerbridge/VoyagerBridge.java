@@ -238,6 +238,7 @@ public class VoyagerBridge {
         java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
         server.execute(() -> {
             try {
+                ServerLevel level = server.overworld();
                 java.util.List<IColony> colonies = IColonyManager.getInstance().getAllColonies();
                 StringBuilder sb = new StringBuilder("[");
                 for (int i = 0; i < colonies.size(); i++) {
@@ -250,7 +251,27 @@ public class VoyagerBridge {
                       .append("\"x\":").append(center.getX()).append(",")
                       .append("\"y\":").append(center.getY()).append(",")
                       .append("\"z\":").append(center.getZ()).append(",")
-                      .append("\"citizens\":[");
+                      .append("\"buildings\":[");
+                    java.util.Map<BlockPos, IBuilding> buildings = c.getServerBuildingManager().getBuildings();
+                    boolean firstBld = true;
+                    for (java.util.Map.Entry<BlockPos, IBuilding> bldEntry : buildings.entrySet()) {
+                        if (!firstBld) sb.append(",");
+                        firstBld = false;
+                        BlockPos bp = bldEntry.getKey();
+                        IBuilding bld = bldEntry.getValue();
+                        ResourceLocation bldKey = ForgeRegistries.BLOCKS.getKey(
+                            level.getBlockState(bp).getBlock());
+                        String bldType = bldKey != null ? bldKey.getPath() : "unknown";
+                        sb.append("{")
+                          .append("\"x\":").append(bp.getX()).append(",")
+                          .append("\"y\":").append(bp.getY()).append(",")
+                          .append("\"z\":").append(bp.getZ()).append(",")
+                          .append("\"type\":\"").append(escape(bldType)).append("\",")
+                          .append("\"level\":").append(bld.getBuildingLevel()).append(",")
+                          .append("\"pending\":").append(bld.isPendingConstruction())
+                          .append("}");
+                    }
+                    sb.append("],\"citizens\":[");
                     java.util.List<ICitizenData> citizens = c.getCitizenManager().getCitizens();
                     for (int j = 0; j < citizens.size(); j++) {
                         ICitizenData cit = citizens.get(j);
@@ -318,6 +339,27 @@ public class VoyagerBridge {
                     if (building.isPendingConstruction()) {
                         result.complete("already has a pending work order");
                         return;
+                    }
+                    // Gate: a Builder's Hut must be at level >= 1 before any
+                    // non-builder building can be queued, because level-0 builders
+                    // can only execute their own hut's upgrade (0→1). Queueing other
+                    // work orders when all builders are level 0 silently fails - the
+                    // work order sits unassigned forever and shows 0/0 steps in the UI.
+                    Block targetBlock = level.getBlockState(pos).getBlock();
+                    ResourceLocation targetKey = ForgeRegistries.BLOCKS.getKey(targetBlock);
+                    boolean isBuilderHut = targetKey != null && "blockhutbuilder".equals(targetKey.getPath());
+                    if (!isBuilderHut) {
+                        boolean hasCapableBuilder = colony.getServerBuildingManager().getBuildings().values().stream()
+                            .anyMatch(bld -> {
+                                ResourceLocation bldKey = ForgeRegistries.BLOCKS.getKey(
+                                    level.getBlockState(bld.getPosition()).getBlock());
+                                return bldKey != null && "blockhutbuilder".equals(bldKey.getPath())
+                                    && bld.getBuildingLevel() >= 1;
+                            });
+                        if (!hasCapableBuilder) {
+                            result.complete("ERROR: no Builder's Hut at level 1+ yet; build Builder's Huts first before requesting other buildings");
+                            return;
+                        }
                     }
                     Player fakePlayer = new FakePlayer(level, AI_PROFILE);
                     building.requestUpgrade(fakePlayer, pos);
