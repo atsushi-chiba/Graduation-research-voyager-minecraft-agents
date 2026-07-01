@@ -65,28 +65,107 @@ MineColoniesのblueprintには `domum_ornamentum:framed` のような**テクス
 
 **やってはいけないこと:** `overruleNextOpenRequestOfCitizenWithStack()` はリクエスト状態を変えるだけで完成品をインベントリに入れない。完成品を入れずにこれだけ呼ぶと、建築家AIは「アイテムが手元にない」と判断して同一リクエストを再発行し続ける無限ループになる。(2026-07-01修正済み: `VoyagerBridge.java` の `handleResolveRequest` で素材消費後に `inv.insertItem` を追加)
 
-### サーバー運用メモ
+### ファイル・ディレクトリ構成
 
-```bash
-# Forgeサーバー起動(cmd_pipeの常駐書き込みプロセスも同時に立ち上げる)
-cd /root/mc-server-forge
-nohup bash -c 'tail -f /dev/null > cmd_pipe & bash run.sh nogui < cmd_pipe >> console.log 2>&1' > /dev/null 2>&1 &
+```
+/root/mc-server-forge/          ← Forge 1.20.1 サーバー本体
+  run.sh                        ← Forge 標準起動スクリプト(直接使わない)
+  start_server.sh               ← ★ 通常の起動エントリポイント
+  stop_server.sh                ← ★ 通常の停止エントリポイント
+  rebuild_bridge.sh             ← ★ Bridge mod ビルド & 配備
+  cmd_pipe                      ← 名前付きFIFO(サーバーのstdin代わり)
+  console.log                   ← サーバーログ(追記)
+  mods/
+    voyagerbridge-0.1.0.jar     ← Bridge mod 本体(ビルド成果物)
+    minecolonies-1.20.1-*.jar
+    structurize-1.20.1-*.jar
+    blockui-1.20.1-*.jar
+    domum_ornamentum-1.20.1-*.jar
+    multipiston-1.20-*.jar
+  config/
+    minecolonies-common.toml    ← MineColonies 設定(creativeresolveは未設定)
 
-# Bridgeのビルド(JDK17必須、JDK21では動かない)
-cd /root/Voyager/voyager/env/minecolonies-bridge
-JAVA_HOME=/opt/jdk-17.0.19+10 ./gradlew build -x test
-cp build/libs/voyagerbridge-0.1.0.jar /root/mc-server-forge/mods/
-# その後サーバー再起動
-
-# council + supply_bot の起動
-cd /root/Voyager/voyager/env/minecolonies-bridge
-node supply_bot.js &
-OPENROUTER_API_KEY=... node council.js
+/root/Voyager/voyager/env/minecolonies-bridge/   ← Bridge mod ソース + エージェント
+  VoyagerBridge.java            ← Bridge mod 唯一のソースファイル
+    (src/main/java/com/voyagerbridge/)
+  council.js                    ← ★ メインエージェント(LLM知事2人が議論してコロニー運営)
+  supply_bot.js                 ← ★ 資材自動供給ボット(council.jsと並走)
+  building_registry.json        ← 建物タイプ → block_id / blueprint / 職業 のマッピング表
+  build.gradle / gradlew        ← Gradle ビルド設定(JDK17専用)
 ```
 
-### なぜ `cmd_pipe` への書き込みに O_NONBLOCK が必要か
+### 起動・停止手順
 
-cmd_pipe はLinuxの名前付きFIFO。`tail -f /dev/null > cmd_pipe &` の常駐プロセスが死ぬと、次の書き込みプロセスが reader が来るまで永遠にブロックする。`O_NONBLOCK` フラグで開くと reader 不在時に即 `ENXIO` を返すので、council.jsのループが詰まらない。
+```bash
+# ===== 通常起動 =====
+cd /root/mc-server-forge
+bash start_server.sh
+# → サーバー起動 + Bridge 待機 + supply_bot + council が全部自動で立ち上がる
+# → ログ: /tmp/supply_bot.log  /tmp/council.log
+
+# エージェントなしで起動したい場合
+bash start_server.sh --no-agents
+
+# ===== 停止 =====
+bash stop_server.sh
+# → council & supply_bot を kill してから Minecraft サーバーに stop を送る
+
+# ===== Bridge mod を改造した後の更新手順 =====
+bash stop_server.sh
+bash rebuild_bridge.sh   # JDK17 でビルド → mods/ に自動配備
+bash start_server.sh
+
+# ===== council だけ再起動したい場合 =====
+cd /root/Voyager/voyager/env/minecolonies-bridge
+OPENROUTER_API_KEY=sk-... node council.js > /tmp/council.log 2>&1 &
+```
+
+### 環境メモ
+
+| 項目 | 値 |
+|---|---|
+| サーバーポート | 25566 (vanilla は 25565 で別) |
+| Bridge HTTP API | http://localhost:8089 |
+| ワールド | スーパーフラット、y=-60 が地表 |
+| JDK | `/opt/jdk-17.0.19+10`(ビルド用) / システムJDK21(サーバー起動用) |
+| LLMモデル | `anthropic/claude-haiku-4.5` via OpenRouter |
+| gamerule | doDaylightCycle=false, doWeatherCycle=false (start_server.sh が設定) |
+
+### Bridge mod の HTTP エンドポイント一覧
+
+| エンドポイント | メソッド | 主なパラメータ | 説明 |
+|---|---|---|---|
+| `/ping` | GET | - | 疎通確認 |
+| `/status` | GET | - | 全コロニーの建物・市民情報をJSON返却 |
+| `/place` | POST | x,y,z,block | 指定座標に hut ブロックを設置。既存建物と重複するとERROR |
+| `/found` | POST | x,y,z,name | town hall をコロニーとして設立 |
+| `/spawnCitizen` | POST | colonyId | 市民を1人追加スポーン |
+| `/requestBuild` | POST | x,y,z | 建物に work order を発行(着工指示) |
+| `/giveToCitizen` | POST | colonyId,citizenId,item,count | 市民インベントリにアイテムを直接挿入 |
+| `/resolveRequest` | POST | x,y,z,citizenId | 市民のオープンリクエストを解決(textured blockは素材消費→完成品挿入→OVERRULED) |
+| `/giveTexturedBlock` | POST | colonyId,citizenId,block,count,tex1,mat1... | Domum Ornamentum フレームブロックを合成して渡す |
+| `/openRequests` | GET | x,y,z,citizenId | 市民の未解決リクエスト一覧 |
+| `/clearCitizenInventory` | POST | colonyId,citizenId | 市民インベントリを全クリア |
+
+### Bridge mod で手を加えた箇所とその理由
+
+MineColonies/Structurize の API はほぼそのまま呼んでいるが、以下の点で独自ロジックを追加した：
+
+**1. `/place` — 建物配置前の footprint 衝突チェック**
+MineColonies 本体には `setBlockAndUpdate` 呼び出し時の重複チェックが存在しない。ある座標に新しい hut を置くと既存建物が静かに破壊される。さらに、破壊された座標に置かれた新建物は内部状態が壊れて `requestUpgrade` が work order を生成しなくなるという二次被害もある。そのため `/place` 内で `IBuilding.isInBuilding(pos)` を使った事前チェックを実装した。
+
+**2. `/requestBuild` — builder hut の選択**
+`IBuilding.requestUpgrade(player, builderPos)` の第2引数は「担当 builder hut の座標」。ドキュメントが存在しないため当初は target 建物の座標を渡していたが、builder hut 以外の建物では work order が作られないことで発覚。`colony.getServerBuildingManager()` から lv1+ の builder hut を検索して渡すよう修正。
+
+**3. `/resolveRequest` — Domum Ornamentum フレームブロックの完成品配送**
+`overruleNextOpenRequestOfCitizenWithStack()` はリクエストシステムの状態を OVERRULED にするだけで、アイテムを実際にインベントリに入れない。builder AI は「手元にない」と判断して同一リクエストを再発行し続けるループに陥る。素材消費後に完成品 ItemStack を `inv.insertItem` で直接挿入することで解決。
+
+**4. `cmd_pipe` への書き込みに O_NONBLOCK**
+Linux の名前付き FIFO は reader がいない状態で open しようとすると永久ブロックする。council.js のループが詰まらないよう `fs.openSync(path, O_WRONLY | O_NONBLOCK)` で開き、reader 不在時は ENXIO を catch してスキップするよう変更。
+
+### なぜ `creativeresolve` を使っていないか
+
+`minecolonies-common.toml` の `[requestsystem]` セクションに `creativeresolve = true` を設定すると `StandardPlayerRequestResolver` がリクエストを自動充足する。ただし**サーバー稼働中に設定を変更するとシャットダウン時に上書きされて消える**ため、変更は必ずサーバー停止中に行う必要がある。現状は `supply_bot.js` が同等の機能を担っているため設定していない。
 
 ---
 
