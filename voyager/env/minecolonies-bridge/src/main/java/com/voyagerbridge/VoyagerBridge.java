@@ -77,6 +77,7 @@ public class VoyagerBridge {
             httpServer.createContext("/giveTexturedBlock", this::handleGiveTexturedBlock);
             httpServer.createContext("/openRequests", this::handleOpenRequests);
             httpServer.createContext("/resolveRequest", this::handleResolveRequest);
+            httpServer.createContext("/clearCitizenInventory", this::handleClearCitizenInventory);
             httpServer.createContext("/ping", VoyagerBridge::handlePing);
             httpServer.setExecutor(null);
             httpServer.start();
@@ -169,6 +170,16 @@ public class VoyagerBridge {
 
     private String foundOnServerThread(int x, int y, int z, String colonyName) {
         ServerLevel level = server.overworld();
+        Player fakePlayer = new FakePlayer(level, AI_PROFILE);
+
+        // placing a townhall block already triggers MineColonies' setPlacedBy which
+        // auto-creates the colony - check for that before attempting a second createColony
+        IColony existingOwned = IColonyManager.getInstance().getIColonyByOwner(level, fakePlayer);
+        if (existingOwned != null) {
+            existingOwned.setName(colonyName);
+            return "founded colony " + existingOwned.getID() + " (" + colonyName + ")";
+        }
+
         BlockPos pos = new BlockPos(x, y, z);
         BlockEntity tileEntity = level.getBlockEntity(pos);
         if (!(tileEntity instanceof TileEntityColonyBuilding)) {
@@ -179,14 +190,6 @@ public class VoyagerBridge {
         StructurePackMeta pack = getPinnedPack();
         if (pack == null) {
             return "ERROR: no structure packs registered";
-        }
-        hut.setStructurePack(pack);
-        hut.setBlueprintPath("fundamentals/townhall1.blueprint");
-
-        Player fakePlayer = new FakePlayer(level, AI_PROFILE);
-        IColony existingOwned = IColonyManager.getInstance().getIColonyByOwner(level, fakePlayer);
-        if (existingOwned != null) {
-            return "ERROR: VoyagerAI already owns colony " + existingOwned.getID();
         }
 
         IColony created = IColonyManager.getInstance().createColony(level, pos, fakePlayer, colonyName, pack.getName());
@@ -252,6 +255,7 @@ public class VoyagerBridge {
                       .append("\"y\":").append(center.getY()).append(",")
                       .append("\"z\":").append(center.getZ()).append(",")
                       .append("\"buildings\":[");
+                    java.util.List<ICitizenData> citizens = c.getCitizenManager().getCitizens();
                     java.util.Map<BlockPos, IBuilding> buildings = c.getServerBuildingManager().getBuildings();
                     boolean firstBld = true;
                     for (java.util.Map.Entry<BlockPos, IBuilding> bldEntry : buildings.entrySet()) {
@@ -262,13 +266,23 @@ public class VoyagerBridge {
                         ResourceLocation bldKey = ForgeRegistries.BLOCKS.getKey(
                             level.getBlockState(bp).getBlock());
                         String bldType = bldKey != null ? bldKey.getPath() : "unknown";
+                        boolean operational = bld.getBuildingLevel() >= 1 && !bld.isPendingConstruction();
+                        boolean inTerritory = c.isCoordInColony(level, bp);
+                        java.util.List<Integer> workerIds = citizens.stream()
+                            .filter(w -> w.getWorkBuilding() != null
+                                && w.getWorkBuilding().getPosition().equals(bp))
+                            .map(ICitizenData::getId)
+                            .collect(java.util.stream.Collectors.toList());
                         sb.append("{")
                           .append("\"x\":").append(bp.getX()).append(",")
                           .append("\"y\":").append(bp.getY()).append(",")
                           .append("\"z\":").append(bp.getZ()).append(",")
                           .append("\"type\":\"").append(escape(bldType)).append("\",")
                           .append("\"level\":").append(bld.getBuildingLevel()).append(",")
-                          .append("\"pending\":").append(bld.isPendingConstruction())
+                          .append("\"pending\":").append(bld.isPendingConstruction()).append(",")
+                          .append("\"operational\":").append(operational).append(",")
+                          .append("\"inTerritory\":").append(inTerritory).append(",")
+                          .append("\"workers\":").append(workerIds)
                           .append("}");
                     }
                     // Research-unlocked buildings: which research-gated building types
@@ -284,16 +298,31 @@ public class VoyagerBridge {
                         }
                     }
                     sb.append("],\"citizens\":[");
-                    java.util.List<ICitizenData> citizens = c.getCitizenManager().getCitizens();
                     for (int j = 0; j < citizens.size(); j++) {
                         ICitizenData cit = citizens.get(j);
                         if (j > 0) sb.append(",");
-                        String jobName = cit.getJob() == null ? "unemployed" : cit.getJob().getJobRegistryEntry().getKey().getPath();
+                        String jobName = cit.getJob() == null ? "unemployed"
+                            : cit.getJob().getJobRegistryEntry().getKey().getPath();
+                        String jobStatusStr = cit.getJobStatus() != null
+                            ? cit.getJobStatus().name().toLowerCase() : "unknown";
+                        IBuilding workBld = cit.getWorkBuilding();
                         sb.append("{")
                           .append("\"id\":").append(cit.getId()).append(",")
                           .append("\"name\":\"").append(escape(cit.getName())).append("\",")
-                          .append("\"job\":\"").append(escape(jobName)).append("\"")
-                          .append("}");
+                          .append("\"job\":\"").append(escape(jobName)).append("\",")
+                          .append("\"jobStatus\":\"").append(jobStatusStr).append("\",");
+                        if (workBld != null) {
+                            BlockPos wp = workBld.getPosition();
+                            sb.append("\"workBuilding\":{")
+                              .append("\"x\":").append(wp.getX()).append(",")
+                              .append("\"y\":").append(wp.getY()).append(",")
+                              .append("\"z\":").append(wp.getZ()).append(",")
+                              .append("\"level\":").append(workBld.getBuildingLevel())
+                              .append("}");
+                        } else {
+                            sb.append("\"workBuilding\":null");
+                        }
+                        sb.append("}");
                     }
                     sb.append("]}");
                 }
@@ -338,7 +367,7 @@ public class VoyagerBridge {
                 try {
                     ServerLevel level = server.overworld();
                     BlockPos pos = new BlockPos(x, y, z);
-                    IColony colony = IColonyManager.getInstance().getIColony(level, pos);
+                    IColony colony = findColonyAt(level, pos);
                     if (colony == null) {
                         result.complete("ERROR: no colony at " + x + "," + y + "," + z);
                         return;
@@ -669,13 +698,28 @@ public class VoyagerBridge {
                         first = false;
                         java.util.List<ItemStack> displayStacks = req.getDisplayStacks();
                         ItemStack stack = displayStacks.isEmpty() ? ItemStack.EMPTY : displayStacks.get(0);
-                        boolean textured = !stack.isEmpty() && stack.getTagElement("textureData") != null;
+                        CompoundTag textureData = !stack.isEmpty() ? stack.getTagElement("textureData") : null;
+                        boolean textured = textureData != null;
                         sb.append("{")
                           .append("\"description\":\"").append(escape(req.getShortDisplayString().getString())).append("\",")
                           .append("\"item\":\"").append(stack.isEmpty() ? "" : escape(String.valueOf(ForgeRegistries.ITEMS.getKey(stack.getItem())))).append("\",")
                           .append("\"count\":").append(stack.getCount()).append(",")
-                          .append("\"textured\":").append(textured)
-                          .append("}");
+                          .append("\"textured\":").append(textured);
+                        // For textured blocks, expose the required raw materials so callers
+                        // can give them to the citizen before resolving the request.
+                        if (textured) {
+                            sb.append(",\"materials\":[");
+                            boolean firstMat = true;
+                            for (String texKey : textureData.getAllKeys()) {
+                                String matId = textureData.getString(texKey);
+                                if (!firstMat) sb.append(",");
+                                firstMat = false;
+                                sb.append("{\"item\":\"").append(escape(matId))
+                                  .append("\",\"count\":").append(stack.getCount()).append("}");
+                            }
+                            sb.append("]");
+                        }
+                        sb.append("}");
                     }
                     sb.append("]");
                     result.complete(sb.toString());
@@ -781,6 +825,14 @@ public class VoyagerBridge {
                         for (Item mat : materials) {
                             extractItem(inv, mat, stack.getCount());
                         }
+                        // overruleNextOpenRequestOfCitizenWithStack only changes request
+                        // state to OVERRULED - it does not put the item in the citizen's
+                        // inventory. The builder AI won't exit NEEDS_ITEM until the
+                        // finished textured block physically arrives in its inventory.
+                        ItemStack toDeliver = stack.copy();
+                        for (int slot = 0; slot < inv.getSlots() && !toDeliver.isEmpty(); slot++) {
+                            toDeliver = inv.insertItem(slot, toDeliver, false);
+                        }
                     }
 
                     boolean resolved = building.overruleNextOpenRequestOfCitizenWithStack(citizen, stack);
@@ -789,6 +841,54 @@ public class VoyagerBridge {
                             : "ERROR: overrule returned false (request may have already been resolved)");
                 } catch (Exception e) {
                     LOGGER.error("resolveRequest failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // POST /clearCitizenInventory?colonyId=1&citizenId=2
+    // Extracts every item from the citizen's personal inventory and drops them
+    // in the world at the citizen's feet (or discards if the entity isn't loaded).
+    // Used to unblock citizens whose inventory was filled by erroneous supply runs.
+    private void handleClearCitizenInventory(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.get("colonyId"));
+            int citizenId = Integer.parseInt(params.get("citizenId"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, server.overworld());
+                    if (colony == null) { result.complete("ERROR: no colony " + colonyId); return; }
+                    ICitizenData citizen = colony.getCitizenManager().getCivilian(citizenId);
+                    if (citizen == null) { result.complete("ERROR: no citizen " + citizenId); return; }
+                    java.util.Optional<AbstractEntityCitizen> entityOpt = citizen.getEntity();
+                    if (entityOpt.isEmpty()) { result.complete("ERROR: citizen has no live entity"); return; }
+                    InventoryCitizen inv = entityOpt.get().getInventoryCitizen();
+                    int cleared = 0;
+                    for (int slot = 0; slot < inv.getSlots(); slot++) {
+                        if (!inv.getStackInSlot(slot).isEmpty()) {
+                            inv.extractItem(slot, Integer.MAX_VALUE, false);
+                            cleared++;
+                        }
+                    }
+                    result.complete("cleared " + cleared + " slot(s) for citizen " + citizenId);
+                } catch (Exception e) {
+                    LOGGER.error("clearCitizenInventory failed", e);
                     result.complete("ERROR: " + e);
                 }
             });
@@ -832,23 +932,65 @@ public class VoyagerBridge {
     // `fg.deobf(files(...))` does not actually do for plain local file refs.
     private static final java.util.Map<String, String> BLUEPRINT_PATHS = new java.util.HashMap<>();
     static {
-        BLUEPRINT_PATHS.put("townhall", "fundamentals/townhall1.blueprint");
-        BLUEPRINT_PATHS.put("builder", "fundamentals/builder1.blueprint");
-        BLUEPRINT_PATHS.put("citizen", "fundamentals/house1.blueprint");
-        BLUEPRINT_PATHS.put("forester", "fundamentals/forester1.blueprint");
-        BLUEPRINT_PATHS.put("hospital", "fundamentals/hospital1.blueprint");
-        BLUEPRINT_PATHS.put("tavern", "fundamentals/tavern1.blueprint");
-        BLUEPRINT_PATHS.put("warehouse", "craftsmanship/storage/warehouse1.blueprint");
-        BLUEPRINT_PATHS.put("deliveryman", "craftsmanship/storage/courier1.blueprint");
-        BLUEPRINT_PATHS.put("sawmill", "craftsmanship/carpentry/sawmill1.blueprint");
-        BLUEPRINT_PATHS.put("blacksmith", "craftsmanship/metallurgy/blacksmith1.blueprint");
-        BLUEPRINT_PATHS.put("stonemason", "craftsmanship/masonry/stonemason1.blueprint");
-        BLUEPRINT_PATHS.put("library", "education/library1.blueprint");
-        BLUEPRINT_PATHS.put("school", "education/school1.blueprint");
-        BLUEPRINT_PATHS.put("farmer", "agriculture/horticulture/farm1.blueprint");
-        BLUEPRINT_PATHS.put("fisherman", "agriculture/husbandry/fisher1.blueprint");
-        BLUEPRINT_PATHS.put("guardtower", "military/guardtower1.blueprint");
-        BLUEPRINT_PATHS.put("barracks", "military/barracks1.blueprint");
+        // Fundamentals
+        BLUEPRINT_PATHS.put("townhall",      "fundamentals/townhall1.blueprint");
+        BLUEPRINT_PATHS.put("builder",       "fundamentals/builder1.blueprint");
+        BLUEPRINT_PATHS.put("citizen",       "fundamentals/house1.blueprint");
+        BLUEPRINT_PATHS.put("hospital",      "fundamentals/hospital1.blueprint");
+        BLUEPRINT_PATHS.put("tavern",        "fundamentals/tavern1.blueprint");
+        BLUEPRINT_PATHS.put("lumberjack",    "fundamentals/forester1.blueprint");
+        BLUEPRINT_PATHS.put("miner",         "fundamentals/mine1.blueprint");
+        BLUEPRINT_PATHS.put("kitchen",       "fundamentals/restaurant1.blueprint");
+        // Craftsmanship / Storage
+        BLUEPRINT_PATHS.put("warehouse",     "craftsmanship/storage/warehouse1.blueprint");
+        BLUEPRINT_PATHS.put("deliveryman",   "craftsmanship/storage/courier1.blueprint");
+        // Craftsmanship / Carpentry
+        BLUEPRINT_PATHS.put("sawmill",       "craftsmanship/carpentry/sawmill1.blueprint");
+        BLUEPRINT_PATHS.put("fletcher",      "craftsmanship/carpentry/fletcher1.blueprint");
+        // Craftsmanship / Metallurgy
+        BLUEPRINT_PATHS.put("blacksmith",    "craftsmanship/metallurgy/blacksmith1.blueprint");
+        BLUEPRINT_PATHS.put("mechanic",      "craftsmanship/metallurgy/mechanic1.blueprint");
+        BLUEPRINT_PATHS.put("smeltery",      "craftsmanship/metallurgy/smeltery1.blueprint");
+        // Craftsmanship / Masonry
+        BLUEPRINT_PATHS.put("stonemason",    "craftsmanship/masonry/stonemason1.blueprint");
+        BLUEPRINT_PATHS.put("stonesmeltery", "craftsmanship/masonry/stonesmeltery1.blueprint");
+        BLUEPRINT_PATHS.put("crusher",       "craftsmanship/masonry/crusher1.blueprint");
+        BLUEPRINT_PATHS.put("sifter",        "craftsmanship/masonry/sifter1.blueprint");
+        // Craftsmanship / Luxury
+        BLUEPRINT_PATHS.put("baker",         "craftsmanship/luxury/bakery1.blueprint");
+        BLUEPRINT_PATHS.put("cook",          "craftsmanship/luxury/cookery1.blueprint");
+        BLUEPRINT_PATHS.put("dyer",          "craftsmanship/luxury/dyer1.blueprint");
+        BLUEPRINT_PATHS.put("glassblower",   "craftsmanship/luxury/glassblower1.blueprint");
+        BLUEPRINT_PATHS.put("concretemixer", "craftsmanship/luxury/concretemixer1.blueprint");
+        BLUEPRINT_PATHS.put("alchemist",     "craftsmanship/luxury/alchemisttower1.blueprint");
+        // Agriculture / Horticulture
+        BLUEPRINT_PATHS.put("farmer",        "agriculture/horticulture/farm1.blueprint");
+        BLUEPRINT_PATHS.put("composter",     "agriculture/horticulture/composter1.blueprint");
+        BLUEPRINT_PATHS.put("florist",       "agriculture/horticulture/flowershop1.blueprint");
+        BLUEPRINT_PATHS.put("plantation",    "agriculture/horticulture/plantation1.blueprint");
+        // Agriculture / Husbandry
+        BLUEPRINT_PATHS.put("fisherman",     "agriculture/husbandry/fisher1.blueprint");
+        BLUEPRINT_PATHS.put("beekeeper",     "agriculture/husbandry/apiary1.blueprint");
+        BLUEPRINT_PATHS.put("chickenherder", "agriculture/husbandry/chickenfarmer1.blueprint");
+        BLUEPRINT_PATHS.put("cowboy",        "agriculture/husbandry/cowhand1.blueprint");
+        BLUEPRINT_PATHS.put("shepherd",      "agriculture/husbandry/shepherd1.blueprint");
+        BLUEPRINT_PATHS.put("swineherder",   "agriculture/husbandry/swineherd1.blueprint");
+        BLUEPRINT_PATHS.put("rabbithutch",   "agriculture/husbandry/rabbithutch1.blueprint");
+        // Military
+        BLUEPRINT_PATHS.put("guardtower",    "military/guardtower1.blueprint");
+        BLUEPRINT_PATHS.put("barracks",      "military/barracks1.blueprint");
+        BLUEPRINT_PATHS.put("barrackstower", "military/barrackstower1.blueprint");
+        BLUEPRINT_PATHS.put("archery",       "military/archery1.blueprint");
+        BLUEPRINT_PATHS.put("combatacademy", "military/combatacademy1.blueprint");
+        BLUEPRINT_PATHS.put("gatehouse",     "military/gatehouse1.blueprint");
+        // Education
+        BLUEPRINT_PATHS.put("library",       "education/library1.blueprint");
+        BLUEPRINT_PATHS.put("school",        "education/school1.blueprint");
+        BLUEPRINT_PATHS.put("university",    "education/university1.blueprint");
+        // Mystic
+        BLUEPRINT_PATHS.put("enchanter",     "mystic/enchanterstower1.blueprint");
+        BLUEPRINT_PATHS.put("graveyard",     "mystic/graveyard1.blueprint");
+        BLUEPRINT_PATHS.put("netherworker",  "mystic/nethermine1.blueprint");
     }
 
     // The BLUEPRINT_PATHS table was derived specifically from the "Colonial"
@@ -881,6 +1023,28 @@ public class VoyagerBridge {
         }
         Item item = ForgeRegistries.ITEMS.getValue(rl);
         BlockPos pos = new BlockPos(x, y, z);
+
+        // Footprint collision check: reject if pos falls inside any existing building's
+        // bounding box. MineColonies has no such check itself - the Builder will silently
+        // demolish normal blocks of any overlapping building during construction.
+        IColony nearbyColony = IColonyManager.getInstance().getIColony(level, pos);
+        if (nearbyColony != null) {
+            for (IBuilding existingBld : nearbyColony.getServerBuildingManager().getBuildings().values()) {
+                if (existingBld.getPosition().equals(pos)) continue; // replacing same spot is fine
+                try {
+                    if (existingBld.isInBuilding(pos)) {
+                        ResourceLocation existKey = ForgeRegistries.BLOCKS.getKey(
+                            level.getBlockState(existingBld.getPosition()).getBlock());
+                        String existType = existKey != null ? existKey.getPath() : "unknown";
+                        return "ERROR: (" + x + "," + y + "," + z + ") is inside existing building "
+                            + existType + " at " + existingBld.getPosition()
+                            + " - choose a position outside its footprint";
+                    }
+                } catch (Exception ignored) {
+                    // getCorners() may not be initialised for buildings with no work order yet
+                }
+            }
+        }
         BlockState state = block.defaultBlockState();
 
         level.setBlockAndUpdate(pos, state);
@@ -917,7 +1081,38 @@ public class VoyagerBridge {
         // imported its (obfuscated) class - virtual dispatch finds it at runtime.
         block.setPlacedBy(level, pos, state, fakePlayer, stack);
 
-        return "placed " + blockId + " at " + x + "," + y + "," + z + blueprintNote;
+        // Colony territory check: after placement, verify the block ended up inside
+        // the colony's claimed territory. MineColonies limits citizen pathfinding to
+        // within colony-claimed chunks; a building registered outside the territory
+        // will have an assigned worker but that worker will never actually move there.
+        // initialColonySize defaults to 4 chunks (64 blocks) at townhall level 0.
+        String territoryWarning = "";
+        IColony placedInColony = findColonyAt(level, pos);
+        if (placedInColony != null && !placedInColony.isCoordInColony(level, pos)) {
+            BlockPos center = placedInColony.getCenter();
+            double dist = Math.sqrt(Math.pow(pos.getX() - center.getX(), 2)
+                + Math.pow(pos.getZ() - center.getZ(), 2));
+            territoryWarning = " WARNING: position is outside colony claimed territory"
+                + " (dist=" + (int) dist + " from center; workers assigned here may not move)";
+        }
+
+        return "placed " + blockId + " at " + x + "," + y + "," + z + blueprintNote + territoryWarning;
+    }
+
+    // Robust colony lookup: tries the standard position-based lookup first, then
+    // falls back to scanning all colonies for one that has a building registered
+    // at the given position. The fallback iterates getBuildings() directly rather
+    // than calling getBuilding(pos) because getBuilding() may use a different
+    // key-lookup path than the map's own containsKey, causing false negatives when
+    // the colony was auto-created via setPlacedBy rather than the normal founding flow.
+    private IColony findColonyAt(ServerLevel level, BlockPos pos) {
+        IColony colony = IColonyManager.getInstance().getIColony(level, pos);
+        if (colony != null) return colony;
+        for (IColony c : IColonyManager.getInstance().getAllColonies()) {
+            if (!c.getDimension().equals(level.dimension())) continue;
+            if (c.getServerBuildingManager().getBuildings().containsKey(pos)) return c;
+        }
+        return null;
     }
 
     private static java.util.Map<String, String> parseQuery(String query) {
