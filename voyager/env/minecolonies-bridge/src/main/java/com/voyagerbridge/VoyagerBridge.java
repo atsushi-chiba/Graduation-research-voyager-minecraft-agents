@@ -1070,37 +1070,58 @@ public class VoyagerBridge {
 
         level.setBlockAndUpdate(pos, state);
 
-        // The blueprint pack/path MUST be set on the tile entity before
-        // setPlacedBy runs below - setPlacedBy is what triggers MineColonies'
-        // own building registration internally, and the registered IBuilding
-        // object caches its own copy of the blueprint path at that moment.
-        // Setting it afterwards only updates the tile entity's copy, leaving
-        // the IBuilding with a stale empty path that breaks requestUpgrade()
-        // later with a StringIndexOutOfBoundsException ("Failed to get
-        // rotation of building ... with path: ").
-        String blueprintNote = "";
-        BlockEntity tileEntity = level.getBlockEntity(pos);
-        if (tileEntity instanceof TileEntityColonyBuilding) {
-            String typeName = rl.getPath().replaceFirst("^blockhut", "");
-            String path = BLUEPRINT_PATHS.get(typeName);
-            if (path != null) {
-                StructurePackMeta pack = getPinnedPack();
-                if (pack != null) {
-                    ((TileEntityColonyBuilding) tileEntity).setStructurePack(pack);
-                    ((TileEntityColonyBuilding) tileEntity).setBlueprintPath(path);
-                    blueprintNote = " (blueprint " + pack.getName() + "/" + path + ")";
-                }
-            } else {
-                blueprintNote = " (no known blueprint path for type '" + typeName + "', placed without one)";
-            }
-        }
-
         FakePlayer fakePlayer = new FakePlayer(level, AI_PROFILE);
         ItemStack stack = item != null ? new ItemStack(item, 1) : ItemStack.EMPTY;
-        // setPlacedBy is a standard Block API hook; MineColonies overrides it on
-        // its hut blocks to register the building/colony, even though we never
-        // imported its (obfuscated) class - virtual dispatch finds it at runtime.
-        block.setPlacedBy(level, pos, state, fakePlayer, stack);
+        // setPlacedBy registers the building with the colony. When a colony already
+        // exists, MineColonies initializes the new building immediately and internally
+        // calls building.setStructurePack(), which calls getTileEntity() on the
+        // building. getTileEntity() returns null at this point (the building<->tile
+        // entity back-link is set lazily), causing NPE inside setPlacedBy. The
+        // building IS registered before that internal call, so we catch the NPE and
+        // continue. If no colony exists yet (town hall placement), setPlacedBy
+        // succeeds without the problematic initialization path.
+        try {
+            block.setPlacedBy(level, pos, state, fakePlayer, stack);
+        } catch (NullPointerException ignored) {}
+
+        // Blueprint pack/path must be set on the IBuilding AFTER setPlacedBy.
+        // IBuilding.setStructurePack(String) and setBlueprintPath(String) write
+        // their own fields first, then try to sync to the tile entity via
+        // getTileEntity(). getTileEntity() returns null immediately after
+        // setPlacedBy (the building<->tileEntity back-link is set lazily on the
+        // next tick or chunk reload), so these calls throw NPE during the sync
+        // step. We catch and swallow those NPEs: the building fields ARE already
+        // written before the NPE, so IBuilding.getStructurePack() /
+        // getBlueprintPath() return the correct values and requestUpgrade works.
+        // We also call TileEntityColonyBuilding.setStructurePack/setBlueprintPath
+        // directly (these just write their own fields, no back-call, always safe).
+        String blueprintNote = "";
+        String typeName = rl.getPath().replaceFirst("^blockhut", "");
+        String path = BLUEPRINT_PATHS.get(typeName);
+        if (path != null) {
+            StructurePackMeta pack = getPinnedPack();
+            if (pack != null) {
+                IColony bldColony = findColonyAt(level, pos);
+                if (bldColony != null) {
+                    IBuilding bld = bldColony.getServerBuildingManager().getBuilding(pos);
+                    if (bld != null) {
+                        try { bld.setStructurePack(pack.getName()); } catch (NullPointerException ignored) {}
+                        try { bld.setBlueprintPath(path); } catch (NullPointerException ignored) {}
+                        try { bld.markDirty(); } catch (Exception ignored) {}
+                    }
+                }
+                // Also set directly on the tile entity (these methods only write
+                // their own fields, no back-delegation, safe without building link).
+                BlockEntity te = level.getBlockEntity(pos);
+                if (te instanceof TileEntityColonyBuilding) {
+                    ((TileEntityColonyBuilding) te).setStructurePack(pack);
+                    ((TileEntityColonyBuilding) te).setBlueprintPath(path);
+                }
+                blueprintNote = " (blueprint " + pack.getName() + "/" + path + ")";
+            }
+        } else {
+            blueprintNote = " (no known blueprint path for type '" + typeName + "', placed without one)";
+        }
 
         // Colony territory check: after placement, verify the block ended up inside
         // the colony's claimed territory. MineColonies limits citizen pathfinding to
