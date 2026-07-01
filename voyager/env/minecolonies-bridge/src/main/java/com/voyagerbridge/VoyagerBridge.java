@@ -1107,6 +1107,43 @@ public class VoyagerBridge {
                 }
             }
         }
+        // Territory check: non-town-hall buildings must be placed inside a colony's
+        // claimed territory. IColonyManager.getIColony() returns the colony only if
+        // the position is within its territory, so null means "outside all colonies".
+        // Town halls are exempt - they found a new colony anywhere.
+        boolean isTownHall = "blockhuttownhall".equals(rl.getPath());
+        if (!isTownHall) {
+            IColony territoryColony = IColonyManager.getInstance().getIColony(level, pos);
+            if (territoryColony == null) {
+                // Fall back to scanning buildings in case getIColony misses edge chunks,
+                // but the building at pos doesn't exist yet so this mainly catches the
+                // case where a colony happens to claim the chunk via a different path.
+                boolean foundByBuildings = false;
+                for (IColony c : IColonyManager.getInstance().getAllColonies()) {
+                    if (c.getDimension().equals(level.dimension()) && c.isCoordInColony(level, pos)) {
+                        foundByBuildings = true;
+                        break;
+                    }
+                }
+                if (!foundByBuildings) {
+                    BlockPos nearest = null;
+                    double nearestDist = Double.MAX_VALUE;
+                    for (IColony c : IColonyManager.getInstance().getAllColonies()) {
+                        if (!c.getDimension().equals(level.dimension())) continue;
+                        BlockPos center = c.getCenter();
+                        double dist = Math.sqrt(Math.pow(pos.getX() - center.getX(), 2)
+                            + Math.pow(pos.getZ() - center.getZ(), 2));
+                        if (dist < nearestDist) { nearestDist = dist; nearest = center; }
+                    }
+                    String hint = nearest != null
+                        ? " (nearest colony center " + nearest + ", dist=" + (int) nearestDist + ")"
+                        : " (no colony founded yet)";
+                    return "ERROR: (" + x + "," + y + "," + z + ") is outside all colony territories"
+                        + hint + "; stay within the colony's claimed chunks";
+                }
+            }
+        }
+
         BlockState state = block.defaultBlockState();
 
         level.setBlockAndUpdate(pos, state);
@@ -1164,22 +1201,7 @@ public class VoyagerBridge {
             blueprintNote = " (no known blueprint path for type '" + typeName + "', placed without one)";
         }
 
-        // Colony territory check: after placement, verify the block ended up inside
-        // the colony's claimed territory. MineColonies limits citizen pathfinding to
-        // within colony-claimed chunks; a building registered outside the territory
-        // will have an assigned worker but that worker will never actually move there.
-        // initialColonySize defaults to 4 chunks (64 blocks) at townhall level 0.
-        String territoryWarning = "";
-        IColony placedInColony = findColonyAt(level, pos);
-        if (placedInColony != null && !placedInColony.isCoordInColony(level, pos)) {
-            BlockPos center = placedInColony.getCenter();
-            double dist = Math.sqrt(Math.pow(pos.getX() - center.getX(), 2)
-                + Math.pow(pos.getZ() - center.getZ(), 2));
-            territoryWarning = " WARNING: position is outside colony claimed territory"
-                + " (dist=" + (int) dist + " from center; workers assigned here may not move)";
-        }
-
-        return "placed " + blockId + " at " + x + "," + y + "," + z + blueprintNote + territoryWarning;
+        return "placed " + blockId + " at " + x + "," + y + "," + z + blueprintNote;
     }
 
     // Robust colony lookup: tries the standard position-based lookup first, then
