@@ -428,9 +428,27 @@ public class VoyagerBridge {
                             return;
                         }
                     }
+                    // requestUpgrade's second argument is the BlockPos of the builder's
+                    // hut that should handle this work order - NOT the target building's
+                    // own position. Passing pos (the target building) worked for builder
+                    // huts building themselves (pos == their own hut), but silently
+                    // produced no work order for every other building type.
+                    // For builder huts: assign to self (pos). For others: find any lv1+ hut.
+                    BlockPos builderHutPos = isBuilderHut ? pos
+                        : colony.getServerBuildingManager().getBuildings().values().stream()
+                            .filter(bld -> {
+                                ResourceLocation bldKey = ForgeRegistries.BLOCKS.getKey(
+                                    level.getBlockState(bld.getPosition()).getBlock());
+                                return bldKey != null && "blockhutbuilder".equals(bldKey.getPath())
+                                    && bld.getBuildingLevel() >= 1;
+                            })
+                            .map(IBuilding::getPosition)
+                            .findFirst()
+                            .orElse(pos);
                     Player fakePlayer = new FakePlayer(level, AI_PROFILE);
-                    building.requestUpgrade(fakePlayer, pos);
-                    result.complete("requested build for building at " + x + "," + y + "," + z);
+                    building.requestUpgrade(fakePlayer, builderHutPos);
+                    result.complete("requested build for building at " + x + "," + y + "," + z
+                        + " (assigned to builder hut at " + builderHutPos + ")");
                 } catch (Exception e) {
                     LOGGER.error("requestBuild failed", e);
                     result.complete("ERROR: " + e);
@@ -1030,7 +1048,10 @@ public class VoyagerBridge {
         IColony nearbyColony = IColonyManager.getInstance().getIColony(level, pos);
         if (nearbyColony != null) {
             for (IBuilding existingBld : nearbyColony.getServerBuildingManager().getBuildings().values()) {
-                if (existingBld.getPosition().equals(pos)) continue; // replacing same spot is fine
+                // Note: no same-position exception here. Placing a different building type
+                // at an existing building's anchor block silently destroys it in MineColonies
+                // and leaves the replacement in a broken state where requestUpgrade() no
+                // longer creates work orders. Treat same-anchor as a footprint collision.
                 try {
                     if (existingBld.isInBuilding(pos)) {
                         ResourceLocation existKey = ForgeRegistries.BLOCKS.getKey(
