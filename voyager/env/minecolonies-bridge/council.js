@@ -178,7 +178,8 @@ function buildGovernorSystemPrompt(gov) {
 {"say":"<日本語で一言、40文字以内、他の統治者への発言や状況へのコメント>","action":{"action":"<action名>", ...パラメータ}}
 
 actionの種類:
-- {"action":"place","x":<int>,"y":<int>,"z":<int>,"block":"<block_id>"} ← 下の対応表のblock_idをそのまま使うこと
+- {"action":"placeNext","block":"<block_id>"} ← 座標は自動計算(推奨。座標ミスなし)
+- {"action":"place","x":<int>,"y":<int>,"z":<int>,"block":"<block_id>"} ← 座標を手動指定する場合のみ(town hall初回配置など)
 - {"action":"found","x":<int>,"y":<int>,"z":<int>,"name":"<colony name>"}
 - {"action":"spawnCitizen","colonyId":${COLONY_ID}}
 - {"action":"requestBuild","x":<int>,"y":<int>,"z":<int>}
@@ -195,33 +196,33 @@ ${buildingTable()}
 - 他の統治者の直前の発言や行動を踏まえて、被らないように調整すること。
 - アンカー座標(${ANCHOR.x},${ANCHOR.y},${ANCHOR.z})付近に建てる。
 
-建物配置ルール(厳守):
-各建物には以下の実寸(X×Z幅、建物の一端からもう一端まで)があるため、隣同士の配置時は双方のサイズを考慮して最低5ブロックの隙間を確保すること:
-  townhall:38×33  tavern:22×20  warehouse:20×24  farm:25×20  mine:13×22
-  fisher:22×16  hospital:16×17  restaurant:17×17  forester:11×19
-  citizen:13×15  guardtower:11×10  builder:22×11  courier:4×2
-
-推奨配置座標(アンカー200,64,200基準、5ブロック間隔計算済み):
-  Row1(z=200): townhall→(200,-60,200)  builder#1→(243,-60,200)  citizen#1→(270,-60,200)  citizen#2→(288,-60,200)
-  Row2(z=238): tavern→(200,-60,238)  warehouse→(227,-60,238)  courier→(252,-60,238)  fisher→(261,-60,238)  forester→(288,-60,238)
-  Row3(z=267): mine→(200,-60,267)  restaurant→(218,-60,267)  farm→(240,-60,267)  guardtower→(270,-60,267)  builder#2→(286,-60,267)
-
-- 建物はy=-60で置く(このワールドの地表レベル)。
-- /placeがERROR(既存建物の範囲と重複)を返したら次の推奨座標を使うこと。絶対に同じ座標で再試行しない。
-- 推奨座標以外に配置する場合は、上の実寸を使って隣接建物から5ブロック以上の隙間を計算すること。
+建物配置ルール:
+- town hall以外はすべて {"action":"placeNext","block":"<block_id>"} を使うこと。座標は bridge 側が自動計算する(コロニー領域内・既存建物と重複しない最近傍)。
+- town hall のみ手動配置: {"action":"place","x":${ANCHOR.x},"y":${ANCHOR.y},"z":${ANCHOR.z},"block":"minecolonies:blockhuttownhall"}
+- placeNextの後にstatus確認→その建物の座標でrequestBuildを呼ぶ(pending=falseのまま放置しない)。
+- placeNextがERRORを返したら、その建物タイプは今のコロニー領域に入らないということなのでwaitして領域拡大を待つ。
 
 資材供給について(重要):
 - supply_bot.js が並走しており、全市民のオープンリクエストを自動で解決し続けている。資材不足は自動解決されるので、あなたは建設計画に専念してよい。
 - 道具は建物レベルで使える上限が決まる(lv0-1→石製まで, lv2→鉄製まで, lv3→ダイヤまで)。supply_botが自動対応するので手動で渡す必要は原則ない。
 - builderがstuckの場合のみ、/openRequestsで確認した要求アイテムをそのまま giveToCitizen で渡すこと。
 
-進行戦略(この順番を守ること):
-1. town hallを置いてfound → town hallはまだrequestBuildしない(builderが必要なため)
-2. spawnCitizenで市民を8人スポーン(builderになる人員を確保するため)
-3. builder hutを8棟置いてそれぞれrequestBuild → 市民がbuilderに自動割り当てされ自分のhutを建設し始める
-4. 全builderのBuilder's HutがoperationalになったらrequestBuild for town hall
-5. 住居(blockhutcitizen)・食料系(blockhutfisherman, blockhutfarmer)・倉庫(blockhutwarehouse)+配達(blockhutdeliveryman)を優先して建設
-6. waitは「今サイクルで何もすることがない」時だけ使う。常に何か行動できることを探すこと。
+進行戦略(毎ターン status を読んで判断すること):
+【判断ロジック】以下の条件を上から順にチェックし、最初に該当したアクションを実行する:
+
+A. town hallが存在しない → place town hall at (${ANCHOR.x},${ANCHOR.y},${ANCHOR.z}) → found
+B. builder hutが0棟 → spawnCitizen(市民が0人なら)またはplaceNext builder hut
+C. requestBuildしていないbuilder hutがある(pending=false かつ operational=false) → requestBuild その builder hut
+D. builder hutが建設中(pending=true)のものがある かつ operational=trueのbuilder hutが2棟未満 → wait(まだbuilder hutを増やすタイミングではない)
+E. operational=trueのbuilder hutが存在 かつ builder hutが計4棟未満 → placeNext builder hut
+F. operational=trueのbuilder hutが4棟以上 かつ town hallのrequestBuildがまだ → requestBuild town hall (243,-60,200)... いや、town hallの座標をstatusから読んで requestBuild
+G. 上記以外 → 住居・食料・倉庫・配達を1棟ずつplaceNext → requestBuild
+
+【重要ルール】
+- 1ターンに1アクションのみ。複数の建物を一度に置かない。
+- pending=trueの建物が多い時はwait。builderが同時に処理できる案件は hut 数分だけ。
+- 他の統治者が直前にplaceNextを呼んだなら、自分はrequestBuildかwaitにする(被り防止)。
+- waitは「建設中で何もできない」時のみ。必ず理由をsayで共有。
 
 重要な仕組み(必ず守ること):
 - Builder's Hut(blockhutbuilder)のレベルが建設できる建物の上限を決める。
@@ -292,6 +293,8 @@ async function governorTurn(gov, history, status) {
 
 async function runGovernorAction(action) {
   switch (action.action) {
+    case "placeNext":
+      return httpRequest("POST", `/placeNext?block=${encodeURIComponent(action.block)}&colonyId=${action.colonyId || COLONY_ID}`);
     case "place":
       return httpRequest("POST", `/place?x=${action.x}&y=${action.y}&z=${action.z}&block=${encodeURIComponent(action.block)}`);
     case "found":

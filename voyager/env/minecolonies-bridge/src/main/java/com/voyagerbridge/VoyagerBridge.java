@@ -27,6 +27,7 @@ import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.common.util.FakePlayer;
+import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
@@ -59,6 +60,65 @@ public class VoyagerBridge {
     private MinecraftServer server;
     private HttpServer httpServer;
 
+    // Tick rate multiplier, set via POST /tickrate?multiplier=N.
+    private static volatile int tickMultiplier = 1;
+
+    public static int getTickMultiplier() { return tickMultiplier; }
+
+    // Cached reflection access to MinecraftServer.nextTickTime (SRG: f_129726_).
+    // Set to non-null once resolved; null means "not found or not yet searched."
+    private static volatile java.lang.reflect.Field nextTickTimeField = null;
+    private static volatile boolean nextTickTimeSearched = false;
+
+    private static java.lang.reflect.Field resolveNextTickTimeField(MinecraftServer srv) {
+        if (nextTickTimeSearched) return nextTickTimeField;
+        nextTickTimeSearched = true;
+        // Search the class hierarchy for a long field matching either name.
+        Class<?> cls = srv.getClass();
+        while (cls != null) {
+            for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
+                if (f.getType() != long.class) continue;
+                String n = f.getName();
+                if ("nextTickTime".equals(n) || "f_129726_".equals(n)) {
+                    f.setAccessible(true);
+                    nextTickTimeField = f;
+                    return f;
+                }
+            }
+            cls = cls.getSuperclass();
+        }
+        return null;
+    }
+
+    // Called at the END of each server tick, before waitUntilNextTick() sleeps.
+    // When multiplier > 1, we rewind nextTickTime so the upcoming managedBlock()
+    // (which adds 50ms then loops until time is past) exits immediately, giving
+    // approximately mult × 20 TPS (bounded by actual tick processing cost).
+    //
+    // IMPORTANT: nextTickTime uses Util.getMillis() = System.nanoTime()/1_000_000L
+    // (milliseconds since system boot), NOT System.currentTimeMillis() (Unix epoch).
+    // Using currentTimeMillis() would set nextTickTime ~58 years into the future,
+    // causing the tick loop to block indefinitely.
+    @SubscribeEvent
+    public void onServerTick(TickEvent.ServerTickEvent event) {
+        if (event.phase != TickEvent.Phase.START) return;
+        int mult = tickMultiplier;
+        if (mult <= 1 || server == null) return;
+        java.lang.reflect.Field f = resolveNextTickTimeField(server);
+        if (f == null) return;
+        try {
+            // At Phase.START, the previous managedBlock has just set nextTickTime
+            // to prevNextTickTime + 50 (and then waited for it).
+            // nextTickTime ≈ Util.getMillis() right now.
+            // We subtract (50 - 50/mult) so that upcoming managedBlock's += 50
+            // targets only 50/mult ms in the future instead of 50ms.
+            // Util.getMillis() == System.nanoTime() / 1_000_000L (boot-time base)
+            long cur = f.getLong(server);
+            long adj = 50L - 50L / mult;  // for mult=10: 45ms
+            f.setLong(server, cur - adj);
+        } catch (Exception ignored) {}
+    }
+
     public VoyagerBridge() {
         MinecraftForge.EVENT_BUS.register(this);
     }
@@ -78,6 +138,10 @@ public class VoyagerBridge {
             httpServer.createContext("/openRequests", this::handleOpenRequests);
             httpServer.createContext("/resolveRequest", this::handleResolveRequest);
             httpServer.createContext("/clearCitizenInventory", this::handleClearCitizenInventory);
+            httpServer.createContext("/placeNext", this::handlePlaceNext);
+            httpServer.createContext("/suggestPosition", this::handleSuggestPosition);
+            httpServer.createContext("/tickrate", this::handleTickrate);
+            httpServer.createContext("/debugTick", this::handleDebugTick);
             httpServer.createContext("/ping", VoyagerBridge::handlePing);
             httpServer.setExecutor(null);
             httpServer.start();
@@ -340,7 +404,7 @@ public class VoyagerBridge {
                             firstR = false;
                         }
                     }
-                    sb.append("],\"citizens\":[");
+                    sb.append("],\"gameTime\":").append(level.getGameTime()).append(",\"citizens\":[");
                     for (int j = 0; j < citizens.size(); j++) {
                         ICitizenData cit = citizens.get(j);
                         if (j > 0) sb.append(",");
@@ -984,6 +1048,235 @@ public class VoyagerBridge {
         }
     }
 
+    // POST /tickrate?multiplier=10
+    // Sets the tick rate multiplier. multiplier=1 restores normal 20 TPS.
+    // The actual sleep removal is implemented in MinecraftServerMixin via Mixin.
+    private void handleTickrate(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int mult = Integer.parseInt(params.getOrDefault("multiplier", "1"));
+            if (mult < 1) mult = 1;
+            tickMultiplier = mult;
+            respond(exchange, 200, "{\"result\":\"multiplier=" + mult + "\"}");
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // GET /debugTick — dumps MinecraftServer class hierarchy long fields and current nextTickTime value.
+    private void handleDebugTick(HttpExchange exchange) throws IOException {
+        StringBuilder sb = new StringBuilder("{");
+        sb.append("\"multiplier\":").append(tickMultiplier);
+        sb.append(",\"fields\":[");
+        boolean first = true;
+        Class<?> cls = server.getClass();
+        while (cls != null) {
+            for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
+                if (f.getType() != long.class) continue;
+                if (!first) sb.append(",");
+                first = false;
+                sb.append("{\"class\":\"").append(escape(cls.getSimpleName()))
+                  .append("\",\"name\":\"").append(escape(f.getName())).append("\"");
+                try {
+                    f.setAccessible(true);
+                    sb.append(",\"value\":").append(f.getLong(server));
+                } catch (Exception e) {
+                    sb.append(",\"error\":\"").append(escape(e.getMessage())).append("\"");
+                }
+                sb.append("}");
+            }
+            cls = cls.getSuperclass();
+        }
+        sb.append("],\"currentMs\":").append(System.currentTimeMillis());
+        sb.append(",\"resolvedField\":\"").append(nextTickTimeField != null ? escape(nextTickTimeField.getName()) : "null").append("\"");
+        sb.append("}");
+        respond(exchange, 200, sb.toString());
+    }
+
+    // POST /placeNext?block=minecolonies:blockhutbuilder&colonyId=1
+    // Finds the nearest valid position for the building type (within territory,
+    // no footprint overlap) and places it there in one step. The caller should
+    // follow up with /requestBuild at the returned coordinates.
+    private void handlePlaceNext(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            String blockId = params.getOrDefault("block", "");
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    int[] pos = findPlacementPos(blockId, colonyId);
+                    if (pos == null) {
+                        result.complete("ERROR: no valid position found within territory for " + blockId);
+                        return;
+                    }
+                    String placed = placeOnServerThread(pos[0], pos[1], pos[2], blockId);
+                    if (placed.startsWith("ERROR")) {
+                        result.complete(placed);
+                    } else {
+                        result.complete(placed + " [pos:" + pos[0] + "," + pos[1] + "," + pos[2] + "]");
+                    }
+                } catch (Exception e) {
+                    LOGGER.error("placeNext failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // GET /suggestPosition?block=minecolonies:blockhutbuilder&colonyId=1
+    // Returns the nearest available anchor coordinate for the given building type
+    // that fits inside the colony's territory (≤60 blocks from center) without
+    // overlapping any already-placed building footprint (including 5-block gap).
+    private void handleSuggestPosition(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            String blockId = params.getOrDefault("block", "");
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    result.complete(suggestPositionOnServerThread(blockId, colonyId));
+                } catch (Exception e) {
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, outcome);
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // Footprint sizes (X-width × Z-depth) matching the Colonial pack's level-1
+    // blueprints. Used by suggestPosition to check for collisions between buildings.
+    // Keys match the type names in BLUEPRINT_PATHS (part after "blockhut").
+    private static final java.util.Map<String, int[]> BUILDING_FOOTPRINTS = new java.util.HashMap<>();
+    static {
+        BUILDING_FOOTPRINTS.put("townhall",    new int[]{38, 33});
+        BUILDING_FOOTPRINTS.put("builder",     new int[]{22, 11});
+        BUILDING_FOOTPRINTS.put("citizen",     new int[]{13, 15});
+        BUILDING_FOOTPRINTS.put("warehouse",   new int[]{20, 24});
+        BUILDING_FOOTPRINTS.put("tavern",      new int[]{22, 20});
+        BUILDING_FOOTPRINTS.put("farmer",      new int[]{25, 20});
+        BUILDING_FOOTPRINTS.put("miner",       new int[]{13, 22});
+        BUILDING_FOOTPRINTS.put("fisherman",   new int[]{22, 16});
+        BUILDING_FOOTPRINTS.put("hospital",    new int[]{16, 17});
+        BUILDING_FOOTPRINTS.put("kitchen",     new int[]{17, 17});
+        BUILDING_FOOTPRINTS.put("lumberjack",  new int[]{11, 19});
+        BUILDING_FOOTPRINTS.put("guardtower",  new int[]{11, 10});
+        BUILDING_FOOTPRINTS.put("deliveryman", new int[]{4, 2});
+        BUILDING_FOOTPRINTS.put("courier",     new int[]{4, 2});
+    }
+
+    private String suggestPositionOnServerThread(String blockId, int colonyId) {
+        ServerLevel level = server.overworld();
+        IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
+        if (colony == null) return "ERROR: no colony with id " + colonyId;
+        int[] pos = findPlacementPos(blockId, colonyId);
+        if (pos == null) return "ERROR: no valid position found within 60 blocks of colony center";
+        BlockPos center = colony.getCenter();
+        double dist = Math.sqrt(Math.pow(pos[0] - center.getX(), 2) + Math.pow(pos[2] - center.getZ(), 2));
+        return "{\"x\":" + pos[0] + ",\"y\":" + pos[1] + ",\"z\":" + pos[2]
+            + ",\"dist\":" + String.format("%.1f", dist) + "}";
+    }
+
+    // Finds the nearest valid anchor position for a building type within the
+    // colony's territory. Returns {x, y, z} or null if no valid position exists.
+    private int[] findPlacementPos(String blockId, int colonyId) {
+        ServerLevel level = server.overworld();
+        IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
+        if (colony == null) return null;
+
+        BlockPos center = colony.getCenter();
+        String typeName = blockId.contains(":")
+            ? blockId.substring(blockId.indexOf(':') + 1).replaceFirst("^blockhut", "")
+            : blockId.replaceFirst("^blockhut", "");
+        int[] fp = BUILDING_FOOTPRINTS.getOrDefault(typeName, new int[]{10, 10});
+        int bw = fp[0];
+        int bd = fp[1];
+
+        java.util.List<int[]> existing = new java.util.ArrayList<>();
+        for (IBuilding b : colony.getServerBuildingManager().getBuildings().values()) {
+            BlockPos bp = b.getPosition();
+            ResourceLocation bKey = ForgeRegistries.BLOCKS.getKey(level.getBlockState(bp).getBlock());
+            String bType = bKey != null ? bKey.getPath().replaceFirst("^blockhut", "") : "";
+            int[] bFp = BUILDING_FOOTPRINTS.getOrDefault(bType, new int[]{10, 10});
+            existing.add(new int[]{bp.getX(), bp.getZ(), bFp[0], bFp[1]});
+        }
+
+        final int GAP = 5;
+        final int MAX_DIST = 60;
+        final int Y = center.getY();
+
+        java.util.List<int[]> offsets = new java.util.ArrayList<>(15000);
+        for (int dx = -MAX_DIST; dx <= MAX_DIST; dx++) {
+            for (int dz = -MAX_DIST; dz <= MAX_DIST; dz++) {
+                double dist = Math.sqrt((double)(dx * dx + dz * dz));
+                if (dist <= MAX_DIST) {
+                    offsets.add(new int[]{dx, dz, (int)(dist * 1000)});
+                }
+            }
+        }
+        offsets.sort((a, b2) -> a[2] - b2[2]);
+
+        java.util.List<IBuilding> allBuildings = new java.util.ArrayList<>(
+            colony.getServerBuildingManager().getBuildings().values());
+
+        for (int[] off : offsets) {
+            int nx = center.getX() + off[0];
+            int nz = center.getZ() + off[1];
+            BlockPos anchor = new BlockPos(nx, Y, nz);
+            if (!colony.isCoordInColony(level, anchor)) continue;
+
+            // Use MineColonies' own isInBuilding for the anchor to catch actual
+            // blueprint bounds (which may extend in -Z or be larger than our table).
+            boolean anchorInside = false;
+            for (IBuilding b : allBuildings) {
+                try {
+                    if (b.isInBuilding(anchor)) { anchorInside = true; break; }
+                } catch (Exception ignored) {}
+            }
+            if (anchorInside) continue;
+
+            // Also check that the new building's footprint (table-based) doesn't
+            // overlap any existing building's footprint (table-based + GAP).
+            boolean conflict = false;
+            for (int[] eb : existing) {
+                int exX0 = eb[0] - GAP, exX1 = eb[0] + eb[2] - 1 + GAP;
+                int ezZ0 = eb[1] - GAP, ezZ1 = eb[1] + eb[3] - 1 + GAP;
+                if (nx <= exX1 && nx + bw - 1 >= exX0 && nz <= ezZ1 && nz + bd - 1 >= ezZ0) {
+                    conflict = true;
+                    break;
+                }
+            }
+            if (!conflict) return new int[]{nx, Y, nz};
+        }
+        return null;
+    }
+
     // Buildings that require university research before they can be built.
     // Derived from data/minecolonies/researches/effects/blockhu*.json entries
     // in minecolonies-*.jar. Effect IDs follow the pattern
@@ -1153,14 +1446,17 @@ public class VoyagerBridge {
                 return "ERROR: (" + x + "," + y + "," + z + ") no colony founded yet";
             }
 
-            // Hard cap: stay within 60 blocks of colony center to satisfy both
-            // MineColonies' chunk-claim check AND its internal requestUpgrade radius check.
-            // The initial territory is ~64 blocks; we use 60 as a safe margin.
-            if (nearestDist > 60) {
+            // Hard cap: stay within 62 blocks of colony center. MineColonies' initial
+            // territory is 4 chunks = 64 blocks; requestUpgrade silently rejects work
+            // orders beyond that radius. We use 62 to stay 2 blocks inside the limit.
+            // When the town hall is upgraded, the territory expands by 1 chunk per level
+            // (to 80, 96, ... blocks), but this code uses 62 for safety at level 0.
+            // TODO: read colony.getMaxColonySize() to compute the dynamic limit.
+            if (nearestDist > 62) {
                 BlockPos center = nearestColony.getCenter();
                 return "ERROR: (" + x + "," + y + "," + z + ") is " + (int) nearestDist
                     + " blocks from colony center " + center
-                    + "; max 60 blocks allowed (colony territory ~64 blocks, needs margin)";
+                    + "; max 62 blocks allowed at townhall level 0 (territory ~64 blocks)";
             }
 
             // Also verify the position is in a claimed chunk (for multi-colony safety).
