@@ -208,19 +208,60 @@ public class VoyagerBridge {
             int colonyId = Integer.parseInt(params.get("colonyId"));
 
             java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            // Phase 1 (server thread): ensure max cap and force-load colony chunks.
+            // setChunkForced schedules a ticket that ChunkMap.tick() processes on the
+            // same or next server tick; isPositionEntityTicking won't be true until
+            // after that tick completes. We run phase 1, sleep 100ms on the HTTP
+            // thread (≈2 server ticks), then run phase 2 to do the actual spawn.
+            java.util.concurrent.CompletableFuture<Void> phase1 = new java.util.concurrent.CompletableFuture<>();
             server.execute(() -> {
                 try {
                     IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, server.overworld());
                     if (colony == null) {
                         result.complete("ERROR: no colony with id " + colonyId);
+                        phase1.complete(null);
                         return;
                     }
                     int before = colony.getCitizenManager().getCurrentCitizenCount();
-                    colony.getCitizenManager().spawnOrCreateCivilian(null, colony.getWorld(), new java.util.ArrayList<>(), true);
+                    int cap = colony.getCitizenManager().getMaxCitizens();
+                    if (cap <= before) {
+                        colony.getCitizenManager().setMaxCitizens(before + 1);
+                    }
+                    ServerLevel overworld = server.overworld();
+                    BlockPos center = colony.getCenter();
+                    // Force-load a 3×3 chunk area around town hall so entity ticking
+                    // is enabled even with no player connected.
+                    int cx = center.getX() >> 4;
+                    int cz = center.getZ() >> 4;
+                    for (int dx = -1; dx <= 1; dx++) {
+                        for (int dz = -1; dz <= 1; dz++) {
+                            overworld.setChunkForced(cx + dx, cz + dz, true);
+                        }
+                    }
+                    phase1.complete(null);
+                } catch (Exception e) {
+                    LOGGER.error("spawnCitizen phase1 failed", e);
+                    result.complete("ERROR: " + e);
+                    phase1.complete(null);
+                }
+            });
+            phase1.get(); // wait for phase 1 on HTTP thread
+            Thread.sleep(120); // 2-3 ticks for ChunkMap to process the tickets
+            // Phase 2 (server thread): spawn the citizen now that ticking is active.
+            server.execute(() -> {
+                try {
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, server.overworld());
+                    if (colony == null || result.isDone()) { result.complete("ERROR: colony gone"); return; }
+                    int before = colony.getCitizenManager().getCurrentCitizenCount();
+                    ServerLevel overworld = server.overworld();
+                    BlockPos center = colony.getCenter();
+                    java.util.List<BlockPos> spawnPos = new java.util.ArrayList<>();
+                    spawnPos.add(center);
+                    colony.getCitizenManager().spawnOrCreateCivilian(null, overworld, spawnPos, true);
                     int after = colony.getCitizenManager().getCurrentCitizenCount();
                     result.complete("citizen count " + before + " -> " + after);
                 } catch (Exception e) {
-                    LOGGER.error("spawnCitizen failed", e);
+                    LOGGER.error("spawnCitizen phase2 failed", e);
                     result.complete("ERROR: " + e);
                 }
             });
