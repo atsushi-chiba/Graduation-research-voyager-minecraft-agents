@@ -176,8 +176,10 @@ public class VoyagerBridge {
         // auto-creates the colony - check for that before attempting a second createColony
         IColony existingOwned = IColonyManager.getInstance().getIColonyByOwner(level, fakePlayer);
         if (existingOwned != null) {
-            existingOwned.setName(colonyName);
-            return "founded colony " + existingOwned.getID() + " (" + colonyName + ")";
+            try { existingOwned.setName(colonyName); } catch (Exception ignored) {}
+            String packName = existingOwned.getStructurePack();
+            return "founded colony " + existingOwned.getID() + " (" + colonyName + ")"
+                + (packName != null && !packName.isEmpty() ? " with pack " + packName : "");
         }
 
         BlockPos pos = new BlockPos(x, y, z);
@@ -486,10 +488,30 @@ public class VoyagerBridge {
                             .map(IBuilding::getPosition)
                             .findFirst()
                             .orElse(pos);
+                    // If the building has no blueprint path (can happen when getBuilding(pos)
+                    // returned null during /place and the IBuilding was not patched), fix it
+                    // now before requestUpgrade reads the path to create the work order.
+                    if (building.getBlueprintPath() == null || building.getBlueprintPath().isEmpty()) {
+                        String typeName = targetKey != null ? targetKey.getPath().replaceFirst("^blockhut", "") : "";
+                        String bpPath = BLUEPRINT_PATHS.get(typeName);
+                        StructurePackMeta pack = getPinnedPack();
+                        if (bpPath != null && pack != null) {
+                            try { building.setStructurePack(pack.getName()); } catch (NullPointerException ignored) {}
+                            try { building.setBlueprintPath(bpPath); } catch (NullPointerException ignored) {}
+                            BlockEntity te = level.getBlockEntity(pos);
+                            if (te instanceof TileEntityColonyBuilding) {
+                                try { ((TileEntityColonyBuilding) te).setStructurePack(pack); } catch (Exception ignored) {}
+                                try { ((TileEntityColonyBuilding) te).setBlueprintPath(bpPath); } catch (Exception ignored) {}
+                            }
+                        }
+                    }
+                    String pathBeforeUpgrade = building.getBlueprintPath();
                     Player fakePlayer = new FakePlayer(level, AI_PROFILE);
                     building.requestUpgrade(fakePlayer, builderHutPos);
+                    boolean nowPending = building.isPendingConstruction();
                     result.complete("requested build for building at " + x + "," + y + "," + z
-                        + " (assigned to builder hut at " + builderHutPos + ")");
+                        + " (assigned to builder hut at " + builderHutPos + ")"
+                        + (nowPending ? "" : " [WARN: not pending after requestUpgrade; path='" + pathBeforeUpgrade + "']"));
                 } catch (Exception e) {
                     LOGGER.error("requestBuild failed", e);
                     result.complete("ERROR: " + e);
@@ -1108,39 +1130,44 @@ public class VoyagerBridge {
             }
         }
         // Territory check: non-town-hall buildings must be placed inside a colony's
-        // claimed territory. IColonyManager.getIColony() returns the colony only if
-        // the position is within its territory, so null means "outside all colonies".
-        // Town halls are exempt - they found a new colony anywhere.
+        // Territory check: non-town-hall buildings must be inside the colony AND within
+        // the effective build radius. Two separate limits apply:
+        //   1. Chunk-claim territory: IColonyManager.getIColony / isCoordInColony
+        //   2. Euclidean radius: MineColonies silently rejects requestUpgrade for work
+        //      orders whose target building is > ~64 blocks from the colony center. The
+        //      chunk-claim check is looser (includes edge chunks), so we add an explicit
+        //      distance guard of 60 blocks to stay safely inside both limits.
         boolean isTownHall = "blockhuttownhall".equals(rl.getPath());
         if (!isTownHall) {
-            IColony territoryColony = IColonyManager.getInstance().getIColony(level, pos);
-            if (territoryColony == null) {
-                // Fall back to scanning buildings in case getIColony misses edge chunks,
-                // but the building at pos doesn't exist yet so this mainly catches the
-                // case where a colony happens to claim the chunk via a different path.
-                boolean foundByBuildings = false;
-                for (IColony c : IColonyManager.getInstance().getAllColonies()) {
-                    if (c.getDimension().equals(level.dimension()) && c.isCoordInColony(level, pos)) {
-                        foundByBuildings = true;
-                        break;
-                    }
-                }
-                if (!foundByBuildings) {
-                    BlockPos nearest = null;
-                    double nearestDist = Double.MAX_VALUE;
-                    for (IColony c : IColonyManager.getInstance().getAllColonies()) {
-                        if (!c.getDimension().equals(level.dimension())) continue;
-                        BlockPos center = c.getCenter();
-                        double dist = Math.sqrt(Math.pow(pos.getX() - center.getX(), 2)
-                            + Math.pow(pos.getZ() - center.getZ(), 2));
-                        if (dist < nearestDist) { nearestDist = dist; nearest = center; }
-                    }
-                    String hint = nearest != null
-                        ? " (nearest colony center " + nearest + ", dist=" + (int) nearestDist + ")"
-                        : " (no colony founded yet)";
-                    return "ERROR: (" + x + "," + y + "," + z + ") is outside all colony territories"
-                        + hint + "; stay within the colony's claimed chunks";
-                }
+            IColony nearestColony = null;
+            double nearestDist = Double.MAX_VALUE;
+            for (IColony c : IColonyManager.getInstance().getAllColonies()) {
+                if (!c.getDimension().equals(level.dimension())) continue;
+                BlockPos center = c.getCenter();
+                double dist = Math.sqrt(Math.pow(pos.getX() - center.getX(), 2)
+                    + Math.pow(pos.getZ() - center.getZ(), 2));
+                if (dist < nearestDist) { nearestDist = dist; nearestColony = c; }
+            }
+
+            if (nearestColony == null) {
+                return "ERROR: (" + x + "," + y + "," + z + ") no colony founded yet";
+            }
+
+            // Hard cap: stay within 60 blocks of colony center to satisfy both
+            // MineColonies' chunk-claim check AND its internal requestUpgrade radius check.
+            // The initial territory is ~64 blocks; we use 60 as a safe margin.
+            if (nearestDist > 60) {
+                BlockPos center = nearestColony.getCenter();
+                return "ERROR: (" + x + "," + y + "," + z + ") is " + (int) nearestDist
+                    + " blocks from colony center " + center
+                    + "; max 60 blocks allowed (colony territory ~64 blocks, needs margin)";
+            }
+
+            // Also verify the position is in a claimed chunk (for multi-colony safety).
+            if (!nearestColony.isCoordInColony(level, pos)) {
+                BlockPos center = nearestColony.getCenter();
+                return "ERROR: (" + x + "," + y + "," + z + ") is not in the colony's claimed chunks"
+                    + " (colony center " + center + ", dist=" + (int) nearestDist + ")";
             }
         }
 
@@ -1181,7 +1208,15 @@ public class VoyagerBridge {
             if (pack != null) {
                 IColony bldColony = findColonyAt(level, pos);
                 if (bldColony != null) {
+                    // getBuilding(pos) uses a key-lookup path that can miss buildings
+                    // registered via setPlacedBy (key format mismatch). Fall back to
+                    // scanning getBuildings().values() so we always find the building.
                     IBuilding bld = bldColony.getServerBuildingManager().getBuilding(pos);
+                    if (bld == null) {
+                        for (IBuilding candidate : bldColony.getServerBuildingManager().getBuildings().values()) {
+                            if (candidate.getPosition().equals(pos)) { bld = candidate; break; }
+                        }
+                    }
                     if (bld != null) {
                         try { bld.setStructurePack(pack.getName()); } catch (NullPointerException ignored) {}
                         try { bld.setBlueprintPath(path); } catch (NullPointerException ignored) {}
@@ -1192,8 +1227,8 @@ public class VoyagerBridge {
                 // their own fields, no back-delegation, safe without building link).
                 BlockEntity te = level.getBlockEntity(pos);
                 if (te instanceof TileEntityColonyBuilding) {
-                    ((TileEntityColonyBuilding) te).setStructurePack(pack);
-                    ((TileEntityColonyBuilding) te).setBlueprintPath(path);
+                    try { ((TileEntityColonyBuilding) te).setStructurePack(pack); } catch (Exception ignored) {}
+                    try { ((TileEntityColonyBuilding) te).setBlueprintPath(path); } catch (Exception ignored) {}
                 }
                 blueprintNote = " (blueprint " + pack.getName() + "/" + path + ")";
             }
