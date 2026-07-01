@@ -90,6 +90,30 @@ function httpRequest(method, path) {
   });
 }
 
+// Scan for the first syntactically complete JSON object in text.
+// The greedy /\{[\s\S]*\}/ regex breaks when the LLM appends explanation
+// text after the JSON (common with markdown code fences + reasoning notes)
+// because it stretches to the last } in the entire string.
+function extractFirstJSON(text) {
+  // Strip markdown code fence if present: ```json ... ``` or ``` ... ```
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fence) return fence[1].trim();
+  // Otherwise find the first { and walk braces to find its matching }.
+  const start = text.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0, inString = false, escape = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) { escape = false; continue; }
+    if (ch === "\\" && inString) { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === "{") depth++;
+    else if (ch === "}") { if (--depth === 0) return text.slice(start, i + 1); }
+  }
+  return null;
+}
+
 function askLLM(model, messages) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify({ model, messages });
@@ -241,16 +265,16 @@ async function governorTurn(gov, history, status) {
   }
   history.push({ role: "assistant", content: reply });
 
-  const match = reply.match(/\{[\s\S]*\}/);
-  if (!match) {
-    console.log(`[${gov.name}] no JSON in reply:`, reply);
+  const jsonStr = extractFirstJSON(reply);
+  if (!jsonStr) {
+    console.log(`[${gov.name}] no JSON in reply:`, reply.slice(0, 200));
     return;
   }
   let parsed;
   try {
-    parsed = JSON.parse(match[0]);
+    parsed = JSON.parse(jsonStr);
   } catch (e) {
-    console.log(`[${gov.name}] JSON parse failed:`, e.message, reply);
+    console.log(`[${gov.name}] JSON parse failed:`, e.message, jsonStr.slice(0, 200));
     return;
   }
 
