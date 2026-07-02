@@ -105,18 +105,126 @@ public class VoyagerBridge {
         int mult = tickMultiplier;
         if (mult <= 1 || server == null) return;
         java.lang.reflect.Field f = resolveNextTickTimeField(server);
-        if (f == null) return;
+        if (f != null) {
+            try {
+                // At Phase.START, the previous managedBlock has just set nextTickTime
+                // to prevNextTickTime + 50 (and then waited for it).
+                // nextTickTime ≈ Util.getMillis() right now.
+                // We subtract (50 - 50/mult) so that upcoming managedBlock's += 50
+                // targets only 50/mult ms in the future instead of 50ms.
+                // Util.getMillis() == System.nanoTime() / 1_000_000L (boot-time base)
+                long cur = f.getLong(server);
+                long adj = 50L - 50L / mult;  // for mult=10: 45ms
+                f.setLong(server, cur - adj);
+            } catch (Exception ignored) {}
+        }
+        suppressFloatingKicks();
+        suppressLoginTimeouts();
+    }
+
+    // --- Login timeout suppression while tick-accelerated ---
+    //
+    // Same class of problem as the flying kick below: ServerLoginPacketListenerImpl
+    // .tick() increments its `tick` counter (SRG f_10020_) once per SERVER tick and
+    // disconnects with "Took too long to log in" at 600 ticks (30s at 20 TPS). At
+    // 10x the whole login handshake budget shrinks to ~3 real seconds, which a real
+    // client cannot meet (observed: unkositai kicked at 2026-07-02 11:59 while
+    // multiplier=10). Reset the counter every tick while accelerated.
+    private static volatile java.lang.reflect.Field loginTickField = null;
+    private static volatile boolean loginTickSearched = false;
+
+    private void suppressLoginTimeouts() {
         try {
-            // At Phase.START, the previous managedBlock has just set nextTickTime
-            // to prevNextTickTime + 50 (and then waited for it).
-            // nextTickTime ≈ Util.getMillis() right now.
-            // We subtract (50 - 50/mult) so that upcoming managedBlock's += 50
-            // targets only 50/mult ms in the future instead of 50ms.
-            // Util.getMillis() == System.nanoTime() / 1_000_000L (boot-time base)
-            long cur = f.getLong(server);
-            long adj = 50L - 50L / mult;  // for mult=10: 45ms
-            f.setLong(server, cur - adj);
+            if (server.getConnection() == null) return;
+            for (net.minecraft.network.Connection conn : server.getConnection().getConnections()) {
+                net.minecraft.network.PacketListener listener = conn.getPacketListener();
+                if (!(listener instanceof net.minecraft.server.network.ServerLoginPacketListenerImpl)) continue;
+                if (!loginTickSearched) {
+                    loginTickSearched = true;
+                    Class<?> cls = listener.getClass();
+                    while (cls != null) {
+                        for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
+                            String n = f.getName();
+                            if (("tick".equals(n) || "f_10020_".equals(n)) && f.getType() == int.class) {
+                                f.setAccessible(true);
+                                loginTickField = f;
+                            }
+                        }
+                        cls = cls.getSuperclass();
+                    }
+                }
+                if (loginTickField != null) loginTickField.setInt(listener, 0);
+            }
         } catch (Exception ignored) {}
+    }
+
+    // --- Anti-"flying" kick suppression while tick-accelerated ---
+    //
+    // ServerGamePacketListenerImpl.tick() (SRG m_9933_) runs once per SERVER
+    // tick (not once per network packet). It increments aboveGroundTickCount
+    // (SRG f_9737_) whenever clientIsFloating (f_9736_) is true, and kicks the
+    // player with "multiplayer.disconnect.flying" once the counter exceeds 80
+    // (vanilla source, confirmed via javap on the SRG server jar).
+    //
+    // At normal 20 TPS, 80 ticks = 4 real seconds - plenty of slack for a
+    // legitimate jump's client/server position reconciliation. Our tick
+    // acceleration hack (above) speeds up server-tick wall-clock cadence
+    // without speeding up the connected client (which still sends movement
+    // packets at real-time cadence), so at 10x that same 80-tick budget burns
+    // in ~0.4 real seconds - not enough time for a normal jump's correction
+    // packet to arrive, so every jump gets kicked. This is not fixable by
+    // correcting a logic error; it's an unavoidable side effect of racing
+    // server ticks ahead of real-time network I/O for connected players.
+    // Mitigation: while multiplier > 1, reset the counters every tick so the
+    // vanilla check never accumulates enough to fire. This disables that one
+    // anti-cheat check during acceleration; acceptable for a private
+    // research server where the "opponent" is our own client, not a griefer.
+    private static volatile java.lang.reflect.Field clientIsFloatingField = null;
+    private static volatile java.lang.reflect.Field aboveGroundTickCountField = null;
+    private static volatile java.lang.reflect.Field clientVehicleIsFloatingField = null;
+    private static volatile java.lang.reflect.Field aboveGroundVehicleTickCountField = null;
+    private static volatile boolean floatingFieldsSearched = false;
+
+    private static void resolveFloatingFields(Object connection) {
+        if (floatingFieldsSearched) return;
+        floatingFieldsSearched = true;
+        try {
+            Class<?> cls = connection.getClass();
+            while (cls != null) {
+                for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
+                    String n = f.getName();
+                    if (("clientIsFloating".equals(n) || "f_9736_".equals(n)) && f.getType() == boolean.class) {
+                        f.setAccessible(true);
+                        clientIsFloatingField = f;
+                    } else if (("aboveGroundTickCount".equals(n) || "f_9737_".equals(n)) && f.getType() == int.class) {
+                        f.setAccessible(true);
+                        aboveGroundTickCountField = f;
+                    } else if (("clientVehicleIsFloating".equals(n) || "f_9738_".equals(n)) && f.getType() == boolean.class) {
+                        f.setAccessible(true);
+                        clientVehicleIsFloatingField = f;
+                    } else if (("aboveGroundVehicleTickCount".equals(n) || "f_9739_".equals(n)) && f.getType() == int.class) {
+                        f.setAccessible(true);
+                        aboveGroundVehicleTickCountField = f;
+                    }
+                }
+                cls = cls.getSuperclass();
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private void suppressFloatingKicks() {
+        if (server.getPlayerList() == null) return;
+        for (net.minecraft.server.level.ServerPlayer sp : server.getPlayerList().getPlayers()) {
+            Object connection = sp.connection;
+            if (connection == null) continue;
+            resolveFloatingFields(connection);
+            try {
+                if (clientIsFloatingField != null) clientIsFloatingField.setBoolean(connection, false);
+                if (aboveGroundTickCountField != null) aboveGroundTickCountField.setInt(connection, 0);
+                if (clientVehicleIsFloatingField != null) clientVehicleIsFloatingField.setBoolean(connection, false);
+                if (aboveGroundVehicleTickCountField != null) aboveGroundVehicleTickCountField.setInt(connection, 0);
+            } catch (Exception ignored) {}
+        }
     }
 
     public VoyagerBridge() {
@@ -142,6 +250,9 @@ public class VoyagerBridge {
             httpServer.createContext("/suggestPosition", this::handleSuggestPosition);
             httpServer.createContext("/tickrate", this::handleTickrate);
             httpServer.createContext("/debugTick", this::handleDebugTick);
+            httpServer.createContext("/debugFootprints", this::handleDebugFootprints);
+            httpServer.createContext("/removeBuilding", this::handleRemoveBuilding);
+            httpServer.createContext("/rebalanceWorkOrders", this::handleRebalanceWorkOrders);
             httpServer.createContext("/ping", VoyagerBridge::handlePing);
             httpServer.setExecutor(null);
             httpServer.start();
@@ -540,18 +651,40 @@ public class VoyagerBridge {
                     // own position. Passing pos (the target building) worked for builder
                     // huts building themselves (pos == their own hut), but silently
                     // produced no work order for every other building type.
-                    // For builder huts: assign to self (pos). For others: find any lv1+ hut.
-                    BlockPos builderHutPos = isBuilderHut ? pos
-                        : colony.getServerBuildingManager().getBuildings().values().stream()
+                    // For builder huts: assign to self (pos). For others: pick an
+                    // idle lv1+ hut so work fans out across builders instead of
+                    // always piling onto whichever hut the stream happens to
+                    // enumerate first (previously every non-builder-hut work
+                    // order landed on the same single builder while the rest
+                    // sat idle - see requestBuild history).
+                    BlockPos builderHutPos;
+                    if (isBuilderHut) {
+                        builderHutPos = pos;
+                    } else {
+                        java.util.List<IBuilding> capableBuilderHuts = colony.getServerBuildingManager().getBuildings().values().stream()
                             .filter(bld -> {
                                 ResourceLocation bldKey = ForgeRegistries.BLOCKS.getKey(
                                     level.getBlockState(bld.getPosition()).getBlock());
                                 return bldKey != null && "blockhutbuilder".equals(bldKey.getPath())
                                     && bld.getBuildingLevel() >= 1;
                             })
+                            .collect(java.util.stream.Collectors.toList());
+                        // Pick the hut with the fewest claimed work orders. Judging by
+                        // the citizen's jobStatus alone doesn't balance anything: the
+                        // status stays "idle" until the builder physically starts, so
+                        // a burst of requests all saw every builder idle and piled
+                        // onto the first hut in enumeration order.
+                        java.util.Map<BlockPos, Long> claimedCounts =
+                            colony.getWorkManager().getWorkOrders().values().stream()
+                                .filter(wo -> wo.getClaimedBy() != null)
+                                .collect(java.util.stream.Collectors.groupingBy(
+                                    wo -> wo.getClaimedBy(), java.util.stream.Collectors.counting()));
+                        builderHutPos = capableBuilderHuts.stream()
                             .map(IBuilding::getPosition)
-                            .findFirst()
+                            .min(java.util.Comparator.comparingLong(
+                                hutPos -> claimedCounts.getOrDefault(hutPos, 0L)))
                             .orElse(pos);
+                    }
                     // If the building has no blueprint path (can happen when getBuilding(pos)
                     // returned null during /place and the IBuilding was not patched), fix it
                     // now before requestUpgrade reads the path to create the work order.
@@ -1191,6 +1324,218 @@ public class VoyagerBridge {
         BUILDING_FOOTPRINTS.put("courier",     new int[]{4, 2});
     }
 
+    // Returns {minX, minZ, maxX, maxZ} of a placed building's actual in-world
+    // footprint via IBuilding.getCorners(). getCorners() lazily computes the
+    // corners: from the tile entity's schematic data when present, otherwise by
+    // loading the building's blueprint (structurePack/blueprintPath, which
+    // placeOnServerThread always sets) through ColonyUtils.calculateCorners().
+    // The TE-based getInWorldCorners() path used previously returned null for
+    // every bridge-placed building because we never call setSchematicCorners().
+    // If the blueprint can't be loaded MineColonies stores a degenerate
+    // (position, position) pair - return null then so the caller falls back to
+    // the BUILDING_FOOTPRINTS guess.
+    private int[] realFootprintRect(IBuilding b) {
+        try {
+            net.minecraft.util.Tuple<BlockPos, BlockPos> corners = b.getCorners();
+            if (corners != null && corners.getA() != null && corners.getA().equals(corners.getB())) {
+                // Degenerate corners persist in the colony save from sessions where
+                // the blueprint failed to load (getCorners only recomputes when the
+                // corners are still BlockPos.ZERO). Force a recompute now that the
+                // structure packs are loaded - this also heals isInBuilding() for
+                // MineColonies' own logic since calculateCorners stores the result.
+                b.calculateCorners();
+                corners = b.getCorners();
+            }
+            if (corners == null || corners.getA() == null || corners.getB() == null) return null;
+            BlockPos c1 = corners.getA();
+            BlockPos c2 = corners.getB();
+            if (c1.equals(c2)) return null;
+            return new int[]{
+                Math.min(c1.getX(), c2.getX()), Math.min(c1.getZ(), c2.getZ()),
+                Math.max(c1.getX(), c2.getX()), Math.max(c1.getZ(), c2.getZ())
+            };
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // POST /rebalanceWorkOrders?colonyId=1 - redistributes claimed building work
+    // orders round-robin across all level-1+ builder huts. Work orders created
+    // before the fewest-claimed selection existed all piled onto one hut and
+    // stay there forever (builders never steal claimed orders), so this is the
+    // one-off migration for them. Self-build orders (a builder hut building
+    // itself) keep their claim.
+    private void handleRebalanceWorkOrders(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
+                    if (colony == null) { result.complete("ERROR: no colony with id " + colonyId); return; }
+                    java.util.List<BlockPos> huts = colony.getServerBuildingManager().getBuildings().values().stream()
+                        .filter(bld -> {
+                            ResourceLocation bldKey = ForgeRegistries.BLOCKS.getKey(
+                                level.getBlockState(bld.getPosition()).getBlock());
+                            return bldKey != null && "blockhutbuilder".equals(bldKey.getPath())
+                                && bld.getBuildingLevel() >= 1;
+                        })
+                        .map(IBuilding::getPosition)
+                        .sorted(java.util.Comparator.<BlockPos>comparingInt(p -> p.getX())
+                            .thenComparingInt(p -> p.getZ()))
+                        .collect(java.util.stream.Collectors.toList());
+                    if (huts.isEmpty()) { result.complete("ERROR: no operational builder huts"); return; }
+                    StringBuilder sb = new StringBuilder();
+                    int i = 0;
+                    for (com.minecolonies.api.colony.workorders.IServerWorkOrder wo
+                            : colony.getWorkManager().getWorkOrders().values()) {
+                        if (wo.getClaimedBy() == null) continue;
+                        if (wo.getLocation() != null && wo.getLocation().equals(wo.getClaimedBy())) continue;
+                        BlockPos target = huts.get(i % huts.size());
+                        i++;
+                        if (!target.equals(wo.getClaimedBy())) {
+                            wo.setClaimedBy(target);
+                        }
+                        sb.append(wo.getLocation() == null ? "?" : wo.getLocation().toShortString())
+                          .append(" -> ").append(target.toShortString()).append("; ");
+                    }
+                    colony.getWorkManager().setDirty(true);
+                    result.complete("rebalanced " + i + " work orders: " + sb);
+                } catch (Exception e) {
+                    LOGGER.error("rebalanceWorkOrders failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            respond(exchange, outcome.startsWith("ERROR") ? 500 : 200,
+                "{\"result\":\"" + escape(outcome) + "\"}");
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // POST /removeBuilding?x=&y=&z=&colonyId=1 - deregisters the building at
+    // the given anchor from the colony (cancelling its work orders) and removes
+    // the hut block from the world. Mirrors what breaking the hut block as a
+    // player does; needed to relocate buildings placed by the old overlapping
+    // placement logic.
+    private void handleRemoveBuilding(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
+                    if (colony == null) { result.complete("ERROR: no colony with id " + colonyId); return; }
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IBuilding building = colony.getServerBuildingManager().getBuilding(pos);
+                    if (building == null) {
+                        for (IBuilding candidate : colony.getServerBuildingManager().getBuildings().values()) {
+                            if (candidate.getPosition().equals(pos)) { building = candidate; break; }
+                        }
+                    }
+                    if (building == null) { result.complete("ERROR: no building at " + x + "," + y + "," + z); return; }
+                    colony.getServerBuildingManager().removeBuilding(building, new java.util.HashSet<>());
+                    level.removeBlock(pos, false);
+                    result.complete("removed building at " + x + "," + y + "," + z);
+                } catch (Exception e) {
+                    LOGGER.error("removeBuilding failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            respond(exchange, outcome.startsWith("ERROR") ? 500 : 200,
+                "{\"result\":\"" + escape(outcome) + "\"}");
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // GET /debugFootprints?colonyId=1&block=<id> - dumps every existing
+    // building's rect as findPlacementPos would compute it (real corners vs
+    // table fallback), plus the candidate blueprint offsets for `block`.
+    // Diagnostic aid for the footprint-overlap fix; not used by agents.
+    private void handleDebugFootprints(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            String blockId = params.getOrDefault("block", "minecolonies:blockhutcitizen");
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
+                    if (colony == null) { result.complete("{\"error\":\"no colony\"}"); return; }
+                    StringBuilder sb = new StringBuilder("{\"buildings\":[");
+                    boolean first = true;
+                    for (IBuilding b : colony.getServerBuildingManager().getBuildings().values()) {
+                        if (!first) sb.append(',');
+                        first = false;
+                        BlockPos bp = b.getPosition();
+                        String corners;
+                        try {
+                            net.minecraft.util.Tuple<BlockPos, BlockPos> c = b.getCorners();
+                            corners = c == null ? "null"
+                                : "\"" + c.getA().toShortString() + " / " + c.getB().toShortString() + "\"";
+                        } catch (Exception e) {
+                            corners = "\"EX: " + escape(String.valueOf(e)) + "\"";
+                        }
+                        int[] rect = realFootprintRect(b);
+                        sb.append("{\"pos\":\"").append(bp.toShortString())
+                          .append("\",\"pack\":\"").append(escape(String.valueOf(b.getStructurePack())))
+                          .append("\",\"path\":\"").append(escape(String.valueOf(b.getBlueprintPath())))
+                          .append("\",\"corners\":").append(corners)
+                          .append(",\"rect\":").append(rect == null ? "null" : java.util.Arrays.toString(rect))
+                          .append('}');
+                    }
+                    sb.append("],\"candidate\":");
+                    String typeName = blockId.contains(":")
+                        ? blockId.substring(blockId.indexOf(':') + 1).replaceFirst("^blockhut", "")
+                        : blockId.replaceFirst("^blockhut", "");
+                    String bpPath = BLUEPRINT_PATHS.get(typeName);
+                    StructurePackMeta pinnedPack = getPinnedPack();
+                    sb.append("{\"type\":\"").append(typeName)
+                      .append("\",\"bpPath\":\"").append(bpPath)
+                      .append("\",\"pack\":\"").append(pinnedPack == null ? null : pinnedPack.getName())
+                      .append("\",\"offsets\":");
+                    if (bpPath != null && pinnedPack != null) {
+                        try {
+                            com.ldtteam.structurize.blueprints.v1.Blueprint blueprint =
+                                StructurePacks.getBlueprint(pinnedPack.getName(), bpPath);
+                            if (blueprint == null) {
+                                sb.append("\"blueprint null\"");
+                            } else {
+                                net.minecraft.util.Tuple<BlockPos, BlockPos> c =
+                                    com.minecolonies.api.util.ColonyUtils.calculateCorners(
+                                        BlockPos.ZERO, level, blueprint, 0, false);
+                                sb.append('"').append(c.getA().toShortString()).append(" / ")
+                                  .append(c.getB().toShortString()).append('"');
+                            }
+                        } catch (Exception e) {
+                            sb.append("\"EX: ").append(escape(String.valueOf(e))).append('"');
+                        }
+                    } else {
+                        sb.append("\"no path or pack\"");
+                    }
+                    sb.append("}}");
+                    result.complete(sb.toString());
+                } catch (Exception e) {
+                    result.complete("{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+                }
+            });
+            respond(exchange, 200, result.get());
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
     private String suggestPositionOnServerThread(String blockId, int colonyId) {
         ServerLevel level = server.overworld();
         IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
@@ -1218,13 +1563,44 @@ public class VoyagerBridge {
         int bw = fp[0];
         int bd = fp[1];
 
+        // Candidate footprint as offsets relative to the anchor. Blueprints don't
+        // all extend +X/+Z from their anchor (townhall extends -Z), so prefer the
+        // real blueprint extent: ColonyUtils.calculateCorners is a pure translation
+        // of the anchor (anchor - primaryBlockOffset .. +size-1), so computing it
+        // once at BlockPos.ZERO gives reusable offsets. rotation=0/mirror=false
+        // matches how placeOnServerThread places buildings.
+        int offMinX = 0, offMinZ = 0, offMaxX = bw - 1, offMaxZ = bd - 1;
+        String bpPath = BLUEPRINT_PATHS.get(typeName);
+        StructurePackMeta pinnedPack = getPinnedPack();
+        if (bpPath != null && pinnedPack != null) {
+            try {
+                com.ldtteam.structurize.blueprints.v1.Blueprint blueprint =
+                    StructurePacks.getBlueprint(pinnedPack.getName(), bpPath);
+                if (blueprint != null) {
+                    net.minecraft.util.Tuple<BlockPos, BlockPos> c =
+                        com.minecolonies.api.util.ColonyUtils.calculateCorners(
+                            BlockPos.ZERO, level, blueprint, 0, false);
+                    offMinX = c.getA().getX();
+                    offMinZ = c.getA().getZ();
+                    offMaxX = c.getB().getX();
+                    offMaxZ = c.getB().getZ();
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // Existing buildings as {minX, minZ, maxX, maxZ} rects.
         java.util.List<int[]> existing = new java.util.ArrayList<>();
         for (IBuilding b : colony.getServerBuildingManager().getBuildings().values()) {
             BlockPos bp = b.getPosition();
-            ResourceLocation bKey = ForgeRegistries.BLOCKS.getKey(level.getBlockState(bp).getBlock());
-            String bType = bKey != null ? bKey.getPath().replaceFirst("^blockhut", "") : "";
-            int[] bFp = BUILDING_FOOTPRINTS.getOrDefault(bType, new int[]{10, 10});
-            existing.add(new int[]{bp.getX(), bp.getZ(), bFp[0], bFp[1]});
+            int[] realRect = realFootprintRect(b);
+            if (realRect != null) {
+                existing.add(realRect);
+            } else {
+                ResourceLocation bKey = ForgeRegistries.BLOCKS.getKey(level.getBlockState(bp).getBlock());
+                String bType = bKey != null ? bKey.getPath().replaceFirst("^blockhut", "") : "";
+                int[] bFp = BUILDING_FOOTPRINTS.getOrDefault(bType, new int[]{10, 10});
+                existing.add(new int[]{bp.getX(), bp.getZ(), bp.getX() + bFp[0] - 1, bp.getZ() + bFp[1] - 1});
+            }
         }
 
         final int GAP = 5;
@@ -1261,13 +1637,14 @@ public class VoyagerBridge {
             }
             if (anchorInside) continue;
 
-            // Also check that the new building's footprint (table-based) doesn't
-            // overlap any existing building's footprint (table-based + GAP).
+            // Check that the new building's footprint (blueprint-based offsets,
+            // table fallback) doesn't overlap any existing building's rect + GAP.
+            int cMinX = nx + offMinX, cMaxX = nx + offMaxX;
+            int cMinZ = nz + offMinZ, cMaxZ = nz + offMaxZ;
             boolean conflict = false;
             for (int[] eb : existing) {
-                int exX0 = eb[0] - GAP, exX1 = eb[0] + eb[2] - 1 + GAP;
-                int ezZ0 = eb[1] - GAP, ezZ1 = eb[1] + eb[3] - 1 + GAP;
-                if (nx <= exX1 && nx + bw - 1 >= exX0 && nz <= ezZ1 && nz + bd - 1 >= ezZ0) {
+                if (cMinX <= eb[2] + GAP && cMaxX >= eb[0] - GAP
+                        && cMinZ <= eb[3] + GAP && cMaxZ >= eb[1] - GAP) {
                     conflict = true;
                     break;
                 }
@@ -1468,6 +1845,30 @@ public class VoyagerBridge {
         }
 
         BlockState state = block.defaultBlockState();
+        // Place the hut with the same facing as the blueprint's anchor block.
+        // MineColonies derives the building's rotation from the difference
+        // between the placed hut's facing and the blueprint anchor's facing
+        // (BuildingUtils.getRotationFromBlueprint), and the builder constructs
+        // the whole schematic at that rotation. Matching the facing pins the
+        // rotation to 0 so findPlacementPos's rotation-0 candidate footprint
+        // equals the footprint that actually gets built.
+        String typeName = rl.getPath().replaceFirst("^blockhut", "");
+        String path = BLUEPRINT_PATHS.get(typeName);
+        try {
+            StructurePackMeta anchorPack = getPinnedPack();
+            if (path != null && anchorPack != null) {
+                com.ldtteam.structurize.blueprints.v1.Blueprint blueprint =
+                    StructurePacks.getBlueprint(anchorPack.getName(), path);
+                if (blueprint != null) {
+                    com.ldtteam.structurize.util.BlockInfo anchorInfo =
+                        blueprint.getBlockInfoAsMap().get(blueprint.getPrimaryBlockOffset());
+                    if (anchorInfo != null && anchorInfo.getState() != null
+                            && anchorInfo.getState().getBlock() == block) {
+                        state = anchorInfo.getState();
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
 
         level.setBlockAndUpdate(pos, state);
 
@@ -1497,8 +1898,6 @@ public class VoyagerBridge {
         // We also call TileEntityColonyBuilding.setStructurePack/setBlueprintPath
         // directly (these just write their own fields, no back-call, always safe).
         String blueprintNote = "";
-        String typeName = rl.getPath().replaceFirst("^blockhut", "");
-        String path = BLUEPRINT_PATHS.get(typeName);
         if (path != null) {
             StructurePackMeta pack = getPinnedPack();
             if (pack != null) {
