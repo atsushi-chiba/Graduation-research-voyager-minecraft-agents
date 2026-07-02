@@ -529,6 +529,32 @@ public class VoyagerBridge {
                           .append("\"name\":\"").append(escape(cit.getName())).append("\",")
                           .append("\"job\":\"").append(escape(jobName)).append("\",")
                           .append("\"jobStatus\":\"").append(jobStatusStr).append("\",");
+                        // Disease info so supply agents can deliver cure items. A sick
+                        // citizen's EntityAISickTask self-cures (APPLY_CURE) once every
+                        // cure item is present in the citizen's own inventory - the same
+                        // delivery mechanism /giveToCitizen already provides.
+                        boolean sick = false;
+                        String diseaseId = null;
+                        StringBuilder cures = new StringBuilder();
+                        try {
+                            com.minecolonies.api.entity.citizen.citizenhandlers.ICitizenDiseaseHandler dh =
+                                cit.getCitizenDiseaseHandler();
+                            if (dh != null && dh.isSick() && dh.getDisease() != null) {
+                                sick = true;
+                                com.minecolonies.core.datalistener.model.Disease disease = dh.getDisease();
+                                diseaseId = disease.id().toString();
+                                java.util.List<com.minecolonies.api.crafting.ItemStorage> cureItems = disease.cureItems();
+                                for (int k = 0; k < cureItems.size(); k++) {
+                                    if (k > 0) cures.append(",");
+                                    ResourceLocation itemKey = ForgeRegistries.ITEMS.getKey(cureItems.get(k).getItem());
+                                    cures.append("{\"item\":\"").append(itemKey)
+                                         .append("\",\"count\":").append(cureItems.get(k).getAmount()).append("}");
+                                }
+                            }
+                        } catch (Exception ignored) {}
+                        sb.append("\"sick\":").append(sick).append(",")
+                          .append("\"disease\":").append(diseaseId == null ? "null" : "\"" + diseaseId + "\"").append(",")
+                          .append("\"cureItems\":[").append(cures).append("],");
                         if (workBld != null) {
                             BlockPos wp = workBld.getPosition();
                             sb.append("\"workBuilding\":{")

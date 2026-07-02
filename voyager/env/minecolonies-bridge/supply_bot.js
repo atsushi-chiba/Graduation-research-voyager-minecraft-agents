@@ -68,6 +68,39 @@ async function resolveRequest(x, y, z, citizenId) {
   );
 }
 
+// citizenId -> disease id we already delivered cure items for. Cleared when
+// the citizen is healthy again so a new infection triggers a fresh delivery.
+const curesDelivered = new Map();
+
+// Sick citizens don't file requests - their EntityAISickTask walks to a
+// hospital (which this colony doesn't have) and otherwise waits forever.
+// The same AI self-cures (APPLY_CURE) as soon as every cure item of the
+// disease is in the citizen's own inventory, so delivering the items via
+// /giveToCitizen is a full treatment.
+async function treatSickCitizens(colony, cycle) {
+  let treated = 0;
+  for (const citizen of colony.citizens || []) {
+    if (!citizen.sick) {
+      curesDelivered.delete(citizen.id);
+      continue;
+    }
+    if (!citizen.cureItems || citizen.cureItems.length === 0) continue;
+    if (curesDelivered.get(citizen.id) === citizen.disease) continue;
+    for (const cure of citizen.cureItems) {
+      if (!cure.item || cure.count <= 0) continue;
+      await giveToCitizen(colony.id, citizen.id, cure.item, cure.count);
+      await sleep(RESOLVE_DELAY_MS);
+    }
+    curesDelivered.set(citizen.id, citizen.disease);
+    console.log(
+      `[supply #${cycle}] treated citizen ${citizen.id} (${citizen.disease}): ` +
+        citizen.cureItems.map((c) => `${c.count}x ${c.item}`).join(", ")
+    );
+    treated++;
+  }
+  return treated;
+}
+
 async function loop() {
   let cycle = 0;
   while (true) {
@@ -77,6 +110,7 @@ async function loop() {
       let totalResolved = 0;
 
       for (const colony of colonies) {
+        totalResolved += await treatSickCitizens(colony, cycle);
         for (const building of colony.buildings) {
           if (building.workers.length === 0) continue;
 
