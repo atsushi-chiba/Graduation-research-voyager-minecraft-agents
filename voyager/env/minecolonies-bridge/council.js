@@ -44,6 +44,11 @@ const CMD_PIPE = "/root/mc-server-forge/cmd_pipe";
 const COLONY_ID = 1;
 const MAX_CYCLES = 300;
 const TURN_DELAY_MS = 2000;
+// Economy mode (2026-07-02): low OpenRouter balance. Idle between cycles so a
+// 300-cycle session spans hours instead of minutes, and only voice a citizen
+// every few cycles (flavor only, no game effect).
+const CYCLE_DELAY_MS = 60000;
+const CITIZEN_VOICE_EVERY = 3;
 
 const ANCHOR = { x: 200, y: -60, z: 200 };
 
@@ -116,7 +121,11 @@ function extractFirstJSON(text) {
 
 function askLLM(model, messages) {
   return new Promise((resolve, reject) => {
-    const payload = JSON.stringify({ model, messages });
+    // max_tokens is mandatory: without it OpenRouter runs its affordability
+    // check against the model's maximum (64k for haiku-4.5) and rejects every
+    // call with 402 when the credit balance is low. Replies here are one short
+    // JSON object, so 1000 is generous.
+    const payload = JSON.stringify({ model, messages, max_tokens: 1000 });
     const req = https.request(
       {
         hostname: "openrouter.ai",
@@ -217,6 +226,7 @@ D. builder hutが建設中(pending=true)のものがある かつ operational=tr
 E. operational=trueのbuilder hutが存在 かつ builder hutが計4棟未満 → placeNext builder hut
 F. operational=trueのbuilder hutが4棟以上 かつ town hallのrequestBuildがまだ → requestBuild town hall (243,-60,200)... いや、town hallの座標をstatusから読んで requestBuild
 G. 上記以外 → 住居・食料・倉庫・配達を1棟ずつplaceNext → requestBuild
+H. 主要建物(住居・食料・倉庫・配達)が揃った中期フェーズ → 優先順: university(研究ゲート解禁)→ mine(石材・鉱石)→ 住居追加(人口増)→ builder hutの自己アップグレード(requestBuildで自分をlv2にするとlv2建物が解禁される)
 
 【重要ルール】
 - 1ターンに1アクションのみ。複数の建物を一度に置かない。
@@ -230,7 +240,7 @@ G. 上記以外 → 住居・食料・倉庫・配達を1棟ずつplaceNext → 
   - レベル1以上: そのレベルまでの建物を建設可能
 - 【重要】最初に市民をspawnCitizenしてから builder hutを置くこと。市民がいないと誰もbuilderにならず建設が進まない。
 - まず全てのBuilder's HutにrequestBuildを呼んでレベル1にする。それが完了してから他の建物へrequestBuildする。
-- 研究ゲート建物(sawmill, blacksmith等)はUniversityでの研究完了前にrequestBuildするとエラーになる。researchUnlocked配列で解除済みかを確認してから呼ぶこと。
+- 研究ゲート建物(hospital, sawmill, blacksmith等)はUniversityでの研究完了前にrequestBuildするとエラーになる。researchUnlocked配列で解除済みかを確認してから呼ぶこと。placeNext自体は通ってしまうので、requestBuildがエラーになったら建物を放置せずwaitに切り替えること。
 - 1つのBuilder's Hutに対して実際に作業できる建築家は1人だけ。Builder職の市民がN人いるならblockhutbuilderもN棟必要。
 
 ステータスJSONの読み方:
@@ -380,7 +390,10 @@ async function main() {
     // One citizen speaks per cycle, picked round-robin from whichever
     // colony already exists.
     const colony = status[0];
-    if (colony && colony.citizens && colony.citizens.length > 0) {
+    if (
+      colony && colony.citizens && colony.citizens.length > 0 &&
+      cycle % CITIZEN_VOICE_EVERY === 1
+    ) {
       const citizen = colony.citizens[(cycle - 1) % colony.citizens.length];
       await citizenVoiceTurn(citizen, citizen.workBuilding);
       await sleep(TURN_DELAY_MS);
@@ -392,6 +405,8 @@ async function main() {
       await governorTurn(gov, histories[gov.name], freshStatus);
       await sleep(TURN_DELAY_MS);
     }
+
+    await sleep(CYCLE_DELAY_MS);
   }
   console.log("\nReached max cycles, stopping.");
 }
