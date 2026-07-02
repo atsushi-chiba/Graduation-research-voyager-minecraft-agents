@@ -31,8 +31,9 @@ echo 'minecolonies citizens info <colonyId> <citizenId>' > /root/mc-server-forge
 4. **blueprint ロード** — /debugWorkOrders の blueprintLoaded、console.log の "Error loading blueprint"。builder は blueprint ロード完了まで `LOAD_STRUCTURE` に留まる。
 5. **道具の tier 制限** — 建物/職レベルを超える tier の道具は使えない。低レベル worker には木/石の道具を渡す(iron 以上は NG)。
 6. **work order の偏り** — builder は他人の claimed order を横取りしない。偏っていたら `POST /rebalanceWorkOrders?colonyId=1` で均等化("Claiming an already claimed workorder!" WARN は無害)。
+7. **claim移動後の亡霊参照ループ** — `LOAD_STRUCTURE→START_BUILDING→BUILDING_STEP→LOAD_STRUCTURE` を5秒周期で無限に回る(citizens info の遷移ログで判別)。原因: builder hut は workOrderId/進捗/資材リストを、AI は structurePlacer をキャッシュしており、claim だけ書き換えると分裂状態になる。bridge の rebalance は `onWorkOrderCancellation` を呼ぶよう修正済み(2026-07-02)だが、同型の症状が出たらサーバー再起動で AI キャッシュが飛び、building 側は getWorkOrder() の自己修復(claimedBy≠自分なら参照クリア)で治る。
 
 ## 注意
 
-- tickrate>1 中はゲーム内時間ベースの現象がすべて加速して見える。診断中は 1x に落とすと切り分けやすい。
+- シミュレーションは常に 10x で回す方針(ユーザー指示 2026-07-02)。診断のため一時的に 1x に落とすのは可だが、終わったら必ず `echo 'tickrate 10' > /root/mc-server-forge/cmd_pipe` で戻す。tickrate>1 中はゲーム内時間ベースの現象がすべて加速して見える点に注意。
 - jobStatus は builder が物理的に作業を始めるまで "idle" のまま。idle ≒ 故障ではない。

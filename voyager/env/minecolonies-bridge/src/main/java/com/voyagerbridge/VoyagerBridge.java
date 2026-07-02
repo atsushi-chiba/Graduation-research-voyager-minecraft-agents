@@ -253,6 +253,7 @@ public class VoyagerBridge {
             httpServer.createContext("/debugFootprints", this::handleDebugFootprints);
             httpServer.createContext("/removeBuilding", this::handleRemoveBuilding);
             httpServer.createContext("/rebalanceWorkOrders", this::handleRebalanceWorkOrders);
+            httpServer.createContext("/debugWorkOrders", this::handleDebugWorkOrders);
             httpServer.createContext("/ping", VoyagerBridge::handlePing);
             httpServer.setExecutor(null);
             httpServer.start();
@@ -1385,6 +1386,48 @@ public class VoyagerBridge {
         }
     }
 
+    // GET /debugWorkOrders?colonyId=1 - dumps every work order with the fields
+    // the builder AI's LOAD_STRUCTURE step depends on (pack/path/blueprint).
+    private void handleDebugWorkOrders(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
+                    if (colony == null) { result.complete("{\"error\":\"no colony\"}"); return; }
+                    StringBuilder sb = new StringBuilder("[");
+                    boolean first = true;
+                    for (com.minecolonies.api.colony.workorders.IServerWorkOrder wo
+                            : colony.getWorkManager().getWorkOrders().values()) {
+                        if (!first) sb.append(',');
+                        first = false;
+                        sb.append("{\"id\":").append(wo.getID())
+                          .append(",\"type\":\"").append(wo.getWorkOrderType()).append('"')
+                          .append(",\"location\":\"").append(wo.getLocation() == null ? null : wo.getLocation().toShortString()).append('"')
+                          .append(",\"claimedBy\":\"").append(wo.getClaimedBy() == null ? null : wo.getClaimedBy().toShortString()).append('"')
+                          .append(",\"pack\":\"").append(escape(String.valueOf(wo.getStructurePack()))).append('"')
+                          .append(",\"path\":\"").append(escape(String.valueOf(wo.getStructurePath()))).append('"')
+                          .append(",\"levels\":\"").append(wo.getCurrentLevel()).append("->").append(wo.getTargetLevel()).append('"')
+                          .append(",\"rotation\":").append(wo.getRotation())
+                          .append(",\"stage\":\"").append(wo.getStage()).append('"')
+                          .append(",\"blueprintLoaded\":").append(wo.getBlueprint() != null)
+                          .append('}');
+                    }
+                    sb.append(']');
+                    result.complete(sb.toString());
+                } catch (Exception e) {
+                    result.complete("{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+                }
+            });
+            respond(exchange, 200, result.get());
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
     // POST /rebalanceWorkOrders?colonyId=1 - redistributes claimed building work
     // orders round-robin across all level-1+ builder huts. Work orders created
     // before the fewest-claimed selection existed all piled onto one hut and
@@ -1422,6 +1465,16 @@ public class VoyagerBridge {
                         BlockPos target = huts.get(i % huts.size());
                         i++;
                         if (!target.equals(wo.getClaimedBy())) {
+                            // The old hut caches workOrderId/progress/resources and its
+                            // worker AI holds a structurePlacer for this order; only
+                            // onWorkOrderCancellation resets all of them. Without it the
+                            // old builder keeps working the order it no longer owns and
+                            // wedges in a LOAD_STRUCTURE/RECALC loop.
+                            IBuilding oldHut = colony.getServerBuildingManager()
+                                .getBuildings().get(wo.getClaimedBy());
+                            if (oldHut instanceof com.minecolonies.core.colony.buildings.AbstractBuildingStructureBuilder oldBuilder) {
+                                oldBuilder.onWorkOrderCancellation(wo);
+                            }
                             wo.setClaimedBy(target);
                         }
                         sb.append(wo.getLocation() == null ? "?" : wo.getLocation().toShortString())
