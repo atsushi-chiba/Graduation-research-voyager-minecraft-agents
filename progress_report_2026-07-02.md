@@ -38,7 +38,11 @@ builder の Annika が `LOAD_STRUCTURE→START_BUILDING→BUILDING_STEP→LOAD_S
 - **木こり**: 世界に木が1本もなく `LUMBERJACK_NO_TREES_FOUND`。`place feature minecraft:oak` で hut 周辺にオーク9本を植樹 → 伐採開始(`LUMBERJACK_CHOP_TREE`)。
 - **釣り人**: 水深2ブロックが必要(ユーザー指摘)だが、blueprint を NBT 解析した結果 **fisher1 の池は設計自体が水深1(107セル)** と判明。全セルの直下(y=-62)に注水して水深2化 → 釣り開始(`FISHERMAN_START_FISHING`)。blueprint のブロック配列デコード方法(y→z→x、上位short先)も確立した。
 
-### 2.6 運用基盤の整備
+### 2.6 空腹市民への自動給食(世話役エージェントの第一歩)
+
+空腹の市民は食料を探しに行き作業が長時間止まる(食堂が未建設のため)。本日3回手動でパンを配った作業を自動化: `/status` の市民情報に `saturation`(0〜20)を追加し、supply_bot が満腹度8未満の市民にパン8個を自動配達する(市民1人あたり10分クールダウン)。稼働直後に全8市民への配達を確認。
+
+### 2.7 運用基盤の整備
 
 - **skills(手順書)の導入**: `deploy-bridge`(ビルド→配備→再起動→ヘルスチェック)と `colony-diag`(市民停止の診断ランブック)を `.claude/skills/` に作成しリポジトリ管理。他の LLM ツール向けに `AGENTS.md`(入口ファイル)と `LLM_SKILLS_GUIDE.md`(運用ガイド、raw URL 込み)も追加。
 - **常時10倍速の運用ルール化**(ユーザー指示)。正しい手順は `POST /tickrate?multiplier=10`(コンソールコマンドではない。cmd_pipe に送ると `<--[HERE]` 付きの不明コマンドエラーになり、これを成功と誤読していた事故を修正)。
@@ -59,9 +63,8 @@ builder の Annika が `LOAD_STRUCTURE→START_BUILDING→BUILDING_STEP→LOAD_S
 ## 4. 未解決の課題
 
 - **人口がボトルネック**: cook・miner・deliveryman は完成しても働き手がいない。住居建設と tavern 経由の人口増待ち。
-- **食料供給が手動**: 空腹(CHECK_FOR_FOOD / SEARCH_RESTAURANT)で作業が止まるたびにパンを手渡ししている。cook 稼働までの暫定措置として supply_bot への自動給食機能追加も検討余地あり。
 - **hospital は研究ゲート**: University 未建設のため requestBuild 不可(placeNext は通ってしまう点に注意)。
-- **OpenRouter 残高**: 節約モードでも数十サイクルで枯渇見込み。本格運用にはクレジット追加が必要。
+- **OpenRouter 残高が枯渇し市長会議は停止中**: 16:30頃、入力プロンプト(約19k tokens)すら残高上限(5395)を超えて 402 になったため council.js を停止した。クレジット追加後に再起動すれば再開できる。プロンプト自体の減量(状態JSONの圧縮・履歴短縮)も中期課題。
 - **council.js の常駐化未実装**: MAX_CYCLES=300(約5時間)で自然終了する。
 - **未調査ログ**: `Failed to get rotation of building at pos: 212,182 / 150,170 with path:(空)` — 市長が発注した建物で発生。実害は未確認。
 - **軽微な残件**: 初期 builder hut 2棟の5列重複(稼働中のため放置)、旧リポジトリのアーカイブ(GitHub UI 手動操作)。
@@ -75,8 +78,9 @@ builder の Annika が `LOAD_STRUCTURE→START_BUILDING→BUILDING_STEP→LOAD_S
 4. 食料自動化(cook 稼働 or supply_bot への給食追加)
 
 ### 中期
-5. council.js の常駐化(start_server.sh での再起動ラッパー)
-6. council.js のプロンプト肥大化対策として、MineColonies 知識をfine-tune した小型モデルの検討(既存メモあり)
+5. **世話役(caretaker)エージェント**(ユーザー発案・メモ保存済み): 市民の困りごと(木がない・水深不足・空腹・病気・stuck)を検知してゲーム内で自動解決する常駐デーモン。今日手動でやった植樹・注水・給食がそのまま自動化対象。給食は本日実装済みで、これが第一歩
+6. council.js の常駐化(start_server.sh での再起動ラッパー)とプロンプト減量
+7. council.js のプロンプト肥大化対策として、MineColonies 知識をfine-tune した小型モデルの検討(既存メモあり)
 
 ## 6. 変更ファイル一覧(コミット、いずれも origin / fork 両方に push 済み)
 
@@ -89,3 +93,5 @@ builder の Annika が `LOAD_STRUCTURE→START_BUILDING→BUILDING_STEP→LOAD_S
 | `080aba2` | skills の tickrate 手順修正(HTTP エンドポイントが正) |
 | `492d635` | council.js: 402修正(max_tokens)・節約モード・中期ルール |
 | `901cc29` | colony-diag: 木こり/釣り人の環境要件を追記 |
+| `b5ce51c` | 本進捗レポート追加 |
+| `dbdf600` | 空腹市民への自動給食(/status に saturation + supply_bot 給食ロジック) |
