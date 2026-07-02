@@ -1,3 +1,9 @@
+> **This repository has moved.** Active development now continues at the
+> proper GitHub fork: **[atsushi-chiba/Voyager](https://github.com/atsushi-chiba/Voyager)**
+> (forked directly from [MineDojo/Voyager](https://github.com/MineDojo/Voyager),
+> so the fork network/attribution is preserved on GitHub). This repo is kept
+> read-only for its commit/issue history.
+
 # Voyager: An Open-Ended Embodied Agent with Large Language Models
 <div align="center">
 
