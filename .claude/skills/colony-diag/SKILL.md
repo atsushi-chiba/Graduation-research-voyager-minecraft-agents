@@ -35,5 +35,6 @@ echo 'minecolonies citizens info <colonyId> <citizenId>' > /root/mc-server-forge
 
 ## 注意
 
-- シミュレーションは常に 10x で回す方針(ユーザー指示 2026-07-02)。診断のため一時的に 1x に落とすのは可だが、終わったら必ず `echo 'tickrate 10' > /root/mc-server-forge/cmd_pipe` で戻す。tickrate>1 中はゲーム内時間ベースの現象がすべて加速して見える点に注意。
+- シミュレーションは常に 10x で回す方針(ユーザー指示 2026-07-02)。診断のため一時的に 1x に落とすのは可だが、終わったら必ず `curl -s -X POST 'http://localhost:8089/tickrate?multiplier=10'` で戻す(コンソールコマンドではなく bridge の HTTP エンドポイント)。tickrate>1 中はゲーム内時間ベースの現象がすべて加速して見える点に注意。
+- cmd_pipe に送ったコマンドの console 応答に `<--[HERE]` が付いていたら**不明コマンドのエラー**。成功と誤読しないこと。
 - jobStatus は builder が物理的に作業を始めるまで "idle" のまま。idle ≒ 故障ではない。
