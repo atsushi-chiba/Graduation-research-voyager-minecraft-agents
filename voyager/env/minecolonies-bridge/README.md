@@ -61,3 +61,16 @@ export JAVA_HOME=/path/to/jdk-17
 ./gradlew build -x test
 # output: build/libs/voyagerbridge-0.1.0.jar -> copy into the server's mods/ folder
 ```
+
+## Third-party mods and licensing
+
+This mod is built and run **against** [MineColonies](https://github.com/ldtteam/minecolonies)
+and [Structurize](https://github.com/ldtteam/structurize) (both by ldtteam,
+licensed GPL-3.0) as compile-time-only (`compileOnly`) API dependencies -
+their code is never copied, bundled, or redistributed here. This repository
+only contains original `voyagerbridge` source; the referenced MineColonies/
+Structurize/Domum Ornamentum jars are expected to already be present on the
+end user's own server install (see `build.gradle`) and are not shipped with
+this project. Full credit to ldtteam for MineColonies, Structurize, and
+Domum Ornamentum, which this experiment depends on entirely for the colony
+simulation itself - `voyagerbridge` only adds an HTTP control surface on top.
