@@ -72,6 +72,33 @@ async function resolveRequest(x, y, z, citizenId) {
 // the citizen is healthy again so a new infection triggers a fresh delivery.
 const curesDelivered = new Map();
 
+// Hungry citizens walk off to hunt for food (CHECK_FOR_FOOD / SEARCH_RESTAURANT)
+// instead of working; with no restaurant in the colony this stalls them for a
+// long time. Feed them bread before they get there. Citizens eat from their own
+// inventory once saturation drops, so a small stack lasts a while.
+const FEED_BELOW_SATURATION = 8;
+const FEED_BREAD_COUNT = 8;
+const FEED_COOLDOWN_MS = 10 * 60 * 1000;
+const lastFed = new Map(); // citizenId -> timestamp of last delivery
+
+async function feedHungryCitizens(colony, cycle) {
+  let fed = 0;
+  for (const citizen of colony.citizens || []) {
+    if (typeof citizen.saturation !== "number") continue;
+    if (citizen.saturation >= FEED_BELOW_SATURATION) continue;
+    const last = lastFed.get(citizen.id) || 0;
+    if (Date.now() - last < FEED_COOLDOWN_MS) continue;
+    await giveToCitizen(colony.id, citizen.id, "minecraft:bread", FEED_BREAD_COUNT);
+    lastFed.set(citizen.id, Date.now());
+    console.log(
+      `[supply #${cycle}] fed citizen ${citizen.id} (saturation ${citizen.saturation}): ${FEED_BREAD_COUNT}x bread`
+    );
+    fed++;
+    await sleep(RESOLVE_DELAY_MS);
+  }
+  return fed;
+}
+
 // Sick citizens don't file requests - their EntityAISickTask walks to a
 // hospital (which this colony doesn't have) and otherwise waits forever.
 // The same AI self-cures (APPLY_CURE) as soon as every cure item of the
@@ -111,6 +138,7 @@ async function loop() {
 
       for (const colony of colonies) {
         totalResolved += await treatSickCitizens(colony, cycle);
+        totalResolved += await feedHungryCitizens(colony, cycle);
         for (const building of colony.buildings) {
           if (building.workers.length === 0) continue;
 

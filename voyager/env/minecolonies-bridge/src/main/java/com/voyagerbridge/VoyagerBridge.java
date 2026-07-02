@@ -529,7 +529,10 @@ public class VoyagerBridge {
                           .append("\"id\":").append(cit.getId()).append(",")
                           .append("\"name\":\"").append(escape(cit.getName())).append("\",")
                           .append("\"job\":\"").append(escape(jobName)).append("\",")
-                          .append("\"jobStatus\":\"").append(jobStatusStr).append("\",");
+                          .append("\"jobStatus\":\"").append(jobStatusStr).append("\",")
+                          // Saturation (0-20). Citizens stop working to hunt for food
+                          // when this runs low, so supply agents feed them proactively.
+                          .append("\"saturation\":").append(String.format(java.util.Locale.ROOT, "%.1f", cit.getSaturation())).append(",");
                         // Disease info so supply agents can deliver cure items. A sick
                         // citizen's EntityAISickTask self-cures (APPLY_CURE) once every
                         // cure item is present in the citizen's own inventory - the same
