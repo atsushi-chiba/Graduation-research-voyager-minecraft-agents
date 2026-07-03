@@ -60,3 +60,13 @@ echo 'minecolonies citizens info <colonyId> <citizenId>' > /root/mc-server-forge
   (耕す→植える→収穫を日替わりで1段階)→残りの時間は余暇/睡眠」。
 - 日付ベースのスケジューラは他職にもあり得るので、「特定の職だけ1日1回しか
   働かない/全く働かない」ときはまず colonyDay の進行を疑う。
+
+## コロニーが「動いて見えるのに何も進まない」とき(最重要の落とし穴)
+
+- **プレイヤーが誰もオンラインでないと、コロニーは UNLOADED 状態になり脳が止まる**
+  (work orderバインド・日付・リクエスト処理・建物tickが全停止。市民は歩き回るので気づきにくい)。
+- 合図: `/debugFarm` の colonyDay が worldDayTime に対して凍結、`/debugBuilder` で
+  claim済みWOがあるのに workOrderId=0、builderが `/debugCitizenAI` で canGoIdle:true のまま余暇。
+- bridge の keepColoniesActive()(onServerTick内)が無人時に状態機械をACTIVEへ強制して対処済み
+  (2026-07-03)。これが壊れた場合は console に "keepColoniesActive failed" が出る。
+- 「ユーザーがログインしている時だけ正常」という症状パターンはまずこれを疑う。
