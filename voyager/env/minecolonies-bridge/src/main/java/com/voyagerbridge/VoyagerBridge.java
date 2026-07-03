@@ -333,6 +333,7 @@ public class VoyagerBridge {
             httpServer.createContext("/debugCitizenAI", this::handleDebugCitizenAI);
             httpServer.createContext("/debugFarm", this::handleDebugFarm);
             httpServer.createContext("/debugBuilder", this::handleDebugBuilder);
+            httpServer.createContext("/assignWorker", this::handleAssignWorker);
             httpServer.createContext("/research", this::handleResearch);
             httpServer.createContext("/startResearch", this::handleStartResearch);
             httpServer.createContext("/autoResearch", this::handleAutoResearch);
@@ -1527,6 +1528,87 @@ public class VoyagerBridge {
         }
     }
 
+    // POST /assignWorker?x=&y=&z=&citizenId=N[&fire=true]
+    //
+    // Hire a specific citizen into the building at (x,y,z), releasing them
+    // from their current workplace first (mirrors HireFireMessage: the GUI's
+    // hire/fire buttons call IAssignsJob.assignCitizen/removeCitizen). With
+    // fire=true just removes them. Needed because MineColonies only auto-hires
+    // UNEMPLOYED citizens - reassigning an employed one is a GUI-only action.
+    private void handleAssignWorker(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+            int citizenId = Integer.parseInt(params.get("citizenId"));
+            boolean fire = "true".equalsIgnoreCase(params.getOrDefault("fire", "false"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IColony colony = findColonyAt(level, pos);
+                    if (colony == null) {
+                        result.complete("ERROR: no colony at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    IBuilding building = colony.getServerBuildingManager().getBuilding(pos);
+                    if (building == null) {
+                        result.complete("ERROR: no building registered at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    com.minecolonies.core.colony.buildings.modules.WorkerBuildingModule module =
+                            building.getFirstModuleOccurance(
+                                    com.minecolonies.core.colony.buildings.modules.WorkerBuildingModule.class);
+                    if (module == null) {
+                        result.complete("ERROR: building has no worker module (not a workplace)");
+                        return;
+                    }
+                    ICitizenData citizen = colony.getCitizenManager().getCivilian(citizenId);
+                    if (citizen == null) {
+                        result.complete("ERROR: no citizen with id " + citizenId);
+                        return;
+                    }
+                    citizen.setPaused(false);
+                    if (fire) {
+                        module.removeCitizen(citizen);
+                        result.complete("removed citizen " + citizenId + " from " + x + "," + y + "," + z);
+                        return;
+                    }
+                    IBuilding oldWork = citizen.getWorkBuilding();
+                    if (oldWork != null && !oldWork.getPosition().equals(pos)) {
+                        com.minecolonies.core.colony.buildings.modules.WorkerBuildingModule oldModule =
+                                oldWork.getFirstModuleOccurance(
+                                        com.minecolonies.core.colony.buildings.modules.WorkerBuildingModule.class);
+                        if (oldModule != null) oldModule.removeCitizen(citizen);
+                    }
+                    boolean ok = module.assignCitizen(citizen);
+                    result.complete(ok
+                            ? "assigned citizen " + citizenId + " to " + building.getClass().getSimpleName()
+                              + " at " + x + "," + y + "," + z
+                            : "ERROR: assignCitizen returned false (module full or citizen unsuitable)");
+                } catch (Exception e) {
+                    LOGGER.error("assignWorker failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
     // ---------- Research pipeline ----------
     //
     // GET  /research?colonyId=1        - whole tree with local state per research
@@ -1644,10 +1726,12 @@ public class VoyagerBridge {
         if (lt.getResearchInProgress().size() >= univ.getBuildingLevel()) {
             return "no free research slots (university lv" + univ.getBuildingLevel() + ")";
         }
-        FakePlayer fp = new FakePlayer(level, AI_PROFILE);
-        fp.getAbilities().instabuild = true; // isCreative() => cost/requirement-free start
-        lt.attemptBeginResearch(fp, colony, univ, research);
-        if (lt.getResearch(branch, id) == null) return "attemptBeginResearch did not start " + id;
+        // attemptBeginResearch's creative branch boils down to startResearch() -
+        // call it directly instead of going through a FakePlayer (whose
+        // isCreative() didn't hold up through the vanilla path): item costs are
+        // skipped by design (cheat-supply policy), progression stays vanilla.
+        research.startResearch(lt);
+        if (lt.getResearch(branch, id) == null) return "startResearch did not register " + id;
         colony.getResearchManager().markDirty();
         return null;
     }
