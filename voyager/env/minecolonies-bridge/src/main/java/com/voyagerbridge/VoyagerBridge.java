@@ -102,6 +102,7 @@ public class VoyagerBridge {
     @SubscribeEvent
     public void onServerTick(TickEvent.ServerTickEvent event) {
         if (event.phase != TickEvent.Phase.START) return;
+        keepColoniesActive();
         int mult = tickMultiplier;
         if (mult <= 1 || server == null) return;
         java.lang.reflect.Field f = resolveNextTickTimeField(server);
@@ -120,6 +121,75 @@ public class VoyagerBridge {
         }
         suppressFloatingKicks();
         suppressLoginTimeouts();
+    }
+
+    // --- Unmanned-colony keep-alive ---
+    //
+    // Colony.updateState() drops a colony to UNLOADED as soon as no player is
+    // near (closeSubscribers empty, no important colony player online). In
+    // UNLOADED only worldTickUnloaded runs: tickWorkManager (binds claimed
+    // work orders to builder huts), checkDayTime (the colony day counter that
+    // day-based schedulers like the farmer's field rotation depend on),
+    // tickRequests and worldTickSlow (building ticks) all stop. Entities keep
+    // walking (forceloaded chunks), so the colony LOOKS alive while its brain
+    // is off - builders wander on leisure forever and the day freezes.
+    // This experiment runs unmanned, so while nobody is online we force the
+    // state machine back to ACTIVE (both the state field and the cached
+    // transition list must be swapped - see BasicStateMachine.transitionToNext).
+    // updateState() flips it back every 100 machine ticks; re-forcing every 20
+    // server ticks keeps the colony effectively always ACTIVE.
+    private int keepActiveCounter = 0;
+    private static volatile java.lang.reflect.Field colonyStateMachineField = null;
+    private static volatile java.lang.reflect.Field smStateField = null;
+    private static volatile java.lang.reflect.Field smTransitionMapField = null;
+    private static volatile java.lang.reflect.Field smCurrentTransitionsField = null;
+
+    private void keepColoniesActive() {
+        if (server == null || ++keepActiveCounter < 20) return;
+        keepActiveCounter = 0;
+        if (server.getPlayerList().getPlayerCount() > 0) return; // vanilla logic is fine with players on
+        try {
+            for (IColony colony : IColonyManager.getInstance().getAllColonies()) {
+                if (!(colony instanceof com.minecolonies.core.colony.Colony)) continue;
+                if (colonyStateMachineField == null) {
+                    colonyStateMachineField = com.minecolonies.core.colony.Colony.class
+                            .getDeclaredField("colonyStateMachine");
+                    colonyStateMachineField.setAccessible(true);
+                }
+                Object sm = colonyStateMachineField.get(colony);
+                if (smStateField == null) {
+                    Class<?> cls = sm.getClass();
+                    while (cls != null && smStateField == null) {
+                        for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
+                            if ("state".equals(f.getName())) smStateField = f;
+                            else if ("transitionMap".equals(f.getName())) smTransitionMapField = f;
+                            else if ("currentStateTransitions".equals(f.getName())) smCurrentTransitionsField = f;
+                        }
+                        cls = cls.getSuperclass();
+                    }
+                    if (smStateField == null || smTransitionMapField == null || smCurrentTransitionsField == null) {
+                        LOGGER.warn("keepColoniesActive: state machine fields not found (state={}, map={}, cur={})",
+                                smStateField != null, smTransitionMapField != null, smCurrentTransitionsField != null);
+                        return;
+                    }
+                    smStateField.setAccessible(true);
+                    smTransitionMapField.setAccessible(true);
+                    smCurrentTransitionsField.setAccessible(true);
+                }
+                Object cur = smStateField.get(sm);
+                Object active = com.minecolonies.api.colony.ColonyState.ACTIVE;
+                if (cur != active) {
+                    java.util.Map<?, ?> map = (java.util.Map<?, ?>) smTransitionMapField.get(sm);
+                    Object activeTransitions = map.get(active);
+                    if (activeTransitions != null) {
+                        smCurrentTransitionsField.set(sm, activeTransitions);
+                        smStateField.set(sm, active);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.warn("keepColoniesActive failed", e);
+        }
     }
 
     // --- Login timeout suppression while tick-accelerated ---
@@ -255,12 +325,14 @@ public class VoyagerBridge {
             httpServer.createContext("/rebalanceWorkOrders", this::handleRebalanceWorkOrders);
             httpServer.createContext("/debugWorkOrders", this::handleDebugWorkOrders);
             httpServer.createContext("/setMenu", this::handleSetMenu);
+            httpServer.createContext("/stockRestaurant", this::handleStockRestaurant);
             httpServer.createContext("/neededResources", this::handleNeededResources);
             httpServer.createContext("/fillBuilderResources", this::handleFillBuilderResources);
             httpServer.createContext("/setFieldSeed", this::handleSetFieldSeed);
             httpServer.createContext("/fields", this::handleFields);
             httpServer.createContext("/debugCitizenAI", this::handleDebugCitizenAI);
             httpServer.createContext("/debugFarm", this::handleDebugFarm);
+            httpServer.createContext("/debugBuilder", this::handleDebugBuilder);
             httpServer.createContext("/ping", VoyagerBridge::handlePing);
             httpServer.setExecutor(null);
             httpServer.start();
@@ -963,6 +1035,107 @@ public class VoyagerBridge {
         }
     }
 
+    // POST /stockRestaurant?x=&y=&z=&countPerItem=32
+    //
+    // Tops the cook hut's racks up to countPerItem of every food on its
+    // RestaurantMenuModule menu. The menu module does file MinimumStock
+    // requests on colony ticks, but citizens queue at the restaurant faster
+    // than that pipeline delivers at 10x - stocking the racks directly means
+    // the cook can serve arrivals immediately instead of them loitering.
+    private void handleStockRestaurant(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+            int target = Integer.parseInt(params.getOrDefault("countPerItem", "32"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IColony colony = findColonyAt(level, pos);
+                    if (colony == null) {
+                        result.complete("ERROR: no colony at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    IBuilding building = colony.getServerBuildingManager().getBuilding(pos);
+                    if (building == null) {
+                        result.complete("ERROR: no building registered at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    com.minecolonies.core.colony.buildings.modules.RestaurantMenuModule menu =
+                            building.getModule(com.minecolonies.core.colony.buildings.modules.BuildingModules.RESTAURANT_MENU);
+                    if (menu == null) {
+                        result.complete("ERROR: building at " + x + "," + y + "," + z
+                                + " has no restaurant menu module (not a cook hut?)");
+                        return;
+                    }
+                    com.minecolonies.api.tileentities.AbstractTileEntityColonyBuilding te = building.getTileEntity();
+                    net.minecraftforge.items.IItemHandler handler = te == null ? null
+                            : te.getCapability(net.minecraftforge.common.capabilities.ForgeCapabilities.ITEM_HANDLER)
+                                .resolve().orElse(null);
+                    if (handler == null) {
+                        result.complete("ERROR: hut has no item handler (tile entity not loaded?)");
+                        return;
+                    }
+                    StringBuilder json = new StringBuilder("[");
+                    boolean first = true;
+                    for (com.minecolonies.api.crafting.ItemStorage st : menu.getMenu()) {
+                        ItemStack proto = st.getItemStack();
+                        int have = 0;
+                        for (int slot = 0; slot < handler.getSlots(); slot++) {
+                            ItemStack s = handler.getStackInSlot(slot);
+                            if (!s.isEmpty() && ItemStack.isSameItemSameTags(s, proto)) {
+                                have += s.getCount();
+                            }
+                        }
+                        int inserted = 0;
+                        int remaining = target - have;
+                        while (remaining > 0) {
+                            int chunkSize = Math.min(remaining, proto.getMaxStackSize());
+                            ItemStack chunk = proto.copy();
+                            chunk.setCount(chunkSize);
+                            ItemStack leftover = chunk;
+                            for (int slot = 0; slot < handler.getSlots() && !leftover.isEmpty(); slot++) {
+                                leftover = handler.insertItem(slot, leftover, false);
+                            }
+                            int put = chunkSize - leftover.getCount();
+                            inserted += put;
+                            remaining -= chunkSize;
+                            if (put < chunkSize) break; // racks full
+                        }
+                        if (!first) json.append(",");
+                        first = false;
+                        json.append("{\"item\":\"")
+                            .append(escape(String.valueOf(ForgeRegistries.ITEMS.getKey(proto.getItem()))))
+                            .append("\",\"had\":").append(have)
+                            .append(",\"given\":").append(inserted)
+                            .append("}");
+                    }
+                    json.append("]");
+                    result.complete(json.toString());
+                } catch (Exception e) {
+                    LOGGER.error("stockRestaurant failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, outcome);
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
     // POST /setMenu?x=200&y=-60&z=182&items=minecraft:bread,minecraft:cooked_beef
     //
     // Once a cook hut (restaurant) exists and is staffed, citizens stop eating
@@ -1258,6 +1431,85 @@ public class VoyagerBridge {
                     result.complete(sb.toString());
                 } catch (Exception e) {
                     LOGGER.error("debugFarm failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, outcome);
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // GET /debugBuilder?x=&y=&z=  (x,y,z = builder hut position)
+    //
+    // Dumps the inputs of WorkManager.tryAssignWorkOrder for one hut, to see
+    // why a claimed work order isn't being bound to the building: binding
+    // requires the hut's WorkerBuildingModule to have a citizen, the hut to
+    // have no current work order, and the order's claimedBy to equal the
+    // hut's position.
+    private void handleDebugBuilder(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IColony colony = findColonyAt(level, pos);
+                    if (colony == null) {
+                        result.complete("ERROR: no colony at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    IBuilding building = colony.getServerBuildingManager().getBuilding(pos);
+                    if (!(building instanceof com.minecolonies.core.colony.buildings.AbstractBuildingStructureBuilder sb)) {
+                        result.complete("ERROR: not a structure-builder hut at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    StringBuilder sbj = new StringBuilder("{");
+                    sbj.append("\"class\":\"").append(building.getClass().getSimpleName()).append("\"");
+                    sbj.append(",\"level\":").append(building.getBuildingLevel());
+                    int woId = -1;
+                    try {
+                        java.lang.reflect.Field f = com.minecolonies.core.colony.buildings.AbstractBuildingStructureBuilder.class
+                                .getDeclaredField("workOrderId");
+                        f.setAccessible(true);
+                        woId = f.getInt(sb);
+                    } catch (Exception e) {
+                        LOGGER.warn("workOrderId reflection failed", e);
+                    }
+                    sbj.append(",\"workOrderId\":").append(woId);
+                    sbj.append(",\"hasWorkOrder\":").append(sb.hasWorkOrder());
+                    com.minecolonies.core.colony.buildings.modules.WorkerBuildingModule wm =
+                            building.getFirstModuleOccurance(com.minecolonies.core.colony.buildings.modules.WorkerBuildingModule.class);
+                    ICitizenData first = wm == null ? null : wm.getFirstCitizen();
+                    sbj.append(",\"workerModule\":").append(wm != null);
+                    sbj.append(",\"firstCitizen\":").append(first == null ? "null" : first.getId());
+                    sbj.append(",\"buildingID\":\"").append(building.getID().toShortString()).append("\"");
+                    sbj.append(",\"orders\":[");
+                    boolean firstOrd = true;
+                    for (com.minecolonies.api.colony.workorders.IWorkOrder wo : colony.getWorkManager().getWorkOrders().values()) {
+                        if (!firstOrd) sbj.append(",");
+                        firstOrd = false;
+                        sbj.append("{\"id\":").append(wo.getID())
+                           .append(",\"claimedBy\":\"").append(wo.getClaimedBy() == null ? "null" : wo.getClaimedBy().toShortString()).append("\"")
+                           .append(",\"claimedEqualsThisHut\":")
+                           .append(wo.getClaimedBy() != null && wo.getClaimedBy().equals(building.getPosition()))
+                           .append(",\"isClaimed\":").append(wo.isClaimed())
+                           .append("}");
+                    }
+                    sbj.append("]}");
+                    result.complete(sbj.toString());
+                } catch (Exception e) {
+                    LOGGER.error("debugBuilder failed", e);
                     result.complete("ERROR: " + e);
                 }
             });

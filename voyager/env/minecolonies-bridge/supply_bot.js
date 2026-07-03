@@ -72,13 +72,20 @@ async function resolveRequest(x, y, z, citizenId) {
 // the citizen is healthy again so a new infection triggers a fresh delivery.
 const curesDelivered = new Map();
 
+// The game runs at 10x (POST /tickrate, standing rule) but this bot lives in
+// real time. Anything that models an in-game process (hunger drain, cooldowns
+// meant to span "a while for the citizen") must be divided by the multiplier,
+// or the bot falls behind the game tenfold - the 10min feed cooldown at 10x
+// meant citizens starved and trekked to the restaurant between feeds, which
+// also caused the constant door-flapping foot traffic.
+const TICK_MULTIPLIER = 10;
+
 // Hungry citizens walk off to hunt for food (CHECK_FOR_FOOD / SEARCH_RESTAURANT)
-// instead of working; with no restaurant in the colony this stalls them for a
-// long time. Feed them bread before they get there. Citizens eat from their own
-// inventory once saturation drops, so a small stack lasts a while.
+// instead of working. Feed them bread before they get there. Citizens eat from
+// their own inventory once saturation drops, so a small stack lasts a while.
 const FEED_BELOW_SATURATION = 8;
 const FEED_BREAD_COUNT = 8;
-const FEED_COOLDOWN_MS = 10 * 60 * 1000;
+const FEED_COOLDOWN_MS = (10 * 60 * 1000) / TICK_MULTIPLIER;
 const lastFed = new Map(); // citizenId -> timestamp of last delivery
 
 async function feedHungryCitizens(colony, cycle) {
@@ -130,6 +137,34 @@ async function fillBuilderHuts(colony, cycle) {
   return filled;
 }
 
+// Keep the restaurant's racks stocked with every menu food so the cook can
+// serve arrivals immediately (the built-in MinimumStock pipeline is too slow
+// at 10x and citizens loiter at the restaurant waiting to be fed).
+async function stockRestaurants(colony, cycle) {
+  let stocked = 0;
+  for (const building of colony.buildings || []) {
+    if (building.type !== "blockhutcook" || !building.operational) continue;
+    try {
+      const res = await httpRequest(
+        "POST",
+        `/stockRestaurant?x=${building.x}&y=${building.y}&z=${building.z}&countPerItem=32`
+      );
+      if (res.status !== 200) continue;
+      const given = JSON.parse(res.body).filter((i) => i.given > 0);
+      if (given.length > 0) {
+        console.log(
+          `[supply #${cycle}] stocked restaurant (${building.x},${building.y},${building.z}): ` +
+            given.map((i) => `${i.given}x ${i.item}`).join(", ")
+        );
+        stocked += given.length;
+      }
+    } catch {
+      // transient - retry next cycle
+    }
+  }
+  return stocked;
+}
+
 // Sick citizens don't file requests - their EntityAISickTask walks to a
 // hospital (which this colony doesn't have) and otherwise waits forever.
 // The same AI self-cures (APPLY_CURE) as soon as every cure item of the
@@ -170,6 +205,7 @@ async function loop() {
       for (const colony of colonies) {
         totalResolved += await treatSickCitizens(colony, cycle);
         totalResolved += await feedHungryCitizens(colony, cycle);
+        totalResolved += await stockRestaurants(colony, cycle);
         totalResolved += await fillBuilderHuts(colony, cycle);
         for (const building of colony.buildings) {
           if (building.workers.length === 0) continue;
