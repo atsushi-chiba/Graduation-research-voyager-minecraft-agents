@@ -11,7 +11,6 @@
 // Both kinds of lines are broadcast into the real Minecraft chat via the
 // server console (so a human watching in-game sees the whole conversation),
 // by writing "say <name>: <message>" into the server's cmd_pipe.
-const https = require("https");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
@@ -32,23 +31,24 @@ function buildingTable() {
   );
 }
 
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-// A fast/cheap model matters a lot more here than raw reasoning quality -
-// the real-time game (no /tick speedup available on vanilla 1.20.1) sets
-// the pace either way, so a slow model just means the chat lags behind
-// what's actually happening rather than the colony progressing faster.
-const MODEL = "anthropic/claude-haiku-4.5";
+// LLM backend: local ollama on the lab server (OpenAI-compatible
+// /v1/chat/completions, no auth, no usage cost). Switched from OpenRouter
+// (2026-07-03) after its credit balance ran out - even the ~19k-token input
+// prompt alone exceeded the remaining allowance.
+const LLM_HOST = process.env.LLM_HOST || "192.168.15.150";
+const LLM_PORT = parseInt(process.env.LLM_PORT || "11434", 10);
+const MODEL = process.env.LLM_MODEL || "gemma4:e4b";
 const BRIDGE_HOST = "localhost";
 const BRIDGE_PORT = 8089;
 const CMD_PIPE = "/root/mc-server-forge/cmd_pipe";
 const COLONY_ID = 1;
 const MAX_CYCLES = 300;
 const TURN_DELAY_MS = 2000;
-// Economy mode (2026-07-02): low OpenRouter balance. Idle between cycles so a
-// 300-cycle session spans hours instead of minutes, and only voice a citizen
-// every few cycles (flavor only, no game effect).
-const CYCLE_DELAY_MS = 60000;
-const CITIZEN_VOICE_EVERY = 3;
+// With the local ollama backend there is no per-token cost, so the old
+// economy mode (60s cycles, citizen voice 1-in-3) is relaxed: the cycle pace
+// now just tracks how fast the colony state actually changes.
+const CYCLE_DELAY_MS = 15000;
+const CITIZEN_VOICE_EVERY = 1;
 
 const ANCHOR = { x: 200, y: -60, z: 200 };
 
@@ -119,21 +119,107 @@ function extractFirstJSON(text) {
   return null;
 }
 
-function askLLM(model, messages) {
+// Structured-output schema for governor turns, enforced by ollama's
+// schema-constrained decoding. gemma-class models can't reliably construct
+// free-form action JSON (they invent action names and coordinates), so the
+// governor picks a numbered choice from a menu that buildCandidates()
+// derives from the live /status - every candidate already carries exact,
+// valid parameters.
+const GOVERNOR_REPLY_SCHEMA = {
+  type: "object",
+  properties: {
+    say: { type: "string" },
+    choice: { type: "integer" },
+  },
+  required: ["say", "choice"],
+};
+
+// Residence lvN sleeps N citizens, the tavern sleeps 4.
+function housingCapacity(colony) {
+  return (colony.buildings || []).reduce((cap, b) => {
+    if (!b.operational) return cap;
+    if (b.type === "blockhutcitizen") return cap + b.level;
+    if (b.type === "blockhuttavern") return cap + 4;
+    return cap;
+  }, 0);
+}
+
+// Enumerate every action that makes sense against the current status.
+// Index 0 is always wait so an out-of-range choice degrades to a no-op.
+function buildCandidates(status) {
+  const candidates = [{ label: "wait(様子見。建設中で他にやることがない時のみ)", action: { action: "wait" } }];
+  const colony = status[0];
+  if (colony) {
+    // Only offer the spawn cheat while there are free beds - gemma otherwise
+    // picks it every single turn and the population runs away past housing.
+    const housing = housingCapacity(colony);
+    const pop = (colony.citizens || []).length;
+    if (pop < housing) {
+      candidates.push({
+        label: `spawnCitizen(市民を1人追加。住居容量 ${housing} に空きあり)`,
+        action: { action: "spawnCitizen", colonyId: COLONY_ID },
+      });
+    }
+    // A building can only be upgraded to a level some operational builder hut
+    // already has (the hut itself may self-upgrade one level ahead). Doomed
+    // upgrade candidates are filtered out entirely - the model otherwise keeps
+    // picking them and collecting level-gate errors.
+    const buildings = colony.buildings || [];
+    const maxBuilderLevel = Math.max(
+      0,
+      ...buildings.filter((b) => b.type === "blockhutbuilder" && b.operational).map((b) => b.level)
+    );
+    for (const b of buildings) {
+      if (b.pending || !b.inTerritory) continue;
+      if (!b.operational) {
+        candidates.push({
+          label: `requestBuild ${b.type} @(${b.x},${b.y},${b.z}) 未着工→着工させる(重要)`,
+          action: { action: "requestBuild", x: b.x, y: b.y, z: b.z },
+        });
+      } else if (b.type === "blockhutbuilder" || b.level + 1 <= maxBuilderLevel) {
+        candidates.push({
+          label: `requestBuild ${b.type} @(${b.x},${b.y},${b.z}) lv${b.level}→lv${b.level + 1}にアップグレード`,
+          action: { action: "requestBuild", x: b.x, y: b.y, z: b.z },
+        });
+      }
+    }
+    if (pop > housing) {
+      candidates.push({
+        label: `placeNext minecolonies:blockhutcitizen(住居の新設。市民${pop}人>容量${housing}人なので最優先級)`,
+        action: { action: "placeNext", block: "minecolonies:blockhutcitizen" },
+      });
+    }
+  }
+  for (const v of Object.values(BUILDING_REGISTRY)) {
+    if (v.blueprint === null) continue;
+    if (v.block === "minecolonies:blockhuttownhall") continue; // manual bootstrap only
+    candidates.push({
+      label: `placeNext ${v.block}(${v.job || "-"}: ${(v.role || "").slice(0, 40)}) 新設を配置`,
+      action: { action: "placeNext", block: v.block },
+    });
+  }
+  return candidates;
+}
+
+function askLLM(model, messages, { format = null } = {}) {
   return new Promise((resolve, reject) => {
-    // max_tokens is mandatory: without it OpenRouter runs its affordability
-    // check against the model's maximum (64k for haiku-4.5) and rejects every
-    // call with 402 when the credit balance is low. Replies here are one short
-    // JSON object, so 1000 is generous.
-    const payload = JSON.stringify({ model, messages, max_tokens: 1000 });
-    const req = https.request(
+    // ollama native /api/chat, not the OpenAI-compatible /v1 endpoint:
+    // - think:false is required - gemma4 otherwise burns the whole token
+    //   budget on a "reasoning" field and returns empty content.
+    // - format: JSON schema (or "json") for structured turns. Citizen voice
+    //   is free-form text and must NOT set it.
+    // num_predict caps runaway generations; replies are one short JSON object.
+    const body = { model, messages, stream: false, think: false, options: { num_predict: 1000 } };
+    if (format) body.format = format;
+    const payload = JSON.stringify(body);
+    const req = http.request(
       {
-        hostname: "openrouter.ai",
-        path: "/api/v1/chat/completions",
+        host: LLM_HOST,
+        port: LLM_PORT,
+        path: "/api/chat",
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
           "Content-Length": Buffer.byteLength(payload),
         },
       },
@@ -143,7 +229,7 @@ function askLLM(model, messages) {
         res.on("end", () => {
           try {
             const parsed = JSON.parse(data);
-            const reply = parsed.choices?.[0]?.message?.content?.trim();
+            const reply = parsed.message?.content?.trim();
             if (reply) resolve(reply);
             else reject(new Error("No reply: " + data));
           } catch (e) {
@@ -184,62 +270,41 @@ function buildGovernorSystemPrompt(gov) {
 資材・物資の供給はコロニーのNPCが自律的にやる仕組みです。例えば、農夫が食料を作り、木こりが木材を切り、配達員が倉庫から各建物へ配給します。あなたが直接アイテムを渡す必要はありません。「資材が足りない」なら、それを生産・供給できる建物(農場・木こり小屋・倉庫・配達スタンド等)を建てることが解決策です。
 
 返答フォーマット(厳守、JSON以外の文章は書かない):
-{"say":"<日本語で一言、40文字以内、他の統治者への発言や状況へのコメント>","action":{"action":"<action名>", ...パラメータ}}
+{"say":"<日本語で一言、40文字以内、他の統治者への発言や状況へのコメント>","choice":<番号>}
 
-actionの種類:
-- {"action":"placeNext","block":"<block_id>"} ← 座標は自動計算(推奨。座標ミスなし)
-- {"action":"place","x":<int>,"y":<int>,"z":<int>,"block":"<block_id>"} ← 座標を手動指定する場合のみ(town hall初回配置など)
-- {"action":"found","x":<int>,"y":<int>,"z":<int>,"name":"<colony name>"}
-- {"action":"spawnCitizen","colonyId":${COLONY_ID}}
-- {"action":"requestBuild","x":<int>,"y":<int>,"z":<int>}
-- {"action":"resolveRequest","x":<int>,"y":<int>,"z":<int>,"citizenId":<int>}
-- {"action":"giveToCitizen","colonyId":${COLONY_ID},"citizenId":<int>,"item":"minecraft:<item_id>","count":<int>}
-- {"action":"wait"}
-
-建物対応表(Colonialパック・block_idとblueprintパスの正確な一覧。これ以外のblock_idは存在しないので使わないこと):
-${buildingTable()}
+毎ターン、[ACTIONS] として「いま実行可能なアクション」の番号付きリストが渡される。その中から1つ選び、choice にその番号(整数)を入れること。リストにないことは実行できない。
 
 ルール:
-- 最初にtown hallを置いてfoundするまで他のactionは無効。
-- 置いたら必ずrequestBuildを呼ぶ(呼ばないと永遠に着工しない)。
+- sayは必ず日本語で40文字以内。長い分析を書かない。
 - 他の統治者の直前の発言や行動を踏まえて、被らないように調整すること。
-- アンカー座標(${ANCHOR.x},${ANCHOR.y},${ANCHOR.z})付近に建てる。
-
-建物配置ルール:
-- town hall以外はすべて {"action":"placeNext","block":"<block_id>"} を使うこと。座標は bridge 側が自動計算する(コロニー領域内・既存建物と重複しない最近傍)。
-- town hall のみ手動配置: {"action":"place","x":${ANCHOR.x},"y":${ANCHOR.y},"z":${ANCHOR.z},"block":"minecolonies:blockhuttownhall"}
-- placeNextの後にstatus確認→その建物の座標でrequestBuildを呼ぶ(pending=falseのまま放置しない)。
-- placeNextがERRORを返したら、その建物タイプは今のコロニー領域に入らないということなのでwaitして領域拡大を待つ。
+- placeNextで配置した建物は「未着工」のまま。[ACTIONS]に「未着工→着工させる」のrequestBuildが出ていたら、原則それを最優先で選ぶこと(着工しないと永遠に建たない)。
+- placeNextがERRORを返したら、その建物タイプが入る空きが今のコロニー領域にないということ。blockhutguardtower(衛兵塔)を新設して領域を拡張するか、townhallをアップグレードする。
 
 資材供給について(重要):
 - supply_bot.js が並走しており、全市民のオープンリクエストを自動で解決し続けている。資材不足は自動解決されるので、あなたは建設計画に専念してよい。
 - 道具は建物レベルで使える上限が決まる(lv0-1→石製まで, lv2→鉄製まで, lv3→ダイヤまで)。supply_botが自動対応するので手動で渡す必要は原則ない。
 - builderがstuckの場合のみ、/openRequestsで確認した要求アイテムをそのまま giveToCitizen で渡すこと。
 
-進行戦略(毎ターン status を読んで判断すること):
-【判断ロジック】以下の条件を上から順にチェックし、最初に該当したアクションを実行する:
+進行戦略(現在は中期フェーズ。毎ターン [HINT] と status を読み、以下を上から順にチェックして最初に該当したものを選ぶ):
 
-A. town hallが存在しない → place town hall at (${ANCHOR.x},${ANCHOR.y},${ANCHOR.z}) → found
-B. builder hutが0棟 → spawnCitizen(市民が0人なら)またはplaceNext builder hut
-C. requestBuildしていないbuilder hutがある(pending=false かつ operational=false) → requestBuild その builder hut
-D. builder hutが建設中(pending=true)のものがある かつ operational=trueのbuilder hutが2棟未満 → wait(まだbuilder hutを増やすタイミングではない)
-E. operational=trueのbuilder hutが存在 かつ builder hutが計4棟未満 → placeNext builder hut
-F. operational=trueのbuilder hutが4棟以上 かつ town hallのrequestBuildがまだ → requestBuild town hall (243,-60,200)... いや、town hallの座標をstatusから読んで requestBuild
-G. 上記以外 → 住居・食料・倉庫・配達を1棟ずつplaceNext → requestBuild
-H. 主要建物(住居・食料・倉庫・配達)が揃った中期フェーズ → 優先順: university(研究ゲート解禁)→ mine(石材・鉱石)→ 住居追加(人口増)→ builder hutの自己アップグレード(requestBuildで自分をlv2にするとlv2建物が解禁される)
+A. [ACTIONS]に「未着工→着工させる」がある → 必ずそれを選ぶ(最優先。着工しないと永遠に建たない)
+B. 市民数が住居容量を超えている([HINT]に表示) → 住居(blockhutcitizen)を新設、または既存住居をアップグレード(lvNの住居はN人収容)。宿なしの市民が出るので常に最優先級。
+C. lv2のbuilder hutがまだ1棟もない → builder hutをアップグレード(builder hutのレベル = 他の建物をそのレベルまで上げられる上限。全アップグレードの前提)
+D. 生活基盤の強化 → 食料(farm/cook)、資材(lumberjack/sawmill)、物流(warehouse/deliveryman)の新設やアップグレード
+E. university新設 → 研究でhospital等の上位建物が解禁される
+F. 上記に該当なし → 重要施設(townhall・warehouse・住居)のアップグレード。townhallのレベルアップはコロニー領域も広げる。
 
 【重要ルール】
-- 1ターンに1アクションのみ。複数の建物を一度に置かない。
+- 1ターンに1アクションのみ。
+- 直前のターンで placeNext や requestBuild がERRORを返していたら、同じ選択を繰り返さないこと([RESULT]にエラー理由が出る)。
+- placeNextがERRORの時は領域不足 → blockhutguardtower(衛兵塔)を新設するとその周囲のチャンクがコロニー領域に加わり、領域を拡張できる。
+- 建物のアップグレードが「needs a Builder's Hut at level N」エラーになったら、先にbuilder hutをアップグレードする。
 - pending=trueの建物が多い時はwait。builderが同時に処理できる案件は hut 数分だけ。
-- 他の統治者が直前にplaceNextを呼んだなら、自分はrequestBuildかwaitにする(被り防止)。
+- 他の統治者と同じアクションを連続で選ばない(被り防止)。
 - waitは「建設中で何もできない」時のみ。必ず理由をsayで共有。
 
 重要な仕組み(必ず守ること):
-- Builder's Hut(blockhutbuilder)のレベルが建設できる建物の上限を決める。
-  - レベル0: 自分のBuilder's Hutのみ建設可(town hall含む他の建物へのrequestBuildはエラーになる)
-  - レベル1以上: そのレベルまでの建物を建設可能
-- 【重要】最初に市民をspawnCitizenしてから builder hutを置くこと。市民がいないと誰もbuilderにならず建設が進まない。
-- まず全てのBuilder's HutにrequestBuildを呼んでレベル1にする。それが完了してから他の建物へrequestBuildする。
+- Builder's Hut(blockhutbuilder)のレベルが建設・アップグレードできる建物のレベル上限を決める。lv2建物が欲しければ先にbuilder hutをlv2にする。
 - 研究ゲート建物(hospital, sawmill, blacksmith等)はUniversityでの研究完了前にrequestBuildするとエラーになる。researchUnlocked配列で解除済みかを確認してから呼ぶこと。placeNext自体は通ってしまうので、requestBuildがエラーになったら建物を放置せずwaitに切り替えること。
 - 1つのBuilder's Hutに対して実際に作業できる建築家は1人だけ。Builder職の市民がN人いるならblockhutbuilderもN棟必要。
 
@@ -261,15 +326,27 @@ H. 主要建物(住居・食料・倉庫・配達)が揃った中期フェーズ
 }
 
 async function governorTurn(gov, history, status) {
-  const userMsg = `[STATE] anchor ${ANCHOR.x},${ANCHOR.y},${ANCHOR.z}\ncolonies: ${JSON.stringify(status)}\n直近の会話: ${sharedChatLog
+  const candidates = buildCandidates(status);
+  const menu = candidates.map((c, i) => `${i}: ${c.label}`).join("\n");
+  // Pre-computed hints: small models don't reliably derive these from the
+  // raw status JSON, and the housing deficit drives the top-priority rule.
+  const colony = status[0];
+  let hint = "";
+  if (colony) {
+    const cap = housingCapacity(colony);
+    const pop = (colony.citizens || []).length;
+    const pending = (colony.buildings || []).filter((b) => b.pending).length;
+    hint = `\n[HINT] 市民${pop}人/住居容量${cap}人${pop > cap ? ` → 住居が${pop - cap}人分不足!住居の新設/アップグレードを優先` : "(充足)"}、建設中(pending)${pending}件`;
+  }
+  const userMsg = `[STATE] anchor ${ANCHOR.x},${ANCHOR.y},${ANCHOR.z}\ncolonies: ${JSON.stringify(status)}${hint}\n直近の会話: ${sharedChatLog
     .slice(-8)
     .map((c) => `${c.who}: ${c.text}`)
-    .join(" | ")}\n次の行動は?`;
+    .join(" | ")}\n[ACTIONS] 次の行動を1つ選び {"say":"<日本語で40文字以内の短い一言>","choice":<番号>} で答えること。sayに分析や長文を書かない:\n${menu}`;
   history.push({ role: "user", content: userMsg });
 
   let reply;
   try {
-    reply = await askLLM(MODEL, history.slice(0, 1).concat(history.slice(-12)));
+    reply = await askLLM(MODEL, history.slice(0, 1).concat(history.slice(-12)), { format: GOVERNOR_REPLY_SCHEMA });
   } catch (e) {
     console.log(`[${gov.name}] LLM error:`, e.message);
     return;
@@ -289,15 +366,23 @@ async function governorTurn(gov, history, status) {
     return;
   }
 
-  if (parsed.say) sayInGame(gov.name, parsed.say);
+  if (parsed.say) sayInGame(gov.name, String(parsed.say).slice(0, 60));
+  else console.log(`[${gov.name}] reply missing say:`, jsonStr.slice(0, 200));
 
-  if (parsed.action && parsed.action.action) {
-    try {
-      const res = await runGovernorAction(parsed.action);
-      console.log(`[${gov.name}] action ${parsed.action.action} ->`, res.status, res.body);
-    } catch (e) {
-      console.log(`[${gov.name}] action failed:`, e.message);
-    }
+  const idx =
+    Number.isInteger(parsed.choice) && parsed.choice >= 0 && parsed.choice < candidates.length
+      ? parsed.choice
+      : 0;
+  const chosen = candidates[idx];
+  try {
+    const res = await runGovernorAction(chosen.action);
+    console.log(`[${gov.name}] choice ${idx} (${chosen.label}) ->`, res.status, res.body);
+    // Feed the outcome back into this governor's history - otherwise errors
+    // (level gates, no space, research gates) are invisible and the model
+    // keeps repeating the same failing choice.
+    history.push({ role: "user", content: `[RESULT] ${chosen.label} -> ${res.status} ${String(res.body).slice(0, 150)}` });
+  } catch (e) {
+    console.log(`[${gov.name}] action failed:`, e.message);
   }
 }
 
@@ -392,7 +477,7 @@ async function main() {
     const colony = status[0];
     if (
       colony && colony.citizens && colony.citizens.length > 0 &&
-      cycle % CITIZEN_VOICE_EVERY === 1
+      (cycle - 1) % CITIZEN_VOICE_EVERY === 0
     ) {
       const citizen = colony.citizens[(cycle - 1) % colony.citizens.length];
       await citizenVoiceTurn(citizen, citizen.workBuilding);
@@ -415,4 +500,8 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-main().catch((e) => console.error("FATAL", e));
+module.exports = { askLLM, buildGovernorSystemPrompt, extractFirstJSON, buildCandidates, GOVERNORS, MODEL, GOVERNOR_REPLY_SCHEMA };
+
+if (require.main === module) {
+  main().catch((e) => console.error("FATAL", e));
+}
