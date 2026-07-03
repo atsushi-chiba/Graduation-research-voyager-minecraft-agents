@@ -254,6 +254,9 @@ public class VoyagerBridge {
             httpServer.createContext("/removeBuilding", this::handleRemoveBuilding);
             httpServer.createContext("/rebalanceWorkOrders", this::handleRebalanceWorkOrders);
             httpServer.createContext("/debugWorkOrders", this::handleDebugWorkOrders);
+            httpServer.createContext("/setMenu", this::handleSetMenu);
+            httpServer.createContext("/setFieldSeed", this::handleSetFieldSeed);
+            httpServer.createContext("/fields", this::handleFields);
             httpServer.createContext("/ping", VoyagerBridge::handlePing);
             httpServer.setExecutor(null);
             httpServer.start();
@@ -813,6 +816,209 @@ public class VoyagerBridge {
                 respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
             } else {
                 respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // POST /setMenu?x=200&y=-60&z=182&items=minecraft:bread,minecraft:cooked_beef
+    //
+    // Once a cook hut (restaurant) exists and is staffed, citizens stop eating
+    // food from their own inventory and will only eat what is registered on the
+    // restaurant's menu (RestaurantMenuModule - the list the player normally
+    // edits in the hut GUI). A freshly built cook hut has an EMPTY menu, which
+    // starves the entire colony. addMenuItem enforces edibility (FoodUtils.EDIBLE)
+    // and a per-building-level size cap and silently ignores rejects, so the
+    // response re-reads the menu to show what actually stuck.
+    private void handleSetMenu(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+            String itemsCsv = params.getOrDefault("items", "");
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IColony colony = findColonyAt(level, pos);
+                    if (colony == null) {
+                        result.complete("ERROR: no colony at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    IBuilding building = colony.getServerBuildingManager().getBuilding(pos);
+                    if (building == null) {
+                        result.complete("ERROR: no building registered at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    com.minecolonies.core.colony.buildings.modules.RestaurantMenuModule menu =
+                            building.getModule(com.minecolonies.core.colony.buildings.modules.BuildingModules.RESTAURANT_MENU);
+                    if (menu == null) {
+                        result.complete("ERROR: building at " + x + "," + y + "," + z
+                                + " has no restaurant menu module (not a cook hut?)");
+                        return;
+                    }
+                    for (String id : itemsCsv.split(",")) {
+                        id = id.trim();
+                        if (id.isEmpty()) continue;
+                        Item item = ForgeRegistries.ITEMS.getValue(new ResourceLocation(id));
+                        if (item == null) {
+                            result.complete("ERROR: unknown item id " + id);
+                            return;
+                        }
+                        menu.addMenuItem(new ItemStack(item, 1));
+                    }
+                    StringBuilder sb = new StringBuilder("menu now (" + menu.getMenu().size() + "): ");
+                    boolean first = true;
+                    for (com.minecolonies.api.crafting.ItemStorage st : menu.getMenu()) {
+                        if (!first) sb.append(", ");
+                        first = false;
+                        sb.append(ForgeRegistries.ITEMS.getKey(st.getItemStack().getItem()));
+                    }
+                    result.complete(sb.toString());
+                } catch (Exception e) {
+                    LOGGER.error("setMenu failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // POST /setFieldSeed?x=&y=&z=&seed=minecraft:wheat_seeds
+    //
+    // A farm field (scarecrow block) grows nothing until a seed is assigned,
+    // which is normally done in the scarecrow GUI - without it the farmer never
+    // starts working. (x,y,z) is the scarecrow's position. Mirrors what
+    // FarmFieldUpdateSeedMessage.onExecute does server-side.
+    private void handleSetFieldSeed(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+            String seedId = params.get("seed");
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IColony colony = findColonyAt(level, pos);
+                    if (colony == null) {
+                        result.complete("ERROR: no colony at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    Item seedItem = ForgeRegistries.ITEMS.getValue(new ResourceLocation(seedId));
+                    if (seedItem == null) {
+                        result.complete("ERROR: unknown item id " + seedId);
+                        return;
+                    }
+                    java.util.Optional<com.minecolonies.api.colony.buildingextensions.IBuildingExtension> extOpt =
+                            colony.getServerBuildingManager().getMatchingBuildingExtension(ext ->
+                                    ext.getBuildingExtensionType()
+                                            == com.minecolonies.api.colony.buildingextensions.registry.BuildingExtensionRegistries.farmField.get()
+                                    && ext.getPosition().equals(pos));
+                    if (extOpt.isEmpty()) {
+                        result.complete("ERROR: no farm field registered at " + x + "," + y + "," + z
+                                + " (is that the scarecrow position, and has the field been built?)");
+                        return;
+                    }
+                    ((com.minecolonies.core.colony.buildingextensions.FarmField) extOpt.get())
+                            .setSeed(new ItemStack(seedItem, 1));
+                    colony.getServerBuildingManager().markBuildingExtensionsDirty();
+                    result.complete("seed of field at " + x + "," + y + "," + z + " set to " + seedId);
+                } catch (Exception e) {
+                    LOGGER.error("setFieldSeed failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // GET /fields?colonyId=1
+    //
+    // Lists the colony's building extensions (farm fields, plantation fields):
+    // position, type, whether a hut has claimed it, and the assigned seed for
+    // farm fields. IRegisteredStructureManager only exposes a first-match
+    // predicate search, so the predicate collects every entry and returns false.
+    private void handleFields(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, server.overworld());
+                    if (colony == null) {
+                        result.complete("ERROR: no colony with id " + colonyId);
+                        return;
+                    }
+                    java.util.List<com.minecolonies.api.colony.buildingextensions.IBuildingExtension> all =
+                            new java.util.ArrayList<>();
+                    colony.getServerBuildingManager().getMatchingBuildingExtension(ext -> {
+                        all.add(ext);
+                        return false;
+                    });
+                    StringBuilder sb = new StringBuilder("[");
+                    boolean first = true;
+                    for (com.minecolonies.api.colony.buildingextensions.IBuildingExtension ext : all) {
+                        if (!first) sb.append(",");
+                        first = false;
+                        BlockPos p = ext.getPosition();
+                        sb.append("{\"x\":").append(p.getX())
+                          .append(",\"y\":").append(p.getY())
+                          .append(",\"z\":").append(p.getZ())
+                          .append(",\"type\":\"").append(escape(ext.getClass().getSimpleName())).append("\"")
+                          .append(",\"taken\":").append(ext.isTaken());
+                        if (ext instanceof com.minecolonies.core.colony.buildingextensions.FarmField farm) {
+                            ItemStack seed = farm.getSeed();
+                            sb.append(",\"seed\":\"")
+                              .append(seed == null || seed.isEmpty() ? ""
+                                      : escape(String.valueOf(ForgeRegistries.ITEMS.getKey(seed.getItem()))))
+                              .append("\"");
+                        }
+                        sb.append("}");
+                    }
+                    sb.append("]");
+                    result.complete(sb.toString());
+                } catch (Exception e) {
+                    LOGGER.error("fields failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, outcome);
             }
         } catch (Exception e) {
             respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");

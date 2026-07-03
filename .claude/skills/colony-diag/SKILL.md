@@ -32,7 +32,9 @@ echo 'minecolonies citizens info <colonyId> <citizenId>' > /root/mc-server-forge
 5. **道具の tier 制限** — 建物/職レベルを超える tier の道具は使えない。低レベル worker には木/石の道具を渡す(iron 以上は NG)。
 6. **work order の偏り** — builder は他人の claimed order を横取りしない。偏っていたら `POST /rebalanceWorkOrders?colonyId=1` で均等化("Claiming an already claimed workorder!" WARN は無害)。
 7. **職業別の環境要件(スーパーフラットでは自前で用意)** — 木こり: `LUMBERJACK_NO_TREES_FOUND` なら木がない。`place feature minecraft:oak <x> -60 <z>` をcmd_pipeで送って hut 周辺(半径〜15)に植える(y=-60が地表の空気層)。釣り人: **水深2ブロック必須**。blueprintの池は水深1なので `setblock <x> -62 <z> minecraft:water` で掘り下げる(2026-07-02 に fisher1 の107セルを深化済み)。空腹(CHECK_FOR_FOOD / SEARCH_RESTAURANT)も並発しやすく、パンを渡すまで作業を再開しないことがある。
-8. **claim移動後の亡霊参照ループ** — `LOAD_STRUCTURE→START_BUILDING→BUILDING_STEP→LOAD_STRUCTURE` を5秒周期で無限に回る(citizens info の遷移ログで判別)。原因: builder hut は workOrderId/進捗/資材リストを、AI は structurePlacer をキャッシュしており、claim だけ書き換えると分裂状態になる。bridge の rebalance は `onWorkOrderCancellation` を呼ぶよう修正済み(2026-07-02)だが、同型の症状が出たらサーバー再起動で AI キャッシュが飛び、building 側は getWorkOrder() の自己修復(claimedBy≠自分なら参照クリア)で治る。
+8. **食堂(cook hut)完成後の全員絶食** — 食堂が稼働すると市民は**食堂メニューに登録された食べ物しか食べなくなる**(自分のインベントリのパンも無視して食堂に集まり、満腹度0で固まる)。新設食堂のメニューは空。対処: `POST /setMenu?x&y&z&items=minecraft:bread,minecraft:cooked_beef,...`(lv1の上限は5品。応答に実際に登録されたメニューが返る)。メニュー登録すると食堂が MinimumStock 要求を出し、supply_bot が自動で食材を納品する。
+9. **農民が働かない** — 畑(カカシ)に種が未指定だと農民は一切働かない(通常はカカシGUIで指定)。確認: `GET /fields?colonyId=1`(位置・taken・seed)。対処: `POST /setFieldSeed?x&y&z&seed=minecraft:wheat_seeds`(座標はカカシ位置)。種を入れると farmer hut が自動で畑を claim して働き始める。
+10. **claim移動後の亡霊参照ループ** — `LOAD_STRUCTURE→START_BUILDING→BUILDING_STEP→LOAD_STRUCTURE` を5秒周期で無限に回る(citizens info の遷移ログで判別)。原因: builder hut は workOrderId/進捗/資材リストを、AI は structurePlacer をキャッシュしており、claim だけ書き換えると分裂状態になる。bridge の rebalance は `onWorkOrderCancellation` を呼ぶよう修正済み(2026-07-02)だが、同型の症状が出たらサーバー再起動で AI キャッシュが飛び、building 側は getWorkOrder() の自己修復(claimedBy≠自分なら参照クリア)で治る。
 
 ## 注意
 
