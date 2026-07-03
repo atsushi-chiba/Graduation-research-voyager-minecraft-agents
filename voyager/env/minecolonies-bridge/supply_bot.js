@@ -137,6 +137,28 @@ async function fillBuilderHuts(colony, cycle) {
   return filled;
 }
 
+// Research progresses on its own once started (the university researcher
+// works it down), but finished research frees slots and unlocks children -
+// periodically ask the bridge to start whatever is startable next. Item
+// costs are cheated (creative path); progression order stays vanilla.
+async function autoResearch(colony, cycle) {
+  if (cycle % 10 !== 1) return 0;
+  try {
+    const res = await httpRequest("POST", `/autoResearch?colonyId=${colony.id}`);
+    if (res.status !== 200) return 0; // e.g. no university yet
+    const d = JSON.parse(res.body);
+    if (d.started && d.started.length > 0) {
+      console.log(
+        `[supply #${cycle}] started research: ${d.started.join(", ")} (${d.inProgress}/${d.slots} slots)`
+      );
+      return d.started.length;
+    }
+  } catch {
+    // transient - retry next round
+  }
+  return 0;
+}
+
 // Keep the restaurant's racks stocked with every menu food so the cook can
 // serve arrivals immediately (the built-in MinimumStock pipeline is too slow
 // at 10x and citizens loiter at the restaurant waiting to be fed).
@@ -206,6 +228,7 @@ async function loop() {
         totalResolved += await treatSickCitizens(colony, cycle);
         totalResolved += await feedHungryCitizens(colony, cycle);
         totalResolved += await stockRestaurants(colony, cycle);
+        totalResolved += await autoResearch(colony, cycle);
         totalResolved += await fillBuilderHuts(colony, cycle);
         for (const building of colony.buildings) {
           if (building.workers.length === 0) continue;

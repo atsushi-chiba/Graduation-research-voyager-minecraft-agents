@@ -333,6 +333,9 @@ public class VoyagerBridge {
             httpServer.createContext("/debugCitizenAI", this::handleDebugCitizenAI);
             httpServer.createContext("/debugFarm", this::handleDebugFarm);
             httpServer.createContext("/debugBuilder", this::handleDebugBuilder);
+            httpServer.createContext("/research", this::handleResearch);
+            httpServer.createContext("/startResearch", this::handleStartResearch);
+            httpServer.createContext("/autoResearch", this::handleAutoResearch);
             httpServer.createContext("/ping", VoyagerBridge::handlePing);
             httpServer.setExecutor(null);
             httpServer.start();
@@ -1524,6 +1527,243 @@ public class VoyagerBridge {
         }
     }
 
+    // ---------- Research pipeline ----------
+    //
+    // GET  /research?colonyId=1        - whole tree with local state per research
+    // POST /startResearch?colonyId=1&branch=<rl>&id=<rl>
+    // POST /autoResearch?colonyId=1    - start the shallowest startable researches
+    //                                    until the university's slots are full
+    //
+    // Research is normally started from the university GUI; the server-side
+    // entry point is LocalResearchTree.attemptBeginResearch (TryResearchMessage).
+    // A creative player skips the item costs and requirement checks entirely,
+    // which matches this experiment's cheat-supply philosophy - so we pass a
+    // FakePlayer with abilities.instabuild=true. Progression afterwards is the
+    // normal simulation: the university researcher works the research down
+    // (config researchCreativeCompletion would make it instant; not used).
+    // Concurrent research slots = university building level; the creative path
+    // skips that check in vanilla, so we enforce it ourselves.
+
+    private com.minecolonies.core.colony.buildings.workerbuildings.BuildingUniversity findUniversity(IColony colony) {
+        for (IBuilding b : colony.getServerBuildingManager().getBuildings().values()) {
+            if (b instanceof com.minecolonies.core.colony.buildings.workerbuildings.BuildingUniversity u
+                    && u.getBuildingLevel() >= 1) {
+                return u;
+            }
+        }
+        return null;
+    }
+
+    // getPrimaryResearch/getChildren element types differ across versions
+    // (IGlobalResearch vs ResourceLocation ids), so walk defensively.
+    private java.util.List<com.minecolonies.api.research.IGlobalResearch> walkBranch(
+            com.minecolonies.api.research.IGlobalResearchTree gt, ResourceLocation branch) {
+        java.util.List<com.minecolonies.api.research.IGlobalResearch> out = new java.util.ArrayList<>();
+        java.util.ArrayDeque<Object> stack = new java.util.ArrayDeque<>();
+        java.util.List<?> primary = gt.getPrimaryResearch(branch);
+        if (primary != null) stack.addAll(primary);
+        while (!stack.isEmpty()) {
+            Object o = stack.pop();
+            com.minecolonies.api.research.IGlobalResearch r =
+                    o instanceof com.minecolonies.api.research.IGlobalResearch g ? g
+                    : o instanceof ResourceLocation rl ? gt.getResearch(branch, rl) : null;
+            if (r == null) continue;
+            out.add(r);
+            java.util.List<?> children = r.getChildren();
+            if (children != null) stack.addAll(children);
+        }
+        return out;
+    }
+
+    private void handleResearch(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, server.overworld());
+                    if (colony == null) {
+                        result.complete("ERROR: no colony with id " + colonyId);
+                        return;
+                    }
+                    com.minecolonies.api.research.IGlobalResearchTree gt =
+                            com.minecolonies.api.research.IGlobalResearchTree.getInstance();
+                    com.minecolonies.api.research.ILocalResearchTree lt =
+                            colony.getResearchManager().getResearchTree();
+                    com.minecolonies.core.colony.buildings.workerbuildings.BuildingUniversity univ = findUniversity(colony);
+                    StringBuilder json = new StringBuilder("{");
+                    json.append("\"universityLevel\":").append(univ == null ? 0 : univ.getBuildingLevel());
+                    json.append(",\"inProgress\":").append(lt.getResearchInProgress().size());
+                    json.append(",\"branches\":[");
+                    boolean firstBranch = true;
+                    for (ResourceLocation branch : gt.getBranches()) {
+                        if (!firstBranch) json.append(",");
+                        firstBranch = false;
+                        json.append("{\"branch\":\"").append(escape(branch.toString())).append("\",\"researches\":[");
+                        boolean firstRes = true;
+                        for (com.minecolonies.api.research.IGlobalResearch r : walkBranch(gt, branch)) {
+                            com.minecolonies.api.research.ILocalResearch local = lt.getResearch(branch, r.getId());
+                            if (!firstRes) json.append(",");
+                            firstRes = false;
+                            json.append("{\"id\":\"").append(escape(r.getId().toString()))
+                                .append("\",\"depth\":").append(r.getDepth())
+                                .append(",\"state\":\"").append(local == null ? "NOT_STARTED" : String.valueOf(local.getState()))
+                                .append("\",\"progress\":").append(local == null ? 0 : local.getProgress())
+                                .append("}");
+                        }
+                        json.append("]}");
+                    }
+                    json.append("]}");
+                    result.complete(json.toString());
+                } catch (Exception e) {
+                    LOGGER.error("research failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            respond(exchange, outcome.startsWith("ERROR") ? 500 : 200,
+                    outcome.startsWith("ERROR") ? "{\"error\":\"" + escape(outcome) + "\"}" : outcome);
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // Shared: start one research via the creative path; returns null on success
+    // or an error string.
+    private String startResearchInternal(IColony colony,
+            com.minecolonies.core.colony.buildings.workerbuildings.BuildingUniversity univ,
+            ResourceLocation branch, ResourceLocation id, ServerLevel level) {
+        com.minecolonies.api.research.IGlobalResearchTree gt =
+                com.minecolonies.api.research.IGlobalResearchTree.getInstance();
+        com.minecolonies.api.research.ILocalResearchTree lt = colony.getResearchManager().getResearchTree();
+        com.minecolonies.api.research.IGlobalResearch research = gt.getResearch(branch, id);
+        if (research == null) return "unknown research " + branch + "/" + id;
+        if (lt.getResearch(branch, id) != null) return "already started/finished: " + id;
+        if (lt.getResearchInProgress().size() >= univ.getBuildingLevel()) {
+            return "no free research slots (university lv" + univ.getBuildingLevel() + ")";
+        }
+        FakePlayer fp = new FakePlayer(level, AI_PROFILE);
+        fp.getAbilities().instabuild = true; // isCreative() => cost/requirement-free start
+        lt.attemptBeginResearch(fp, colony, univ, research);
+        if (lt.getResearch(branch, id) == null) return "attemptBeginResearch did not start " + id;
+        colony.getResearchManager().markDirty();
+        return null;
+    }
+
+    private void handleStartResearch(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+            ResourceLocation branch = new ResourceLocation(params.get("branch"));
+            ResourceLocation id = new ResourceLocation(params.get("id"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, server.overworld());
+                    if (colony == null) {
+                        result.complete("ERROR: no colony with id " + colonyId);
+                        return;
+                    }
+                    com.minecolonies.core.colony.buildings.workerbuildings.BuildingUniversity univ = findUniversity(colony);
+                    if (univ == null) {
+                        result.complete("ERROR: no operational university in colony");
+                        return;
+                    }
+                    String err = startResearchInternal(colony, univ, branch, id, server.overworld());
+                    result.complete(err == null ? "started " + branch + "/" + id : "ERROR: " + err);
+                } catch (Exception e) {
+                    LOGGER.error("startResearch failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    private void handleAutoResearch(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, server.overworld());
+                    if (colony == null) {
+                        result.complete("ERROR: no colony with id " + colonyId);
+                        return;
+                    }
+                    com.minecolonies.core.colony.buildings.workerbuildings.BuildingUniversity univ = findUniversity(colony);
+                    if (univ == null) {
+                        result.complete("ERROR: no operational university in colony");
+                        return;
+                    }
+                    com.minecolonies.api.research.IGlobalResearchTree gt =
+                            com.minecolonies.api.research.IGlobalResearchTree.getInstance();
+                    com.minecolonies.api.research.ILocalResearchTree lt = colony.getResearchManager().getResearchTree();
+                    // Candidates: not locally present, and canResearch (parent done +
+                    // university depth gate + building requirements) - the auto path
+                    // respects vanilla progression, only the item costs are cheated.
+                    java.util.List<com.minecolonies.api.research.IGlobalResearch> candidates = new java.util.ArrayList<>();
+                    for (ResourceLocation branch : gt.getBranches()) {
+                        for (com.minecolonies.api.research.IGlobalResearch r : walkBranch(gt, branch)) {
+                            if (lt.getResearch(r.getBranch(), r.getId()) != null) continue;
+                            try {
+                                if (!r.canResearch(univ, lt)) continue;
+                            } catch (Exception e) {
+                                continue;
+                            }
+                            candidates.add(r);
+                        }
+                    }
+                    candidates.sort(java.util.Comparator.comparingInt(
+                            com.minecolonies.api.research.IGlobalResearch::getDepth));
+                    StringBuilder started = new StringBuilder("[");
+                    boolean first = true;
+                    for (com.minecolonies.api.research.IGlobalResearch r : candidates) {
+                        if (lt.getResearchInProgress().size() >= univ.getBuildingLevel()) break;
+                        String err = startResearchInternal(colony, univ, r.getBranch(), r.getId(), server.overworld());
+                        if (err == null) {
+                            if (!first) started.append(",");
+                            first = false;
+                            started.append("\"").append(escape(r.getId().toString())).append("\"");
+                        }
+                    }
+                    started.append("]");
+                    result.complete("{\"started\":" + started
+                            + ",\"inProgress\":" + lt.getResearchInProgress().size()
+                            + ",\"slots\":" + univ.getBuildingLevel() + "}");
+                } catch (Exception e) {
+                    LOGGER.error("autoResearch failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            respond(exchange, outcome.startsWith("ERROR") ? 500 : 200,
+                    outcome.startsWith("ERROR") ? "{\"error\":\"" + escape(outcome) + "\"}" : outcome);
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
     // GET /fields?colonyId=1
     //
     // Lists the colony's building extensions (farm fields, plantation fields):
@@ -2391,7 +2631,7 @@ public class VoyagerBridge {
         IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
         if (colony == null) return "ERROR: no colony with id " + colonyId;
         int[] pos = findPlacementPos(blockId, colonyId);
-        if (pos == null) return "ERROR: no valid position found within 60 blocks of colony center";
+        if (pos == null) return "ERROR: no valid position found within 100 blocks of colony center";
         BlockPos center = colony.getCenter();
         double dist = Math.sqrt(Math.pow(pos[0] - center.getX(), 2) + Math.pow(pos[2] - center.getZ(), 2));
         return "{\"x\":" + pos[0] + ",\"y\":" + pos[1] + ",\"z\":" + pos[2]
@@ -2454,7 +2694,11 @@ public class VoyagerBridge {
         }
 
         final int GAP = 5;
-        final int MAX_DIST = 60;
+        // 100 (was 60): with the townhall at lv5 the claimed territory reaches far
+        // beyond the original core, and the 60-radius disc filled up completely -
+        // big buildings (university etc.) found no gap. isCoordInColony still
+        // filters candidates to actual claimed chunks.
+        final int MAX_DIST = 100;
         final int Y = center.getY();
 
         java.util.List<int[]> offsets = new java.util.ArrayList<>(15000);
@@ -2673,17 +2917,14 @@ public class VoyagerBridge {
                 return "ERROR: (" + x + "," + y + "," + z + ") no colony founded yet";
             }
 
-            // Hard cap: stay within 62 blocks of colony center. MineColonies' initial
-            // territory is 4 chunks = 64 blocks; requestUpgrade silently rejects work
-            // orders beyond that radius. We use 62 to stay 2 blocks inside the limit.
-            // When the town hall is upgraded, the territory expands by 1 chunk per level
-            // (to 80, 96, ... blocks), but this code uses 62 for safety at level 0.
-            // TODO: read colony.getMaxColonySize() to compute the dynamic limit.
-            if (nearestDist > 62) {
+            // Claimed chunks are authoritative: the territory grows as the townhall
+            // and border buildings level up, so the old fixed 62-block cap (sized
+            // for a level-0 bootstrap colony) wrongly rejected valid positions once
+            // the townhall reached lv5.
+            if (!nearestColony.isCoordInColony(level, pos)) {
                 BlockPos center = nearestColony.getCenter();
-                return "ERROR: (" + x + "," + y + "," + z + ") is " + (int) nearestDist
-                    + " blocks from colony center " + center
-                    + "; max 62 blocks allowed at townhall level 0 (territory ~64 blocks)";
+                return "ERROR: (" + x + "," + y + "," + z + ") is outside colony claimed territory ("
+                    + (int) nearestDist + " blocks from center " + center + ")";
             }
 
             // Also verify the position is in a claimed chunk (for multi-colony safety).
