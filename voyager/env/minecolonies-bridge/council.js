@@ -21,6 +21,17 @@ const path = require("path");
 const BUILDING_REGISTRY = JSON.parse(
   fs.readFileSync(path.join(__dirname, "building_registry.json"), "utf8")
 );
+// Per-building upgrade-effect knowledge (what actually improves: capacity,
+// throughput, slots, unlocks). Small models can't infer this, so it is
+// embedded directly into the candidate labels the governor picks from.
+const BUILDING_KNOWLEDGE = JSON.parse(
+  fs.readFileSync(path.join(__dirname, "building_knowledge.json"), "utf8")
+);
+function upgradeEffect(buildingType) {
+  const key = String(buildingType).replace(/^blockhut/, "");
+  const know = BUILDING_KNOWLEDGE[key];
+  return know && know.upgrade ? know.upgrade : "";
+}
 function buildingTable() {
   const rows = Object.entries(BUILDING_REGISTRY)
     .filter(([, v]) => v.blueprint !== null)
@@ -176,9 +187,11 @@ function buildCandidates(status) {
           label: `requestBuild ${b.type} @(${b.x},${b.y},${b.z}) 未着工→着工させる(重要)`,
           action: { action: "requestBuild", x: b.x, y: b.y, z: b.z },
         });
-      } else if (b.type === "blockhutbuilder" || b.level + 1 <= maxBuilderLevel) {
+      } else if (b.level < 5 && (b.type === "blockhutbuilder" || b.level + 1 <= maxBuilderLevel)) {
+        // level 5 is the MineColonies max; requestUpgrade silently no-ops there
+        const effect = upgradeEffect(b.type);
         candidates.push({
-          label: `requestBuild ${b.type} @(${b.x},${b.y},${b.z}) lv${b.level}→lv${b.level + 1}にアップグレード`,
+          label: `requestBuild ${b.type} @(${b.x},${b.y},${b.z}) lv${b.level}→lv${b.level + 1}にアップグレード${effect ? "(効果: " + effect + ")" : ""}`,
           action: { action: "requestBuild", x: b.x, y: b.y, z: b.z },
         });
       }
