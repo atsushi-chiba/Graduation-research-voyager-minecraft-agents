@@ -46,9 +46,17 @@ echo 'minecolonies citizens info <colonyId> <citizenId>' > /root/mc-server-forge
 
 - `curl -s 'http://localhost:8089/debugCitizenAI?colonyId=1&citizenId=<id>'` で判定材料を見る。
   WORKに入る条件は「workerAIがAbstractEntityAIBasic かつ canGoIdle()==false かつ leisureTime==0」。
-- `leisureTime>0` はランダム発生する余暇(一時的・正常)。`canGoIdle:true` が張り付く場合は
-  職業AIが「やることなし」と判断している — 職業ブロック設定(種・メニュー等)を**後から**
-  bridgeで変えた場合、職業モジュールの一時状態が更新されず張り付くことがある。
-  **サーバー再起動でモジュール状態が再構築されて直る**(2026-07-03 farmer で実測:
-  再起動直後にWORKING/FARMER_PLANTで畑仕事を開始した)。
-- 農家は畑を植え終わると作物成長までcanGoIdle:trueで待機する(これは正常)。
+- `leisureTime>0` はランダム発生する余暇(一時的・正常。3600tickで自然消滅)。
+- **farmer の canGoIdle:true 張り付き(2026-07-03 解決済みの実例)** —
+  farmerの畑スケジューラは**日付ベース**: 畑を1サイクル処理すると
+  `checkedExtensions[畑]=colony.getDay()` の刻印を押し、**翌日まで再訪しない**
+  (`/debugFarm?x&y&z`(farmer hut座標)で colonyDay / checkedExtensions /
+  extensionToWorkOn / stage を確認できる)。
+  真因は start_server.sh が `doDaylightCycle false` にしていて **colonyDay が永遠に0**
+  だったこと(「翌日」が来ない→畑は再起動ごとに1回しか働けない。再起動で一時的に
+  動くのは checkedExtensions がNBT保存バグで消えるため)。
+  **対処済み: doDaylightCycle=true に恒久変更**(start_server.sh 2026-07-03)。
+  夜は市民が寝る(10xで実時間約1分/晩)。正常リズム =「毎朝1回畑を処理
+  (耕す→植える→収穫を日替わりで1段階)→残りの時間は余暇/睡眠」。
+- 日付ベースのスケジューラは他職にもあり得るので、「特定の職だけ1日1回しか
+  働かない/全く働かない」ときはまず colonyDay の進行を疑う。

@@ -260,6 +260,7 @@ public class VoyagerBridge {
             httpServer.createContext("/setFieldSeed", this::handleSetFieldSeed);
             httpServer.createContext("/fields", this::handleFields);
             httpServer.createContext("/debugCitizenAI", this::handleDebugCitizenAI);
+            httpServer.createContext("/debugFarm", this::handleDebugFarm);
             httpServer.createContext("/ping", VoyagerBridge::handlePing);
             httpServer.setExecutor(null);
             httpServer.start();
@@ -1166,6 +1167,97 @@ public class VoyagerBridge {
                     result.complete(sb.toString());
                 } catch (Exception e) {
                     LOGGER.error("debugCitizenAI failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, outcome);
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // GET /debugFarm?x=&y=&z=  (x,y,z = farmer hut position)
+    //
+    // Dumps why the farmer's BuildingExtensionsModule does or doesn't hand out
+    // a field: the module only re-offers a field whose checkedExtensions day
+    // stamp is OLDER than colony.getDay() (fields get stamped after 4 visits
+    // with nothing to do), so a farmer can legitimately idle until the next
+    // colony day - or forever, if the day counter doesn't advance.
+    private void handleDebugFarm(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IColony colony = findColonyAt(level, pos);
+                    if (colony == null) {
+                        result.complete("ERROR: no colony at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    IBuilding building = colony.getServerBuildingManager().getBuilding(pos);
+                    if (building == null) {
+                        result.complete("ERROR: no building registered at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    com.minecolonies.core.colony.buildings.modules.BuildingExtensionsModule module =
+                            building.getFirstModuleOccurance(
+                                    com.minecolonies.core.colony.buildings.modules.BuildingExtensionsModule.class);
+                    if (module == null) {
+                        result.complete("ERROR: building has no BuildingExtensionsModule");
+                        return;
+                    }
+                    StringBuilder sb = new StringBuilder("{");
+                    sb.append("\"colonyDay\":").append(colony.getDay());
+                    sb.append(",\"worldDayTime\":").append(level.getDayTime());
+                    Object currentId = null;
+                    String checked = "?";
+                    try {
+                        java.lang.reflect.Field fCur = com.minecolonies.core.colony.buildings.modules.BuildingExtensionsModule.class
+                                .getDeclaredField("currentExtensionId");
+                        fCur.setAccessible(true);
+                        currentId = fCur.get(module);
+                        java.lang.reflect.Field fChk = com.minecolonies.core.colony.buildings.modules.BuildingExtensionsModule.class
+                                .getDeclaredField("checkedExtensions");
+                        fChk.setAccessible(true);
+                        checked = String.valueOf(fChk.get(module));
+                    } catch (Exception e) {
+                        LOGGER.warn("debugFarm reflection failed", e);
+                    }
+                    sb.append(",\"currentExtensionId\":\"").append(escape(String.valueOf(currentId))).append("\"");
+                    sb.append(",\"checkedExtensions\":\"").append(escape(checked)).append("\"");
+                    Object toWorkOn = module.getExtensionToWorkOn();
+                    sb.append(",\"extensionToWorkOn\":\"").append(toWorkOn == null ? "null"
+                            : escape(String.valueOf(((com.minecolonies.api.colony.buildingextensions.IBuildingExtension) toWorkOn).getPosition()))).append("\"");
+                    sb.append(",\"ownedExtensions\":[");
+                    boolean first = true;
+                    for (com.minecolonies.api.colony.buildingextensions.IBuildingExtension ext : module.getOwnedExtensions()) {
+                        if (!first) sb.append(",");
+                        first = false;
+                        BlockPos p = ext.getPosition();
+                        sb.append("{\"x\":").append(p.getX()).append(",\"y\":").append(p.getY()).append(",\"z\":").append(p.getZ());
+                        if (ext instanceof com.minecolonies.core.colony.buildingextensions.FarmField farm) {
+                            sb.append(",\"stage\":\"").append(farm.getFieldStage()).append("\"");
+                            ItemStack seed = farm.getSeed();
+                            sb.append(",\"seed\":\"").append(seed == null || seed.isEmpty() ? ""
+                                    : escape(String.valueOf(ForgeRegistries.ITEMS.getKey(seed.getItem())))).append("\"");
+                        }
+                        sb.append("}");
+                    }
+                    sb.append("]}");
+                    result.complete(sb.toString());
+                } catch (Exception e) {
+                    LOGGER.error("debugFarm failed", e);
                     result.complete("ERROR: " + e);
                 }
             });
