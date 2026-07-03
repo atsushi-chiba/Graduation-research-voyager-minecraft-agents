@@ -99,6 +99,37 @@ async function feedHungryCitizens(colony, cycle) {
   return fed;
 }
 
+// Builders request materials one item type at a time as construction reaches
+// them, which costs a request->deliver round-trip (one poll cycle) per item
+// type. The hut itself tracks the whole remaining bill of materials, and the
+// builder takes from the hut's racks before filing requests - so bulk-filling
+// the racks via /fillBuilderResources removes the ping-pong. Tools/armor are
+// not in that list and still flow through the request loop below.
+async function fillBuilderHuts(colony, cycle) {
+  let filled = 0;
+  for (const building of colony.buildings || []) {
+    if (building.type !== "blockhutbuilder") continue;
+    try {
+      const res = await httpRequest(
+        "POST",
+        `/fillBuilderResources?x=${building.x}&y=${building.y}&z=${building.z}`
+      );
+      if (res.status !== 200) continue;
+      const given = JSON.parse(res.body).filter((i) => i.given > 0);
+      if (given.length > 0) {
+        console.log(
+          `[supply #${cycle}] filled builder hut (${building.x},${building.y},${building.z}): ` +
+            given.map((i) => `${i.given}x ${i.item}`).join(", ")
+        );
+        filled += given.length;
+      }
+    } catch {
+      // transient - retry next cycle
+    }
+  }
+  return filled;
+}
+
 // Sick citizens don't file requests - their EntityAISickTask walks to a
 // hospital (which this colony doesn't have) and otherwise waits forever.
 // The same AI self-cures (APPLY_CURE) as soon as every cure item of the
@@ -139,6 +170,7 @@ async function loop() {
       for (const colony of colonies) {
         totalResolved += await treatSickCitizens(colony, cycle);
         totalResolved += await feedHungryCitizens(colony, cycle);
+        totalResolved += await fillBuilderHuts(colony, cycle);
         for (const building of colony.buildings) {
           if (building.workers.length === 0) continue;
 
@@ -178,9 +210,13 @@ async function loop() {
                   }
                 } else if (!req.textured) {
                   // Plain material request: give item then close the request.
+                  // Give exactly what the request asks for (the old 64-item floor
+                  // that avoided re-request round-trips is obsolete now that
+                  // fillBuilderResources bulk-stocks the hut racks, and it flooded
+                  // citizens with e.g. 64x polished diorite for a 1-block request).
                   const isToolItem = /_(pickaxe|axe|shovel|hoe|sword|bow|crossbow|fishing_rod)$/.test(req.item);
                   const maxMatch = !isToolItem && req.description && req.description.match(/\d+-(\d+)/);
-                  const giveCount = isToolItem ? 1 : (maxMatch ? parseInt(maxMatch[1]) : Math.max(req.count, 64));
+                  const giveCount = isToolItem ? 1 : (maxMatch ? parseInt(maxMatch[1]) : Math.max(req.count, 1));
                   await giveToCitizen(colony.id, citizenId, req.item, giveCount);
                   const res = await resolveRequest(building.x, building.y, building.z, citizenId);
                   if (res.status === 200) {

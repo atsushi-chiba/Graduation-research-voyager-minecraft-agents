@@ -255,6 +255,8 @@ public class VoyagerBridge {
             httpServer.createContext("/rebalanceWorkOrders", this::handleRebalanceWorkOrders);
             httpServer.createContext("/debugWorkOrders", this::handleDebugWorkOrders);
             httpServer.createContext("/setMenu", this::handleSetMenu);
+            httpServer.createContext("/neededResources", this::handleNeededResources);
+            httpServer.createContext("/fillBuilderResources", this::handleFillBuilderResources);
             httpServer.createContext("/setFieldSeed", this::handleSetFieldSeed);
             httpServer.createContext("/fields", this::handleFields);
             httpServer.createContext("/ping", VoyagerBridge::handlePing);
@@ -816,6 +818,143 @@ public class VoyagerBridge {
                 respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
             } else {
                 respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // GET  /neededResources?x=&y=&z=      - a builder hut's remaining material
+    //      list for its current work order: [{item, needed, available, given:0}]
+    // POST /fillBuilderResources?x=&y=&z= - same list, but first tops up every
+    //      deficit (needed - available) into the hut's racks in one shot.
+    //
+    // The builder AI requests materials one item type at a time as construction
+    // reaches them, so reactive request-resolution (supply_bot's default) costs
+    // a request->deliver round-trip per item type. The building already tracks
+    // the whole remaining bill of materials (AbstractBuildingStructureBuilder
+    // .getNeededResources()), and the builder picks materials out of its hut's
+    // racks before filing requests - so bulk-filling the racks up front removes
+    // the ping-pong entirely. Tools/armor are NOT in this list and still flow
+    // through the normal request path.
+    private void handleNeededResources(HttpExchange exchange) throws IOException {
+        handleBuilderResources(exchange, false);
+    }
+
+    private void handleFillBuilderResources(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        handleBuilderResources(exchange, true);
+    }
+
+    private void handleBuilderResources(HttpExchange exchange, boolean fill) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IColony colony = findColonyAt(level, pos);
+                    if (colony == null) {
+                        result.complete("ERROR: no colony at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    IBuilding building = colony.getServerBuildingManager().getBuilding(pos);
+                    if (building == null) {
+                        result.complete("ERROR: no building registered at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    if (!(building instanceof com.minecolonies.core.colony.buildings.AbstractBuildingStructureBuilder sb)) {
+                        result.complete("ERROR: building at " + x + "," + y + "," + z
+                                + " is not a structure-builder hut");
+                        return;
+                    }
+                    net.minecraftforge.items.IItemHandler handler = null;
+                    if (fill) {
+                        com.minecolonies.api.tileentities.AbstractTileEntityColonyBuilding te = building.getTileEntity();
+                        if (te == null) {
+                            result.complete("ERROR: hut tile entity not loaded");
+                            return;
+                        }
+                        handler = te.getCapability(net.minecraftforge.common.capabilities.ForgeCapabilities.ITEM_HANDLER)
+                                .resolve().orElse(null);
+                        if (handler == null) {
+                            result.complete("ERROR: hut has no item handler capability");
+                            return;
+                        }
+                    }
+                    StringBuilder json = new StringBuilder("[");
+                    boolean first = true;
+                    for (com.minecolonies.core.colony.buildings.utils.BuildingBuilderResource res
+                            : sb.getNeededResources().values()) {
+                        ItemStack proto = res.getItemStack();
+                        int needed = res.getAmount();
+                        int available = res.getAvailable();
+                        if (fill) {
+                            // The module's availability counter resets to 0 whenever a
+                            // new work order (re)computes its resource list and only
+                            // catches up on a later tick - trusting it right after that
+                            // reset would re-deliver items already sitting in the racks.
+                            // Count the racks directly and use whichever is higher.
+                            int inRacks = 0;
+                            for (int slot = 0; slot < handler.getSlots(); slot++) {
+                                ItemStack s = handler.getStackInSlot(slot);
+                                if (!s.isEmpty() && ItemStack.isSameItemSameTags(s, proto)) {
+                                    inRacks += s.getCount();
+                                }
+                            }
+                            available = Math.max(available, inRacks);
+                        }
+                        int inserted = 0;
+                        if (fill && needed > available) {
+                            int remaining = needed - available;
+                            while (remaining > 0) {
+                                int chunkSize = Math.min(remaining, proto.getMaxStackSize());
+                                ItemStack chunk = proto.copy();
+                                chunk.setCount(chunkSize);
+                                ItemStack leftover = chunk;
+                                for (int slot = 0; slot < handler.getSlots() && !leftover.isEmpty(); slot++) {
+                                    leftover = handler.insertItem(slot, leftover, false);
+                                }
+                                int put = chunkSize - leftover.getCount();
+                                inserted += put;
+                                remaining -= chunkSize;
+                                if (put < chunkSize) break; // racks full
+                            }
+                            if (inserted > 0) {
+                                // keep the module's availability bookkeeping in sync until
+                                // its own tick recomputes it
+                                res.setAvailable(available + inserted);
+                            }
+                        }
+                        if (!first) json.append(",");
+                        first = false;
+                        json.append("{\"item\":\"")
+                            .append(escape(String.valueOf(ForgeRegistries.ITEMS.getKey(proto.getItem()))))
+                            .append("\",\"needed\":").append(needed)
+                            .append(",\"available\":").append(available)
+                            .append(",\"given\":").append(inserted)
+                            .append("}");
+                    }
+                    json.append("]");
+                    result.complete(json.toString());
+                } catch (Exception e) {
+                    LOGGER.error("builderResources failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, outcome);
             }
         } catch (Exception e) {
             respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
