@@ -41,3 +41,14 @@ echo 'minecolonies citizens info <colonyId> <citizenId>' > /root/mc-server-forge
 - シミュレーションは常に 10x で回す方針(ユーザー指示 2026-07-02)。診断のため一時的に 1x に落とすのは可だが、終わったら必ず `curl -s -X POST 'http://localhost:8089/tickrate?multiplier=10'` で戻す(コンソールコマンドではなく bridge の HTTP エンドポイント)。tickrate>1 中はゲーム内時間ベースの現象がすべて加速して見える点に注意。
 - cmd_pipe に送ったコマンドの console 応答に `<--[HERE]` が付いていたら**不明コマンドのエラー**。成功と誤読しないこと。
 - jobStatus は builder が物理的に作業を始めるまで "idle" のまま。idle ≒ 故障ではない。
+
+## 市民がWORK状態に入らない(ぶらぶらする)とき
+
+- `curl -s 'http://localhost:8089/debugCitizenAI?colonyId=1&citizenId=<id>'` で判定材料を見る。
+  WORKに入る条件は「workerAIがAbstractEntityAIBasic かつ canGoIdle()==false かつ leisureTime==0」。
+- `leisureTime>0` はランダム発生する余暇(一時的・正常)。`canGoIdle:true` が張り付く場合は
+  職業AIが「やることなし」と判断している — 職業ブロック設定(種・メニュー等)を**後から**
+  bridgeで変えた場合、職業モジュールの一時状態が更新されず張り付くことがある。
+  **サーバー再起動でモジュール状態が再構築されて直る**(2026-07-03 farmer で実測:
+  再起動直後にWORKING/FARMER_PLANTで畑仕事を開始した)。
+- 農家は畑を植え終わると作物成長までcanGoIdle:trueで待機する(これは正常)。
