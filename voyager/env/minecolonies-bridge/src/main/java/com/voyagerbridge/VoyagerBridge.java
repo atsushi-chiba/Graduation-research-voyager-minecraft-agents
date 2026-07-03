@@ -259,6 +259,7 @@ public class VoyagerBridge {
             httpServer.createContext("/fillBuilderResources", this::handleFillBuilderResources);
             httpServer.createContext("/setFieldSeed", this::handleSetFieldSeed);
             httpServer.createContext("/fields", this::handleFields);
+            httpServer.createContext("/debugCitizenAI", this::handleDebugCitizenAI);
             httpServer.createContext("/ping", VoyagerBridge::handlePing);
             httpServer.setExecutor(null);
             httpServer.start();
@@ -1095,6 +1096,84 @@ public class VoyagerBridge {
                 respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
             } else {
                 respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // GET /debugCitizenAI?colonyId=1&citizenId=12
+    //
+    // Read-only dump of the internals CitizenAI.calculateNextState() uses to
+    // decide WORK vs IDLE, for diagnosing citizens that wander instead of
+    // working: a citizen only enters WORK when its job's workerAI is an
+    // AbstractEntityAIBasic, canGoIdle() is false, and it has no leisure time
+    // left (leisureTime is private, so reflection).
+    private void handleDebugCitizenAI(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+            int citizenId = Integer.parseInt(params.get("citizenId"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, server.overworld());
+                    if (colony == null) {
+                        result.complete("ERROR: no colony with id " + colonyId);
+                        return;
+                    }
+                    ICitizenData data = colony.getCitizenManager().getCivilian(citizenId);
+                    if (data == null) {
+                        result.complete("ERROR: no citizen with id " + citizenId);
+                        return;
+                    }
+                    StringBuilder sb = new StringBuilder("{");
+                    int leisure = -1;
+                    try {
+                        java.lang.reflect.Field f =
+                                com.minecolonies.core.colony.CitizenData.class.getDeclaredField("leisureTime");
+                        f.setAccessible(true);
+                        leisure = f.getInt(data);
+                    } catch (Exception e) {
+                        LOGGER.warn("leisureTime reflection failed", e);
+                    }
+                    sb.append("\"leisureTime\":").append(leisure);
+                    sb.append(",\"saturation\":").append(String.format(java.util.Locale.ROOT, "%.1f", data.getSaturation()));
+
+                    com.minecolonies.api.colony.jobs.IJob<?> job = data.getJob();
+                    sb.append(",\"jobClass\":\"").append(job == null ? "" : job.getClass().getSimpleName()).append("\"");
+                    Object workerAI = job == null ? null : job.getWorkerAI();
+                    sb.append(",\"workerAIClass\":\"").append(workerAI == null ? "null" : workerAI.getClass().getSimpleName()).append("\"");
+                    boolean isBasic = workerAI instanceof com.minecolonies.core.entity.ai.workers.AbstractEntityAIBasic;
+                    sb.append(",\"workerAIIsBasic\":").append(isBasic);
+                    boolean canGoIdle = false;
+                    if (isBasic) {
+                        try {
+                            canGoIdle = ((com.minecolonies.core.entity.ai.workers.AbstractEntityAIBasic<?, ?>) workerAI).canGoIdle();
+                        } catch (Exception e) {
+                            sb.append(",\"canGoIdleError\":\"").append(escape(String.valueOf(e))).append("\"");
+                        }
+                    }
+                    sb.append(",\"canGoIdle\":").append(canGoIdle);
+                    sb.append(",\"canAIBeInterrupted\":").append(job != null && job.canAIBeInterrupted());
+                    String entityState = data.getEntity()
+                            .map(e -> e instanceof com.minecolonies.core.entity.citizen.EntityCitizen ec
+                                    ? String.valueOf(ec.getCitizenAI().getState()) : "not-EntityCitizen")
+                            .orElse("no-entity");
+                    sb.append(",\"citizenAIState\":\"").append(escape(entityState)).append("\"");
+                    sb.append("}");
+                    result.complete(sb.toString());
+                } catch (Exception e) {
+                    LOGGER.error("debugCitizenAI failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, outcome);
             }
         } catch (Exception e) {
             respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
