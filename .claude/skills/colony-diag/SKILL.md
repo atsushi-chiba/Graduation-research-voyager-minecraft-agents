@@ -25,8 +25,13 @@ bridge API は `http://localhost:8089`。サーバーコンソールは
 echo 'minecolonies citizens info <colonyId> <citizenId>' > /root/mc-server-forge/cmd_pipe
 ```
 
-1. **空腹** — AI 状態が `CHECK_FOR_FOOD` で止まる。対処: `/giveToCitizen` でパンを 32 個渡す。
-2. **病気** — /status の `sick`/`disease` を見る。supply_bot の treatSickCitizens が自動治療するはずだが、手動なら `cureItems` を全部 `/giveToCitizen`(全治療アイテムが本人のインベントリに揃うと自己治療する。病院がないので放置すると永久に待つ)。
+1. **空腹** — AI 状態が `CHECK_FOR_FOOD` で止まる。対処: `/giveToCitizen` で食べ物を渡す。
+   **パンではなく cooked_beef を渡すこと**: FoodUtils.canEatLevel は住居 lv3+ の市民に
+   「栄養値 ≥ 住居レベル+1」を要求する(パン=5 は lv5 住居の市民には食べられない。
+   cooked_beef=8 は全レベル OK)。supply_bot の給食も cooked_beef(2026-07-04〜)。
+2. **病気** — /status の `sick`/`disease` を見る。supply_bot の treatSickCitizens が自動治療するはずだが、手動なら `cureItems` を全部 `/giveToCitizen`(全治療アイテムが本人のインベントリに揃うと自己治療する。病院は 128,-60,241 に建設済み 2026-07-04)。
+   **配達結果の `gave X/Y` を必ず見る**: X<Y はインベントリ満杯で治療不成立。
+   `/clearCitizenInventory` してから渡し直す(supply_bot は自動でこれをやる 2026-07-04〜)。
 3. **資材待ち** — `/openRequests?x&y&z&citizenId`(建物座標+市民ID必須)と supply_bot.log を確認。
 4. **blueprint ロード** — /debugWorkOrders の blueprintLoaded、console.log の "Error loading blueprint"。builder は blueprint ロード完了まで `LOAD_STRUCTURE` に留まる。
 5. **道具の tier 制限** — 建物/職レベルを超える tier の道具は使えない。低レベル worker には木/石の道具を渡す(iron 以上は NG)。
@@ -60,6 +65,23 @@ echo 'minecolonies citizens info <colonyId> <citizenId>' > /root/mc-server-forge
   (耕す→植える→収穫を日替わりで1段階)→残りの時間は余暇/睡眠」。
 - 日付ベースのスケジューラは他職にもあり得るので、「特定の職だけ1日1回しか
   働かない/全く働かない」ときはまず colonyDay の進行を疑う。
+
+## 病気×飢餓の悪循環(2026-07-04 に 33人中23人が病気になった実例)
+
+メカニズム(CitizenAI.calculateNextState / EntityAISickTask / EntityAIEatTask を逆コンパイルで確認):
+
+- **非guard職は SICK が EATING より優先** — 病気の間は食事状態に入れず満腹度が0に落ちて張り付く。
+  「病人の満腹度が全員0」はこの仕様であって給食の故障ではない。
+- そこに supply_bot が給食を配り続けると**食べられないままインベントリが満杯**になり、
+  治療アイテム配達が `gave 0/1` で弾かれ、**永遠に病気**のまま食堂周辺に密集して感染が広がる。
+  対処: `/clearCitizenInventory` → cureItems 配達(supply_bot は自動化済み。病人への給食もスキップする)。
+- **guard職だけは EATING が SICK より優先** — 空腹の病気guardは食堂で `WAIT_FOR_FOOD` に固まる。
+  座席のない食堂では eatPos が取れず GET_FOOD_YOURSELF への脱出経路も塞がるので、
+  メニュー食品(cooked_beef等)を直接 `/giveToCitizen` すると食べて→病気処理→自己治療、と流れる。
+- 座席問題: Colonial cookery1 blueprint には `sit_in`/`sit_out` タグが無く
+  "Restaurant without sitting position" が毎tickスパムされる。健常市民は
+  「インベントリに可食メニュー品があればその場で食べる」フォールバックで実害なし。
+  病院(128,-60,241, lv1)建設済みなので今後の病人はベッド+healer経路もある。
 
 ## コロニーが「動いて見えるのに何も進まない」とき(最重要の落とし穴)
 

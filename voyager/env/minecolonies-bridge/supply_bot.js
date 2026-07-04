@@ -81,10 +81,15 @@ const curesDelivered = new Map();
 const TICK_MULTIPLIER = 10;
 
 // Hungry citizens walk off to hunt for food (CHECK_FOR_FOOD / SEARCH_RESTAURANT)
-// instead of working. Feed them bread before they get there. Citizens eat from
+// instead of working. Feed them before they get there. Citizens eat from
 // their own inventory once saturation drops, so a small stack lasts a while.
+// Must be cooked_beef, not bread: FoodUtils.canEatLevel demands nutrition >=
+// home building level + 1 for homes lv3+, and bread (5) is inedible for
+// citizens housed in lv5 residences. cooked_beef (8) clears every level and
+// is on the restaurant menu, so it never conflicts with the menu filter.
 const FEED_BELOW_SATURATION = 8;
-const FEED_BREAD_COUNT = 8;
+const FEED_ITEM = "minecraft:cooked_beef";
+const FEED_ITEM_COUNT = 8;
 const FEED_COOLDOWN_MS = (10 * 60 * 1000) / TICK_MULTIPLIER;
 const lastFed = new Map(); // citizenId -> timestamp of last delivery
 
@@ -93,12 +98,18 @@ async function feedHungryCitizens(colony, cycle) {
   for (const citizen of colony.citizens || []) {
     if (typeof citizen.saturation !== "number") continue;
     if (citizen.saturation >= FEED_BELOW_SATURATION) continue;
+    // Sick citizens can't reach the EATING state (CitizenAI checks SICK
+    // first), so bread only piles up until the inventory is full - which
+    // then makes the cure delivery bounce and the citizen stays sick
+    // forever (the 2026-07-04 23-sick-citizens incident). Cure first,
+    // feed after.
+    if (citizen.sick) continue;
     const last = lastFed.get(citizen.id) || 0;
     if (Date.now() - last < FEED_COOLDOWN_MS) continue;
-    await giveToCitizen(colony.id, citizen.id, "minecraft:bread", FEED_BREAD_COUNT);
+    await giveToCitizen(colony.id, citizen.id, FEED_ITEM, FEED_ITEM_COUNT);
     lastFed.set(citizen.id, Date.now());
     console.log(
-      `[supply #${cycle}] fed citizen ${citizen.id} (saturation ${citizen.saturation}): ${FEED_BREAD_COUNT}x bread`
+      `[supply #${cycle}] fed citizen ${citizen.id} (saturation ${citizen.saturation}): ${FEED_ITEM_COUNT}x ${FEED_ITEM}`
     );
     fed++;
     await sleep(RESOLVE_DELAY_MS);
@@ -192,6 +203,18 @@ async function stockRestaurants(colony, cycle) {
 // The same AI self-cures (APPLY_CURE) as soon as every cure item of the
 // disease is in the citizen's own inventory, so delivering the items via
 // /giveToCitizen is a full treatment.
+async function deliverCure(colony, citizen) {
+  let complete = true;
+  for (const cure of citizen.cureItems) {
+    if (!cure.item || cure.count <= 0) continue;
+    const res = await giveToCitizen(colony.id, citizen.id, cure.item, cure.count);
+    const m = /gave (\d+)\/(\d+)/.exec(res.body || "");
+    if (!m || m[1] !== m[2]) complete = false;
+    await sleep(RESOLVE_DELAY_MS);
+  }
+  return complete;
+}
+
 async function treatSickCitizens(colony, cycle) {
   let treated = 0;
   for (const citizen of colony.citizens || []) {
@@ -201,10 +224,23 @@ async function treatSickCitizens(colony, cycle) {
     }
     if (!citizen.cureItems || citizen.cureItems.length === 0) continue;
     if (curesDelivered.get(citizen.id) === citizen.disease) continue;
-    for (const cure of citizen.cureItems) {
-      if (!cure.item || cure.count <= 0) continue;
-      await giveToCitizen(colony.id, citizen.id, cure.item, cure.count);
-      await sleep(RESOLVE_DELAY_MS);
+    // /giveToCitizen answers "gave X/Y" - X < Y means the inventory was
+    // full and the cure is incomplete, which the sick AI treats as no cure
+    // at all. Clear the inventory (cheap, everything is cheat-supplied)
+    // and retry once; only a fully landed delivery counts as treated.
+    let complete = await deliverCure(colony, citizen);
+    if (!complete) {
+      await httpRequest(
+        "POST",
+        `/clearCitizenInventory?colonyId=${colony.id}&citizenId=${citizen.id}`
+      );
+      complete = await deliverCure(colony, citizen);
+    }
+    if (!complete) {
+      console.log(
+        `[supply #${cycle}] cure delivery incomplete for citizen ${citizen.id} (${citizen.disease}), will retry`
+      );
+      continue;
     }
     curesDelivered.set(citizen.id, citizen.disease);
     console.log(
