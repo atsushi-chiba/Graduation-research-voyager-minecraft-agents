@@ -1657,6 +1657,44 @@ public class VoyagerBridge {
         return out;
     }
 
+    private boolean requirementsMet(com.minecolonies.api.research.IGlobalResearch r, IColony colony) {
+        try {
+            for (com.minecolonies.api.research.IResearchRequirement req : r.getResearchRequirements()) {
+                if (!req.isFulfilled(colony)) return false;
+            }
+        } catch (Exception e) {
+            return true;
+        }
+        return true;
+    }
+
+    private void appendRequirementsJson(StringBuilder json,
+            com.minecolonies.api.research.IGlobalResearch r, IColony colony) {
+        json.append(",\"requirements\":[");
+        boolean first = true;
+        try {
+            for (com.minecolonies.api.research.IResearchRequirement req : r.getResearchRequirements()) {
+                if (!first) json.append(",");
+                first = false;
+                json.append("{\"met\":").append(req.isFulfilled(colony));
+                if (req instanceof com.minecolonies.api.research.requirements.BuildingResearchRequirement br) {
+                    json.append(",\"building\":\"").append(escape(br.getBuilding().toString()))
+                        .append("\",\"level\":").append(br.getBuildingLevel());
+                } else {
+                    String desc;
+                    try {
+                        desc = req.getDesc().getString();
+                    } catch (Exception e) {
+                        desc = req.getClass().getSimpleName();
+                    }
+                    json.append(",\"desc\":\"").append(escape(desc)).append("\"");
+                }
+                json.append("}");
+            }
+        } catch (Exception ignored) {}
+        json.append("]");
+    }
+
     private void handleResearch(HttpExchange exchange) throws IOException {
         try {
             java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
@@ -1692,10 +1730,31 @@ public class VoyagerBridge {
                             json.append("{\"id\":\"").append(escape(r.getId().toString()))
                                 .append("\",\"depth\":").append(r.getDepth())
                                 .append(",\"state\":\"").append(local == null ? "NOT_STARTED" : String.valueOf(local.getState()))
-                                .append("\",\"progress\":").append(local == null ? 0 : local.getProgress())
-                                .append("}");
+                                .append("\",\"progress\":").append(local == null ? 0 : local.getProgress());
+                            appendRequirementsJson(json, r, colony);
+                            json.append("}");
                         }
                         json.append("]}");
+                    }
+                    json.append("]");
+                    // Researches whose only blocker is an unmet building requirement:
+                    // exactly the list a mayor can act on ("upgrade X to lvN to unlock").
+                    json.append(",\"blocked\":[");
+                    boolean firstBlocked = true;
+                    if (univ != null) {
+                        for (ResourceLocation branch : gt.getBranches()) {
+                            for (com.minecolonies.api.research.IGlobalResearch r : walkBranch(gt, branch)) {
+                                if (lt.getResearch(r.getBranch(), r.getId()) != null) continue;
+                                boolean canRes;
+                                try { canRes = r.canResearch(univ, lt); } catch (Exception e) { continue; }
+                                if (!canRes || requirementsMet(r, colony)) continue;
+                                if (!firstBlocked) json.append(",");
+                                firstBlocked = false;
+                                json.append("{\"id\":\"").append(escape(r.getId().toString())).append("\"");
+                                appendRequirementsJson(json, r, colony);
+                                json.append("}");
+                            }
+                        }
                     }
                     json.append("]}");
                     result.complete(json.toString());
@@ -1815,6 +1874,11 @@ public class VoyagerBridge {
                             } catch (Exception e) {
                                 continue;
                             }
+                            // vanilla checks building requirements at start time
+                            // (attemptBeginResearch); the direct startResearch call
+                            // skips them, so enforce here - unmet ones surface in
+                            // /research's "blocked" list for the mayor to act on.
+                            if (!requirementsMet(r, colony)) continue;
                             candidates.add(r);
                         }
                     }

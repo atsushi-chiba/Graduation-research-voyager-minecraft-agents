@@ -155,9 +155,34 @@ function housingCapacity(colony) {
   }, 0);
 }
 
+// Map of buildingKey -> {research, level} for researches blocked ONLY by an
+// unmet building requirement (from /research "blocked"). Lets the menu tell
+// the governor "upgrading this also unlocks research X".
+async function getResearchNeeds() {
+  try {
+    const res = await httpRequest("GET", `/research?colonyId=${COLONY_ID}`);
+    if (res.status !== 200) return {};
+    const d = JSON.parse(res.body);
+    const map = {};
+    for (const blk of d.blocked || []) {
+      for (const need of blk.requirements || []) {
+        if (need.met || !need.building) continue;
+        const key = need.building.split(":").pop().replace(/^blockhut/, "");
+        const research = blk.id.split("/").pop();
+        if (!map[key] || need.level < map[key].level) {
+          map[key] = { research, level: need.level };
+        }
+      }
+    }
+    return map;
+  } catch {
+    return {};
+  }
+}
+
 // Enumerate every action that makes sense against the current status.
 // Index 0 is always wait so an out-of-range choice degrades to a no-op.
-function buildCandidates(status) {
+function buildCandidates(status, researchNeeds = {}) {
   const candidates = [{ label: "wait(様子見。建設中で他にやることがない時のみ)", action: { action: "wait" } }];
   const colony = status[0];
   if (colony) {
@@ -190,8 +215,12 @@ function buildCandidates(status) {
       } else if (b.level < 5 && (b.type === "blockhutbuilder" || b.level + 1 <= maxBuilderLevel)) {
         // level 5 is the MineColonies max; requestUpgrade silently no-ops there
         const effect = upgradeEffect(b.type);
+        const key = b.type.replace(/^blockhut/, "");
+        const rn = researchNeeds[key];
+        const unlock = rn && b.level < rn.level
+          ? `(さらに lv${rn.level} で研究「${rn.research}」が解禁される)` : "";
         candidates.push({
-          label: `requestBuild ${b.type} @(${b.x},${b.y},${b.z}) lv${b.level}→lv${b.level + 1}にアップグレード${effect ? "(効果: " + effect + ")" : ""}`,
+          label: `requestBuild ${b.type} @(${b.x},${b.y},${b.z}) lv${b.level}→lv${b.level + 1}にアップグレード${effect ? "(効果: " + effect + ")" : ""}${unlock}`,
           action: { action: "requestBuild", x: b.x, y: b.y, z: b.z },
         });
       }
@@ -203,11 +232,17 @@ function buildCandidates(status) {
       });
     }
   }
-  for (const v of Object.values(BUILDING_REGISTRY)) {
+  const existingTypes = new Set(
+    ((status[0] || {}).buildings || []).map((b) => String(b.type).replace(/^blockhut/, ""))
+  );
+  for (const [regKey, v] of Object.entries(BUILDING_REGISTRY)) {
     if (v.blueprint === null) continue;
     if (v.block === "minecolonies:blockhuttownhall") continue; // manual bootstrap only
+    const rn = researchNeeds[regKey];
+    const unlock = rn && !existingTypes.has(regKey)
+      ? `(建てると研究「${rn.research}」の解禁に近づく)` : "";
     candidates.push({
-      label: `placeNext ${v.block}(${v.job || "-"}: ${(v.role || "").slice(0, 40)}) 新設を配置`,
+      label: `placeNext ${v.block}(${v.job || "-"}: ${(v.role || "").slice(0, 40)}) 新設を配置${unlock}`,
       action: { action: "placeNext", block: v.block },
     });
   }
