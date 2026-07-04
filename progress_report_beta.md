@@ -74,6 +74,17 @@
 - アドバイザー(Fable)+エグゼキューター(Sonnet)体制を試行→トークン節約にならず撤回
 - 夜のモンスター: 対策せず観察方針(シミュレーションの一環)
 
+## 施設検証スイート Phase 1(2026-07-04 稼働開始)
+
+- `verify_suite.js`: /status の全建物を PASS/WARN/FAIL で採点する監査ハーネス
+  (pending=WARN、未稼働/無人の職業建物/病気・飢餓の担当者=FAIL。無人が正常な
+  建物種と「スーパーフラットでminerは死に職」は例外扱い)
+- 初回実行: PASS 31 / WARN 9 / FAIL 12(52棟)。FAIL 12件は全て
+  「councilがハットを置いたが建設発注が無い」建物 → その場で全12件 requestBuild 発行
+- 未設置の建物タイプは26種(baker, blacksmith, sawmill, library, school,
+  barracks系, composter ほか)。Phase 2 = これらを系統的に
+  設置→建設→/assignWorkerで雇用→働くか判定、まで自動化する
+
 ## 進行中 / 次の作業
 
 - **研究パイプライン(2026-07-04 完成・実証済み)**: 「University配置→建設→研究員配属
