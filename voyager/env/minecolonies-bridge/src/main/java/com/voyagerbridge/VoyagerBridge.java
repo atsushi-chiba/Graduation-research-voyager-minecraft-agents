@@ -326,6 +326,7 @@ public class VoyagerBridge {
             httpServer.createContext("/debugWorkOrders", this::handleDebugWorkOrders);
             httpServer.createContext("/setMenu", this::handleSetMenu);
             httpServer.createContext("/upgradeWarehouse", this::handleUpgradeWarehouse);
+            httpServer.createContext("/debugBuildGates", this::handleDebugBuildGates);
             httpServer.createContext("/stockRestaurant", this::handleStockRestaurant);
             httpServer.createContext("/neededResources", this::handleNeededResources);
             httpServer.createContext("/fillBuilderResources", this::handleFillBuilderResources);
@@ -816,6 +817,19 @@ public class VoyagerBridge {
                             }
                         }
                     }
+                    // Self-heal chunk claims. onPlacement()'s claimBuildingChunks
+                    // throws for bridge-placed buildings (calculateCorners runs
+                    // before pack/path are set), so footprint chunks can stay
+                    // unclaimed - and WorkManager.addWorkOrder silently drops any
+                    // order whose blueprint touches an unowned chunk
+                    // (isWorkOrderWithinColony). Re-claim here, where pack/path
+                    // are guaranteed set; claiming owned chunks is a no-op.
+                    try {
+                        int claimRadius = building.getClaimRadius(Math.max(1, building.getBuildingLevel()));
+                        forceLoadAndClaim(colony, level, pos, claimRadius, building.getCorners());
+                    } catch (Exception e) {
+                        LOGGER.warn("re-claim before requestBuild failed for {}: {}", pos, e.toString());
+                    }
                     String pathBeforeUpgrade = building.getBlueprintPath();
                     Player fakePlayer = new FakePlayer(level, AI_PROFILE);
                     building.requestUpgrade(fakePlayer, builderHutPos);
@@ -1213,6 +1227,137 @@ public class VoyagerBridge {
             } else {
                 respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
             }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // ChunkDataHelper.tryClaimBuilding defers the claim of any UNLOADED chunk
+    // to "next chunk load" (queued in the chunk manager) - which for an
+    // unattended colony's frontier chunks is never. Force-load every chunk the
+    // claim will touch first, so the claim takes the loaded path and sets
+    // ownership immediately. The chunks may unload again afterwards; the
+    // capability persists with the chunk data. (Root cause of the sawmill
+    // work order silently vanishing, 2026-07-06.)
+    private void forceLoadAndClaim(IColony colony, ServerLevel level, BlockPos pos, int radius,
+            net.minecraft.util.Tuple<BlockPos, BlockPos> corners) {
+        int anchorCX = pos.getX() >> 4, anchorCZ = pos.getZ() >> 4;
+        java.util.HashSet<Long> chunks = new java.util.HashSet<>();
+        for (int cx = anchorCX - radius; cx <= anchorCX + radius; cx++) {
+            for (int cz = anchorCZ - radius; cz <= anchorCZ + radius; cz++) {
+                chunks.add(((long) cx << 32) | (cz & 0xffffffffL));
+            }
+        }
+        if (corners != null) {
+            int minCX = Math.min(corners.getA().getX(), corners.getB().getX()) >> 4;
+            int maxCX = Math.max(corners.getA().getX(), corners.getB().getX()) >> 4;
+            int minCZ = Math.min(corners.getA().getZ(), corners.getB().getZ()) >> 4;
+            int maxCZ = Math.max(corners.getA().getZ(), corners.getB().getZ()) >> 4;
+            for (int cx = minCX; cx <= maxCX; cx++) {
+                for (int cz = minCZ; cz <= maxCZ; cz++) {
+                    chunks.add(((long) cx << 32) | (cz & 0xffffffffL));
+                }
+            }
+        }
+        // Don't go through ChunkDataHelper.tryClaimBuilding: its
+        // WorldUtil.isChunkLoaded gate reads the VISIBLE chunk-holder map, which
+        // doesn't include a chunk synchronously loaded this tick - the claim
+        // would be re-queued to "next chunk load" (i.e. never, out here). We
+        // hold the loaded LevelChunk already, so write the claim into its
+        // capability directly, exactly like tryClaimBuilding's loaded path.
+        for (long key : chunks) {
+            net.minecraft.world.level.chunk.LevelChunk chunk =
+                level.getChunk((int) (key >> 32), (int) key); // synchronous force load
+            com.minecolonies.api.colony.IColonyTagCapability cap =
+                chunk.getCapability(IColony.CLOSE_COLONY_CAP, null).resolve().orElse(null);
+            if (cap != null) {
+                cap.addBuildingClaim(colony.getID(), pos, chunk); // sets owner if unowned; idempotent otherwise
+            }
+        }
+    }
+
+    // GET /debugBuildGates?x=&y=&z=
+    //
+    // Dumps every gate that can silently swallow a requestBuild: the research
+    // effect check in requestUpgrade, the duplicate-order check, canBeResolved,
+    // and - the only gate with no log line at all - WorkManager's
+    // isWorkOrderWithinColony (every chunk touched by the blueprint footprint
+    // must be owned by the colony). Written for the 2026-07-06 sawmill order
+    // that vanished without a trace.
+    private void handleDebugBuildGates(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IColony colony = findColonyAt(level, pos);
+                    if (colony == null) { result.complete("{\"error\":\"no colony\"}"); return; }
+                    IBuilding building = colony.getServerBuildingManager().getBuilding(pos);
+                    if (building == null) { result.complete("{\"error\":\"no building\"}"); return; }
+
+                    StringBuilder json = new StringBuilder("{");
+                    json.append("\"pack\":\"").append(escape(String.valueOf(building.getStructurePack()))).append('"');
+                    json.append(",\"path\":\"").append(escape(String.valueOf(building.getBlueprintPath()))).append('"');
+                    json.append(",\"level\":").append(building.getBuildingLevel());
+
+                    ResourceLocation hutResearch = colony.getResearchManager()
+                        .getResearchEffectIdFrom(level.getBlockState(pos).getBlock());
+                    boolean hasEffect = com.minecolonies.api.MinecoloniesAPIProxy.getInstance()
+                        .getGlobalResearchTree().hasResearchEffect(hutResearch);
+                    double strength = colony.getResearchManager().getResearchEffects().getEffectStrength(hutResearch);
+                    json.append(",\"researchEffect\":\"").append(escape(String.valueOf(hutResearch)))
+                        .append("\",\"hasEffect\":").append(hasEffect)
+                        .append(",\"strength\":").append(strength);
+
+                    int dup = 0;
+                    for (com.minecolonies.core.colony.workorders.WorkOrderBuilding o
+                            : colony.getWorkManager().getWorkOrdersOfType(
+                                com.minecolonies.core.colony.workorders.WorkOrderBuilding.class)) {
+                        if (o.getLocation().equals(building.getID())) dup++;
+                    }
+                    json.append(",\"duplicateOrders\":").append(dup);
+
+                    boolean resolvable = colony.getServerBuildingManager().getBuildings().values().stream()
+                        .anyMatch(b -> b instanceof com.minecolonies.core.colony.buildings.workerbuildings.BuildingBuilder
+                            && !b.getAllAssignedCitizen().isEmpty() && b.getBuildingLevel() >= 1);
+                    json.append(",\"canBeResolved\":").append(resolvable);
+
+                    net.minecraft.util.Tuple<BlockPos, BlockPos> corners = building.getCorners();
+                    json.append(",\"corners\":\"").append(corners.getA()).append(" / ").append(corners.getB()).append('"');
+                    json.append(",\"chunks\":[");
+                    int minX = Math.min(corners.getA().getX(), corners.getB().getX()) + 1;
+                    int maxX = Math.max(corners.getA().getX(), corners.getB().getX());
+                    int minZ = Math.min(corners.getA().getZ(), corners.getB().getZ()) + 1;
+                    int maxZ = Math.max(corners.getA().getZ(), corners.getB().getZ());
+                    boolean first = true;
+                    java.util.HashSet<Long> seen = new java.util.HashSet<>();
+                    for (int cx = minX; cx < maxX; cx += 16) {
+                        for (int cz = minZ; cz < maxZ; cz += 16) {
+                            int chunkX = cx >> 4, chunkZ = cz >> 4;
+                            long key = ((long) chunkX << 32) | (chunkZ & 0xffffffffL);
+                            if (!seen.add(key)) continue;
+                            int owner = com.minecolonies.api.util.ColonyUtils.getOwningColony(
+                                level.getChunk(chunkX, chunkZ));
+                            if (!first) json.append(',');
+                            first = false;
+                            json.append("{\"chunk\":\"").append(chunkX).append(',').append(chunkZ)
+                                .append("\",\"owner\":").append(owner).append('}');
+                        }
+                    }
+                    json.append("]}");
+                    result.complete(json.toString());
+                } catch (Exception e) {
+                    LOGGER.error("debugBuildGates failed", e);
+                    result.complete("{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+                }
+            });
+            respond(exchange, 200, result.get());
         } catch (Exception e) {
             respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
         }
@@ -3230,6 +3375,15 @@ public class VoyagerBridge {
                         try { bld.setStructurePack(pack.getName()); } catch (NullPointerException ignored) {}
                         try { bld.setBlueprintPath(path); } catch (NullPointerException ignored) {}
                         try { bld.markDirty(); } catch (Exception ignored) {}
+                        // onPlacement()'s own claimBuildingChunks throws before
+                        // pack/path exist, leaving footprint chunks unclaimed
+                        // (WorkManager then silently drops build orders that touch
+                        // them). Redo the claim now that the path is set.
+                        try {
+                            forceLoadAndClaim(bldColony, level, pos, bld.getClaimRadius(1), bld.getCorners());
+                        } catch (Exception e) {
+                            LOGGER.warn("post-place chunk claim failed for {}: {}", pos, e.toString());
+                        }
                     }
                 }
                 // Also set directly on the tile entity (these methods only write
