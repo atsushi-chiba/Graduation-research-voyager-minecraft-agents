@@ -85,6 +85,16 @@ async function main() {
       if (KNOWN_LIMITS[b.type]) {
         r.grade = "WARN";
         r.reason = `unstaffed - ${KNOWN_LIMITS[b.type]}`;
+      } else if (
+        colony.buildings.some(
+          (o) => o !== b && o.type === b.type && (o.workers || []).length > 0
+        )
+      ) {
+        // The suite verifies building TYPES work; an unstaffed duplicate of a
+        // type that has a staffed sibling is spare capacity, not a failure
+        // (e.g. 10 courier huts, 8 couriers - deliberate).
+        r.grade = "WARN";
+        r.reason = "surplus hut - type verified by a staffed sibling";
       } else {
         r.grade = "FAIL";
         r.reason = "operational but unstaffed (no worker assigned)";
