@@ -102,6 +102,17 @@
   stonemason, blacksmith, composter の7種を設置+建設発注、rebalanceで5 builderに分散
 - 市民 33→56人に急増(食事修正の効果で住居容量まで回復中)
 
+## 2026-07-06 午後: 無人運転体制 + 倉庫増強
+
+- **倉庫満杯(ユーザー指摘)** → GUI限定の「エメラルドブロックでラック増強」機能を
+  bridge化(`/upgradeWarehouse`、本来1回=エメラルドブロック1個・最大3回・建物レベル別枠)。
+  実行して 0→3(最大)、125ラックの容量を増強
+- **無人運転監視**(colony_watch.sh、常駐Monitor): bridge死活、supply_bot/council の
+  死活+自動再起動(councilはMAX_CYCLES=300で自然終了するため)、病気>5・飢餓>10 の
+  しきい値警報、keepColoniesActive失敗検知、1時間ごとに verify_suite 監査ハートビート
+- 初回ハートビート: citizens=56 sick=0 starving=1 | PASS 57 / WARN 2 / FAIL 9(68棟)
+  (FAILは建設待ちの新設ハット中心。builderが順次消化中)
+
 ## 進行中 / 次の作業
 
 - **研究パイプライン(2026-07-04 完成・実証済み)**: 「University配置→建設→研究員配属
