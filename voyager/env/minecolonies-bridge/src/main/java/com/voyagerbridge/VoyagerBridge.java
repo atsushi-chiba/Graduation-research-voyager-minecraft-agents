@@ -2808,6 +2808,12 @@ public class VoyagerBridge {
         // once at BlockPos.ZERO gives reusable offsets. rotation=0/mirror=false
         // matches how placeOnServerThread places buildings.
         int offMinX = 0, offMinZ = 0, offMaxX = bw - 1, offMaxZ = bd - 1;
+        // Anchor height above the blueprint's "groundlevel"-tagged block. Most
+        // huts tag ground at anchor-relative y=-1 (anchor sits on the terrain),
+        // but multi-story blueprints put the anchor higher: colonial
+        // university1 tags ground at y=-7, so anchoring it at terrain height
+        // sank the whole campus 6 blocks into a bedrock pit (2026-07-04).
+        int groundAnchorOffset = 1;
         String bpPath = BLUEPRINT_PATHS.get(typeName);
         StructurePackMeta pinnedPack = getPinnedPack();
         if (bpPath != null && pinnedPack != null) {
@@ -2822,6 +2828,9 @@ public class VoyagerBridge {
                     offMinZ = c.getA().getZ();
                     offMaxX = c.getB().getX();
                     offMaxZ = c.getB().getZ();
+                    groundAnchorOffset =
+                        com.ldtteam.structurize.blueprints.v1.BlueprintTagUtils
+                            .getGroundAnchorOffset(blueprint, 1);
                 }
             } catch (Exception ignored) {}
         }
@@ -2842,12 +2851,17 @@ public class VoyagerBridge {
         }
 
         final int GAP = 5;
-        // 100 (was 60): with the townhall at lv5 the claimed territory reaches far
-        // beyond the original core, and the 60-radius disc filled up completely -
-        // big buildings (university etc.) found no gap. isCoordInColony still
-        // filters candidates to actual claimed chunks.
-        final int MAX_DIST = 100;
-        final int Y = center.getY();
+        // 200 (was 100, was 60): the disc keeps filling up as the colony grows -
+        // at 60 buildings the 100-radius disc had no gap left for a blacksmith.
+        // isCoordInColony still filters candidates to actual claimed chunks, and
+        // claims are capped by the maxColonySize config (20 chunks = 320 blocks),
+        // so the scan radius just needs to stay ahead of the claim frontier.
+        final int MAX_DIST = 200;
+        // center.getY() is the townhall anchor = one above the terrain's top
+        // solid block, i.e. where a groundAnchorOffset==1 anchor belongs. Taller
+        // offsets raise the anchor so the blueprint's ground layer stays flush
+        // with the terrain instead of being excavated in.
+        final int Y = center.getY() - 1 + groundAnchorOffset;
 
         java.util.List<int[]> offsets = new java.util.ArrayList<>(15000);
         for (int dx = -MAX_DIST; dx <= MAX_DIST; dx++) {
