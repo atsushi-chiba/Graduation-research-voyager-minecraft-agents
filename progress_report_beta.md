@@ -113,6 +113,23 @@
 - 初回ハートビート: citizens=56 sick=0 starving=1 | PASS 57 / WARN 2 / FAIL 9(68棟)
   (FAILは建設待ちの新設ハット中心。builderが順次消化中)
 
+## 2026-07-06 深夜: 「消えるwork order」の根治(辺境チャンクのclaim問題)
+
+- 症状: sawmill(コロニー西端)の requestBuild が5回連続で音もなく消える
+- 診断: `/debugBuildGates` を新設して全ゲートをダンプ → **フットプリントが触れる
+  chunk(5,12) が owner=0**。WorkManager.isWorkOrderWithinColony が「全チャンク所有」を
+  要求し、違反時はプレイヤー向けメッセージのみで捨てる(ログなし)
+- 根本原因は3段重ね:
+  1. bridge設置では onPlacement の claimBuildingChunks が例外で不発(pack/path未設定時に
+     calculateCorners が転倒)
+  2. 後追いの ChunkDataHelper 再claimも不発: アンロードチャンクは「次回ロード時適用」に
+     先送り(無人の辺境は誰も踏まない=永遠に来ない)
+  3. 同期 getChunk() 直後でも WorldUtil.isChunkLoaded は visible holder map 参照で false
+- 修正: 設置時と requestBuild 時に対象チャンクを強制ロードし、CLOSE_COLONY_CAP に
+  addBuildingClaim を直接書き込む(owner未設定なら所有権も付く)。sawmillで実証、
+  work order が CLEAR ステージまで進行
+- 監視ループの自己修復も実戦投入: council(MAX_CYCLES自然終了)を3回自動再起動
+
 ## 進行中 / 次の作業
 
 - **研究パイプライン(2026-07-04 完成・実証済み)**: 「University配置→建設→研究員配属

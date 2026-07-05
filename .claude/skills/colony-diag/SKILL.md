@@ -66,6 +66,20 @@ echo 'minecolonies citizens info <colonyId> <citizenId>' > /root/mc-server-forge
 - 日付ベースのスケジューラは他職にもあり得るので、「特定の職だけ1日1回しか
   働かない/全く働かない」ときはまず colonyDay の進行を疑う。
 
+## requestBuild したのに work order が現れない/消える(2026-07-06 実例: 辺境のsawmill)
+
+- まず `curl -s 'http://localhost:8089/debugBuildGates?x&y&z'` — 黙って発注を握り潰す
+  全ゲート(research effect / 重複order / canBeResolved / **フットプリント各チャンクの
+  owner**)を一括ダンプする。
+- 最頻原因: **blueprintフットプリントが触れるチャンクに owner≠colonyId が混ざっている**。
+  WorkManager.addWorkOrder の isWorkOrderWithinColony がプレイヤー向けメッセージだけ出して
+  return する(サーバーログには何も出ない)。辺境の建物で起きる。
+- bridge は設置時と requestBuild 時にチャンクを強制ロードして CLOSE_COLONY_CAP へ直接
+  claim を書く自己修復を実装済み(2026-07-06)。それでも owner=0 が残る場合は
+  debugBuildGates で特定して requestBuild を再実行すれば claim ごとやり直される。
+- 豆知識: MineColonies 純正の claim 経路は「アンロードチャンク=次回ロード時に適用」に
+  先送りするが、無人コロニーの辺境チャンクは誰も踏まないので永遠に適用されない。
+
 ## 病気×飢餓の悪循環(2026-07-04 に 33人中23人が病気になった実例)
 
 メカニズム(CitizenAI.calculateNextState / EntityAISickTask / EntityAIEatTask を逆コンパイルで確認):
