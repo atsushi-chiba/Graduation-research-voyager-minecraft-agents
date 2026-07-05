@@ -209,7 +209,16 @@ function buildCandidates(status, researchNeeds = {}) {
       0,
       ...buildings.filter((b) => b.type === "blockhutbuilder" && b.operational).map((b) => b.level)
     );
+    // Backlog governor. The menu offered construction every cycle regardless
+    // of the queue, and gemma happily picked one each time - 130 queued work
+    // orders / 38 alchemists / 65 houses by the time it was caught
+    // (2026-07-06). While the queue is deeper than the builders can chew,
+    // construction options disappear from the menu entirely.
+    const pendingCount = buildings.filter((b) => b.pending).length;
+    const builderCount = Math.max(1, buildings.filter((b) => b.type === "blockhutbuilder" && b.operational).length);
+    const backlogFull = pendingCount >= builderCount * 3;
     for (const b of buildings) {
+      if (backlogFull) break;
       if (b.pending || !b.inTerritory) continue;
       if (!b.operational) {
         candidates.push({
@@ -232,26 +241,33 @@ function buildCandidates(status, researchNeeds = {}) {
         });
       }
     }
-    if (pop > housing) {
+    if (pop > housing && !backlogFull) {
       candidates.push({
         label: `placeNext minecolonies:blockhutcitizen(住居の新設。市民${pop}人>容量${housing}人なので最優先級)`,
         action: { action: "placeNext", block: "minecolonies:blockhutcitizen" },
       });
     }
-  }
-  const existingTypes = new Set(
-    ((status[0] || {}).buildings || []).map((b) => String(b.type).replace(/^blockhut/, ""))
-  );
-  for (const [regKey, v] of Object.entries(BUILDING_REGISTRY)) {
-    if (v.blueprint === null) continue;
-    if (v.block === "minecolonies:blockhuttownhall") continue; // manual bootstrap only
-    const rn = researchNeeds[regKey];
-    const unlock = rn && !existingTypes.has(regKey)
-      ? `(建てると研究「${rn.research}」の解禁に近づく)` : "";
-    candidates.push({
-      label: `placeNext ${v.block}(${v.job || "-"}: ${(v.role || "").slice(0, 40)}) 新設を配置${unlock}`,
-      action: { action: "placeNext", block: v.block },
-    });
+    // New building types: only ones the colony doesn't have yet. Offering
+    // every type every cycle produced 38 alchemists - the mayor treats any
+    // visible option as worth picking, so duplicates must simply not appear.
+    // (Deliberate duplicates - couriers, builders - are placed via the bridge
+    // by the operator, not the mayor.)
+    if (!backlogFull) {
+      const existingTypes = new Set(
+        buildings.map((b) => String(b.type).replace(/^blockhut/, ""))
+      );
+      for (const [regKey, v] of Object.entries(BUILDING_REGISTRY)) {
+        if (v.blueprint === null) continue;
+        if (v.block === "minecolonies:blockhuttownhall") continue; // manual bootstrap only
+        if (existingTypes.has(regKey)) continue;
+        const rn = researchNeeds[regKey];
+        const unlock = rn ? `(建てると研究「${rn.research}」の解禁に近づく)` : "";
+        candidates.push({
+          label: `placeNext ${v.block}(${v.job || "-"}: ${(v.role || "").slice(0, 40)}) 新設を配置${unlock}`,
+          action: { action: "placeNext", block: v.block },
+        });
+      }
+    }
   }
   return candidates;
 }
