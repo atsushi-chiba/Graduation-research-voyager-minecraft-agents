@@ -83,13 +83,25 @@ const TICK_MULTIPLIER = 10;
 // Hungry citizens walk off to hunt for food (CHECK_FOR_FOOD / SEARCH_RESTAURANT)
 // instead of working. Feed them before they get there. Citizens eat from
 // their own inventory once saturation drops, so a small stack lasts a while.
-// Must be cooked_beef, not bread: FoodUtils.canEatLevel demands nutrition >=
-// home building level + 1 for homes lv3+, and bread (5) is inedible for
-// citizens housed in lv5 residences. cooked_beef (8) clears every level and
-// is on the restaurant menu, so it never conflicts with the menu filter.
+// Two constraints learned the hard way:
+// - canEatLevel: nutrition >= home level + 1 for lv3+ homes (bread(5) is
+//   inedible in lv5 residences) - every item here is nutrition >= 7.
+// - Food history: once a citizen's history is full, getBestFoodForCitizen
+//   REFUSES all inventory food if diversity (distinct foods) or quality
+//   (count of IMinecoloniesFoodItem meals) is below the home-level
+//   requirement, and sends them trekking to the restaurant instead - fatal
+//   for far-away workplaces at 10x where night interrupts the trip
+//   (citizens 16/26 starvation, 2026-07-06). Rotating MineColonies dinners
+//   (tier-3 ItemFood, no saturation nerf) keeps both stats satisfied.
 const FEED_BELOW_SATURATION = 8;
-const FEED_ITEM = "minecraft:cooked_beef";
+const FEED_ITEMS = [
+  "minecolonies:steak_dinner", // nutrition 9, tier 3
+  "minecolonies:fish_dinner", // nutrition 9, tier 3
+  "minecolonies:cheese_pizza", // nutrition 7, tier 2
+  "minecraft:cooked_beef", // nutrition 8, vanilla for variety
+];
 const FEED_ITEM_COUNT = 8;
+const feedRotation = new Map(); // citizenId -> next index into FEED_ITEMS
 const FEED_COOLDOWN_MS = (10 * 60 * 1000) / TICK_MULTIPLIER;
 const lastFed = new Map(); // citizenId -> timestamp of last delivery
 
@@ -106,10 +118,13 @@ async function feedHungryCitizens(colony, cycle) {
     if (citizen.sick) continue;
     const last = lastFed.get(citizen.id) || 0;
     if (Date.now() - last < FEED_COOLDOWN_MS) continue;
-    await giveToCitizen(colony.id, citizen.id, FEED_ITEM, FEED_ITEM_COUNT);
+    const idx = feedRotation.get(citizen.id) || 0;
+    const item = FEED_ITEMS[idx % FEED_ITEMS.length];
+    feedRotation.set(citizen.id, idx + 1);
+    await giveToCitizen(colony.id, citizen.id, item, FEED_ITEM_COUNT);
     lastFed.set(citizen.id, Date.now());
     console.log(
-      `[supply #${cycle}] fed citizen ${citizen.id} (saturation ${citizen.saturation}): ${FEED_ITEM_COUNT}x ${FEED_ITEM}`
+      `[supply #${cycle}] fed citizen ${citizen.id} (saturation ${citizen.saturation}): ${FEED_ITEM_COUNT}x ${item}`
     );
     fed++;
     await sleep(RESOLVE_DELAY_MS);
