@@ -26,9 +26,16 @@ echo 'minecolonies citizens info <colonyId> <citizenId>' > /root/mc-server-forge
 ```
 
 1. **空腹** — AI 状態が `CHECK_FOR_FOOD` で止まる。対処: `/giveToCitizen` で食べ物を渡す。
-   **パンではなく cooked_beef を渡すこと**: FoodUtils.canEatLevel は住居 lv3+ の市民に
-   「栄養値 ≥ 住居レベル+1」を要求する(パン=5 は lv5 住居の市民には食べられない。
-   cooked_beef=8 は全レベル OK)。supply_bot の給食も cooked_beef(2026-07-04〜)。
+   食品選定の3つのルール(全部 FoodUtils、2026-07-06 全容判明):
+   a. **canEatLevel**: 住居 lv3+ は「栄養値 ≥ 住居lv+1」(パン=5 は lv5 住居で食べられない)
+   b. **diversity**: 食歴の食品種類が「住居lv より多い」必要(lv5 → 6種以上)。不足すると
+      インベントリ食品を全拒否して食堂へ行く(遠距離職場×10倍速の夜割り込みで餓死コース)
+   c. **quality**: 食歴中の MineColonies 製料理(IMinecoloniesFoodItem)数 > 住居lv-2 が必要
+   → 対処は「**未食の MineColonies tier3 料理を渡す**」(未食の minecolonies 食品は
+   無条件で即食べる判定 = デッドロック即解消)。supply_bot は tier3 栄養9 の8種
+   (steak_dinner, fish_dinner, schnitzel, ramen, sushi_roll, tacos, borscht, hand_pie)
+   を市民ごとにローテーション配布(2026-07-06〜)。「配っても食べずに sat 0」を見たら
+   まずこの食歴ルールを疑い、supply_bot.log で同一食品の連続配布を確認する。
 2. **病気** — /status の `sick`/`disease` を見る。supply_bot の treatSickCitizens が自動治療するはずだが、手動なら `cureItems` を全部 `/giveToCitizen`(全治療アイテムが本人のインベントリに揃うと自己治療する。病院は 128,-60,241 に建設済み 2026-07-04)。
    **配達結果の `gave X/Y` を必ず見る**: X<Y はインベントリ満杯で治療不成立。
    `/clearCitizenInventory` してから渡し直す(supply_bot は自動でこれをやる 2026-07-04〜)。
