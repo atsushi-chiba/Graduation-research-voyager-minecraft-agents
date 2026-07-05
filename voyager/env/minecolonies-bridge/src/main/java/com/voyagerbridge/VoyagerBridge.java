@@ -583,6 +583,10 @@ public class VoyagerBridge {
                           .append("\"z\":").append(bp.getZ()).append(",")
                           .append("\"type\":\"").append(escape(bldType)).append("\",")
                           .append("\"level\":").append(bld.getBuildingLevel()).append(",")
+                          // Colonial's tavern tops out at 3, postbox at 1, etc. -
+                          // council needs this to stop proposing impossible upgrades
+                          // (requestUpgrade silently no-ops past max).
+                          .append("\"maxLevel\":").append(bld.getMaxBuildingLevel()).append(",")
                           .append("\"pending\":").append(bld.isPendingConstruction()).append(",")
                           .append("\"operational\":").append(operational).append(",")
                           .append("\"inTerritory\":").append(inTerritory).append(",")

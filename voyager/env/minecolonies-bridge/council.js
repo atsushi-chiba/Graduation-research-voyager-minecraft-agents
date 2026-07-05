@@ -53,7 +53,11 @@ const BRIDGE_HOST = "localhost";
 const BRIDGE_PORT = 8089;
 const CMD_PIPE = "/root/mc-server-forge/cmd_pipe";
 const COLONY_ID = 1;
-const MAX_CYCLES = 300;
+// Infinity = resident daemon. The 300-cycle cap predates the colony_watch
+// supervisor; with the cap, council exited every ~75min and the watch's
+// auto-restart fired a notification each time. Now a council death is an
+// actual anomaly worth reporting, not scheduled churn.
+const MAX_CYCLES = Infinity;
 const TURN_DELAY_MS = 2000;
 // With the local ollama backend there is no per-token cost, so the old
 // economy mode (60s cycles, citizen voice 1-in-3) is relaxed: the cycle pace
@@ -212,7 +216,10 @@ function buildCandidates(status, researchNeeds = {}) {
           label: `requestBuild ${b.type} @(${b.x},${b.y},${b.z}) 未着工→着工させる(重要)`,
           action: { action: "requestBuild", x: b.x, y: b.y, z: b.z },
         });
-      } else if (b.level < 5 && (b.type === "blockhutbuilder" || b.level + 1 <= maxBuilderLevel)) {
+      } else if (b.level < (b.maxLevel ?? 5) && (b.type === "blockhutbuilder" || b.level + 1 <= maxBuilderLevel)) {
+        // maxLevel comes from /status (building.getMaxBuildingLevel()) - e.g.
+        // Colonial tavern caps at 3, postbox at 1; offering those upgrades
+        // wasted mayor turns on silent no-ops.
         // level 5 is the MineColonies max; requestUpgrade silently no-ops there
         const effect = upgradeEffect(b.type);
         const key = b.type.replace(/^blockhut/, "");
