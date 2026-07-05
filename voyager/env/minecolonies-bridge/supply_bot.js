@@ -94,13 +94,26 @@ const TICK_MULTIPLIER = 10;
 //   (citizens 16/26 starvation, 2026-07-06). Rotating MineColonies dinners
 //   (tier-3 ItemFood, no saturation nerf) keeps both stats satisfied.
 const FEED_BELOW_SATURATION = 8;
+// All tier-3 nutrition-9 ItemFood. Depth matters: the diversity requirement
+// is homeLevel (lv5 home -> MORE than 5 distinct foods in history), so a
+// 4-item rotation deadlocked once every item had been eaten recently
+// (citizen 16, 2026-07-06 second starvation). 8 distinct tier-3 meals keep
+// diversity above every home level's bar, and a never-eaten minecolonies
+// food is always accepted immediately, which breaks existing deadlocks.
 const FEED_ITEMS = [
-  "minecolonies:steak_dinner", // nutrition 9, tier 3
-  "minecolonies:fish_dinner", // nutrition 9, tier 3
-  "minecolonies:cheese_pizza", // nutrition 7, tier 2
-  "minecraft:cooked_beef", // nutrition 8, vanilla for variety
+  "minecolonies:steak_dinner",
+  "minecolonies:fish_dinner",
+  "minecolonies:schnitzel",
+  "minecolonies:ramen",
+  "minecolonies:sushi_roll",
+  "minecolonies:tacos",
+  "minecolonies:borscht",
+  "minecolonies:hand_pie",
 ];
-const FEED_ITEM_COUNT = 8;
+// Tier-3 meals restore ~7.5 saturation each (no vanilla nerf); 4 is already
+// 30 saturation vs the 20 cap. Keeping the stack small stops uneaten food
+// from packing inventories (which is what blocked cure deliveries on 07-04).
+const FEED_ITEM_COUNT = 4;
 const feedRotation = new Map(); // citizenId -> next index into FEED_ITEMS
 const FEED_COOLDOWN_MS = (10 * 60 * 1000) / TICK_MULTIPLIER;
 const lastFed = new Map(); // citizenId -> timestamp of last delivery
