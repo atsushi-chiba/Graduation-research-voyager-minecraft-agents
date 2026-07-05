@@ -85,6 +85,23 @@
   barracks系, composter ほか)。Phase 2 = これらを系統的に
   設置→建設→/assignWorkerで雇用→働くか判定、まで自動化する
 
+## 2026-07-06: 大学「穴の底」問題の根治 + Phase 2 開始
+
+- **ユーザー指摘**: 大学が地表より低い岩盤ギリギリの穴に建ち、落ちたら出られない
+- **原因**: placeNext が全建物のアンカーをタウンホールと同じ高さ(地表)に置いていたが、
+  blueprintのアンカー高さは設計ごとに違う(groundlevelタグ: 通常ハット=-1、library1=-3、
+  university1=-7)。大学は6ブロック沈み、地上階が岩盤(-64)に落ちて周囲が掘削された
+- **修正**: `Y = center.getY() - 1 + BlueprintTagUtils.getGroundAnchorOffset(blueprint, 1)`。
+  実地検証: library=-58 / school=-60 / bakery=-61 と blueprint ごとに正しく補正
+- 既存大学は移設せず**脱出階段**(x=139, z=260-262 の土階段)で転落対策のみ
+- 探索半径 100→200(60棟で円盤が満杯になり blacksmith が置けなくなったため)
+- **ついでに判明**: コロニー領土はガードタワー専用ではなく**全建物が周囲1〜2チャンクをclaim**
+  (lv4-5は半径2、ガードタワーはlv5で半径5)。創設時に半径4チャンク。上限はconfig
+  maxColonySize=20チャンク
+- **Phase 2 第1陣**: library(-58,大学lv5研究の要件), school, baker, sawmill,
+  stonemason, blacksmith, composter の7種を設置+建設発注、rebalanceで5 builderに分散
+- 市民 33→56人に急増(食事修正の効果で住居容量まで回復中)
+
 ## 進行中 / 次の作業
 
 - **研究パイプライン(2026-07-04 完成・実証済み)**: 「University配置→建設→研究員配属
