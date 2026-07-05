@@ -325,6 +325,7 @@ public class VoyagerBridge {
             httpServer.createContext("/rebalanceWorkOrders", this::handleRebalanceWorkOrders);
             httpServer.createContext("/debugWorkOrders", this::handleDebugWorkOrders);
             httpServer.createContext("/setMenu", this::handleSetMenu);
+            httpServer.createContext("/upgradeWarehouse", this::handleUpgradeWarehouse);
             httpServer.createContext("/stockRestaurant", this::handleStockRestaurant);
             httpServer.createContext("/neededResources", this::handleNeededResources);
             httpServer.createContext("/fillBuilderResources", this::handleFillBuilderResources);
@@ -1203,6 +1204,66 @@ public class VoyagerBridge {
                     result.complete(sb.toString());
                 } catch (Exception e) {
                     LOGGER.error("setMenu failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // POST /upgradeWarehouse?x=&y=&z=[&times=3]
+    //
+    // The warehouse GUI's rack-capacity upgrade (normally 1 emerald block per
+    // step, max 3 steps, independent of the hut's building level). Mirrors
+    // UpgradeWarehouseMessage.onExecute minus the item cost - consistent with
+    // the colony's cheat-supply policy. upgradeContainers() itself no-ops once
+    // WarehouseModule.getStorageUpgrade() reaches 3, so over-calling is safe;
+    // the response reports the resulting upgrade level.
+    private void handleUpgradeWarehouse(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+            int times = Integer.parseInt(params.getOrDefault("times", "1"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IColony colony = findColonyAt(level, pos);
+                    if (colony == null) {
+                        result.complete("ERROR: no colony at " + x + "," + y + "," + z);
+                        return;
+                    }
+                    IBuilding building = colony.getServerBuildingManager().getBuilding(pos);
+                    if (!(building instanceof com.minecolonies.core.colony.buildings.workerbuildings.BuildingWareHouse wh)) {
+                        result.complete("ERROR: building at " + x + "," + y + "," + z + " is not a warehouse");
+                        return;
+                    }
+                    com.minecolonies.core.colony.buildings.modules.WarehouseModule module =
+                            wh.getFirstModuleOccurance(
+                                com.minecolonies.core.colony.buildings.modules.WarehouseModule.class);
+                    int before = module.getStorageUpgrade();
+                    for (int i = 0; i < times; i++) {
+                        wh.upgradeContainers(level);
+                    }
+                    result.complete("storageUpgrade " + before + " -> " + module.getStorageUpgrade()
+                            + " (max 3, racks " + wh.getContainers().size() + ")");
+                } catch (Exception e) {
+                    LOGGER.error("upgradeWarehouse failed", e);
                     result.complete("ERROR: " + e);
                 }
             });
