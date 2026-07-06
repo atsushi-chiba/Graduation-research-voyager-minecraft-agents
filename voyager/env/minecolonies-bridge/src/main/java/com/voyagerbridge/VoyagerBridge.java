@@ -103,6 +103,7 @@ public class VoyagerBridge {
     public void onServerTick(TickEvent.ServerTickEvent event) {
         if (event.phase != TickEvent.Phase.START) return;
         keepColoniesActive();
+        keepBuildSitesLoaded();
         int mult = tickMultiplier;
         if (mult <= 1 || server == null) return;
         java.lang.reflect.Field f = resolveNextTickTimeField(server);
@@ -143,6 +144,62 @@ public class VoyagerBridge {
     private static volatile java.lang.reflect.Field smStateField = null;
     private static volatile java.lang.reflect.Field smTransitionMapField = null;
     private static volatile java.lang.reflect.Field smCurrentTransitionsField = null;
+
+    // Builder AIs silently wait when the build site's chunks aren't loaded -
+    // with no players online, frontier sites (claim edge, ~90-130 blocks out)
+    // never load and the bound hut's queue freezes (the second 21-order stall,
+    // 2026-07-06; manually forceloading the area unstuck it within seconds).
+    // Keep the chunks of every hut-bound work order force-loaded, and release
+    // chunks whose orders completed.
+    private int keepLoadedCounter = 0;
+    private final java.util.HashSet<Long> forcedBuildChunks = new java.util.HashSet<>();
+    private static java.lang.reflect.Field boundWorkOrderIdField = null;
+
+    private void keepBuildSitesLoaded() {
+        if (server == null || ++keepLoadedCounter < 200) return; // ~1s at 10x
+        keepLoadedCounter = 0;
+        try {
+            ServerLevel level = server.overworld();
+            java.util.HashSet<Long> desired = new java.util.HashSet<>();
+            for (IColony colony : IColonyManager.getInstance().getAllColonies()) {
+                // Only the order each hut is BOUND to (workOrderId) - that's
+                // the one its builder is trying to start right now. Max one
+                // site per hut keeps the forced set small (~25 chunks/hut).
+                for (IBuilding hut : colony.getServerBuildingManager().getBuildings().values()) {
+                    if (!(hut instanceof com.minecolonies.core.colony.buildings.AbstractBuildingStructureBuilder sb)) continue;
+                    if (boundWorkOrderIdField == null) {
+                        boundWorkOrderIdField = com.minecolonies.core.colony.buildings.AbstractBuildingStructureBuilder.class
+                                .getDeclaredField("workOrderId");
+                        boundWorkOrderIdField.setAccessible(true);
+                    }
+                    int woId = boundWorkOrderIdField.getInt(sb);
+                    if (woId == 0) continue;
+                    com.minecolonies.api.colony.workorders.IWorkOrder wo =
+                        colony.getWorkManager().getWorkOrder(woId);
+                    if (wo == null || wo.getLocation() == null) continue;
+                    int cx = wo.getLocation().getX() >> 4, cz = wo.getLocation().getZ() >> 4;
+                    for (int dx = -2; dx <= 2; dx++) {
+                        for (int dz = -2; dz <= 2; dz++) {
+                            desired.add((((long) (cx + dx)) << 32) | ((cz + dz) & 0xffffffffL));
+                        }
+                    }
+                }
+            }
+            for (long key : desired) {
+                if (forcedBuildChunks.add(key)) {
+                    level.setChunkForced((int) (key >> 32), (int) key, true);
+                }
+            }
+            forcedBuildChunks.removeIf(key -> {
+                if (desired.contains(key)) return false;
+                long k = key;
+                level.setChunkForced((int) (k >> 32), (int) k, false);
+                return true;
+            });
+        } catch (Exception e) {
+            LOGGER.warn("keepBuildSitesLoaded failed: {}", e.toString());
+        }
+    }
 
     private void keepColoniesActive() {
         if (server == null || ++keepActiveCounter < 20) return;
