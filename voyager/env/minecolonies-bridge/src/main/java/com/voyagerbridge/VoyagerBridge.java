@@ -780,14 +780,23 @@ public class VoyagerBridge {
                     if (isBuilderHut) {
                         builderHutPos = pos;
                     } else {
+                        // Only huts within the 100-block build radius
+                        // (WorkOrderBuilding.canBuild) - assigning a farther
+                        // hut binds its queue to an order it can never start.
                         java.util.List<IBuilding> capableBuilderHuts = colony.getServerBuildingManager().getBuildings().values().stream()
                             .filter(bld -> {
                                 ResourceLocation bldKey = ForgeRegistries.BLOCKS.getKey(
                                     level.getBlockState(bld.getPosition()).getBlock());
                                 return bldKey != null && "blockhutbuilder".equals(bldKey.getPath())
-                                    && bld.getBuildingLevel() >= 1;
+                                    && bld.getBuildingLevel() >= 1
+                                    && bld.getPosition().distSqr(pos) <= 10000L;
                             })
                             .collect(java.util.stream.Collectors.toList());
+                        if (capableBuilderHuts.isEmpty()) {
+                            result.complete("ERROR: no builder hut within 100 blocks of " + x + "," + y + "," + z
+                                + " (builders cannot construct beyond that radius; place a builder hut nearby first)");
+                            return;
+                        }
                         // Pick the hut with the fewest claimed work orders. Judging by
                         // the citizen's jobStatus alone doesn't balance anything: the
                         // status stays "idle" until the builder physically starts, so
