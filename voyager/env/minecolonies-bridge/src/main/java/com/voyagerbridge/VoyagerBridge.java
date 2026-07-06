@@ -2825,32 +2825,58 @@ public class VoyagerBridge {
                             .thenComparingInt(p -> p.getZ()))
                         .collect(java.util.stream.Collectors.toList());
                     if (huts.isEmpty()) { result.complete("ERROR: no operational builder huts"); return; }
+                    // WorkOrderBuilding.canBuild demands hut->target distance^2
+                    // <= 10000 (100 blocks); an order claimed by a farther hut
+                    // binds the hut's workOrderId but the AI never starts it,
+                    // and the whole hut queue freezes behind it (134-order
+                    // stall, 2026-07-06). Assign each order to the
+                    // least-loaded hut WITHIN RANGE; orders no hut can reach
+                    // are unclaimed and reported instead.
+                    final long MAX_BUILD_DIST_SQ = 10000L;
+                    java.util.Map<BlockPos, Integer> load = new java.util.HashMap<>();
+                    for (BlockPos h : huts) load.put(h, 0);
                     StringBuilder sb = new StringBuilder();
-                    int i = 0;
+                    int i = 0, unreachable = 0;
                     for (com.minecolonies.api.colony.workorders.IServerWorkOrder wo
                             : colony.getWorkManager().getWorkOrders().values()) {
-                        if (wo.getClaimedBy() == null) continue;
-                        if (wo.getLocation() != null && wo.getLocation().equals(wo.getClaimedBy())) continue;
-                        BlockPos target = huts.get(i % huts.size());
+                        if (wo.getClaimedBy() == null || wo.getLocation() == null) continue;
+                        if (wo.getLocation().equals(wo.getClaimedBy())) continue;
+                        BlockPos loc = wo.getLocation();
+                        BlockPos target = huts.stream()
+                            .filter(h -> h.distSqr(loc) <= MAX_BUILD_DIST_SQ)
+                            .min(java.util.Comparator.comparingInt(h -> load.get(h)))
+                            .orElse(null);
+                        // The old hut caches workOrderId/progress/resources and its
+                        // worker AI holds a structurePlacer for this order; only
+                        // onWorkOrderCancellation resets all of them. Without it the
+                        // old builder keeps working the order it no longer owns and
+                        // wedges in a LOAD_STRUCTURE/RECALC loop.
+                        if (target == null) {
+                            IBuilding oldHut = colony.getServerBuildingManager()
+                                .getBuildings().get(wo.getClaimedBy());
+                            if (oldHut instanceof com.minecolonies.core.colony.buildings.AbstractBuildingStructureBuilder oldBuilder) {
+                                oldBuilder.onWorkOrderCancellation(wo);
+                            }
+                            wo.setClaimedBy(BlockPos.ZERO);
+                            unreachable++;
+                            continue;
+                        }
                         i++;
+                        load.merge(target, 1, Integer::sum);
                         if (!target.equals(wo.getClaimedBy())) {
-                            // The old hut caches workOrderId/progress/resources and its
-                            // worker AI holds a structurePlacer for this order; only
-                            // onWorkOrderCancellation resets all of them. Without it the
-                            // old builder keeps working the order it no longer owns and
-                            // wedges in a LOAD_STRUCTURE/RECALC loop.
                             IBuilding oldHut = colony.getServerBuildingManager()
                                 .getBuildings().get(wo.getClaimedBy());
                             if (oldHut instanceof com.minecolonies.core.colony.buildings.AbstractBuildingStructureBuilder oldBuilder) {
                                 oldBuilder.onWorkOrderCancellation(wo);
                             }
                             wo.setClaimedBy(target);
+                            sb.append(loc.toShortString()).append(" -> ")
+                              .append(target.toShortString()).append("; ");
                         }
-                        sb.append(wo.getLocation() == null ? "?" : wo.getLocation().toShortString())
-                          .append(" -> ").append(target.toShortString()).append("; ");
                     }
                     colony.getWorkManager().setDirty(true);
-                    result.complete("rebalanced " + i + " work orders: " + sb);
+                    result.complete("rebalanced " + i + " work orders (" + unreachable
+                        + " unreachable by any builder hut, unclaimed): " + sb);
                 } catch (Exception e) {
                     LOGGER.error("rebalanceWorkOrders failed", e);
                     result.complete("ERROR: " + e);
@@ -3087,11 +3113,29 @@ public class VoyagerBridge {
         java.util.List<IBuilding> allBuildings = new java.util.ArrayList<>(
             colony.getServerBuildingManager().getBuildings().values());
 
+        // A builder can only construct within 100 blocks of its hut
+        // (WorkOrderBuilding.canBuild, dist^2 <= 10000). Placing beyond that
+        // creates a building no one can ever build - 93 of the runaway
+        // orders were stuck exactly like that (2026-07-06). Keep candidates
+        // within 90 of some lv1+ builder hut (margin for blueprint extent).
+        final long PLACE_NEAR_BUILDER_SQ = 90L * 90L;
+        java.util.List<BlockPos> builderHuts = new java.util.ArrayList<>();
+        for (IBuilding b : allBuildings) {
+            ResourceLocation k = ForgeRegistries.BLOCKS.getKey(level.getBlockState(b.getPosition()).getBlock());
+            if (k != null && "blockhutbuilder".equals(k.getPath()) && b.getBuildingLevel() >= 1) {
+                builderHuts.add(b.getPosition());
+            }
+        }
+
         for (int[] off : offsets) {
             int nx = center.getX() + off[0];
             int nz = center.getZ() + off[1];
             BlockPos anchor = new BlockPos(nx, Y, nz);
             if (!colony.isCoordInColony(level, anchor)) continue;
+            if (!builderHuts.isEmpty() && builderHuts.stream()
+                    .noneMatch(h -> h.distSqr(anchor) <= PLACE_NEAR_BUILDER_SQ)) {
+                continue;
+            }
 
             // Use MineColonies' own isInBuilding for the anchor to catch actual
             // blueprint bounds (which may extend in -Z or be larger than our table).
