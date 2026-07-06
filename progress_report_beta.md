@@ -143,6 +143,24 @@
 - 食歴システムの完全解明も同日: diversity要求=住居lv(lv5は6種以上)、quality要求=lv-2。
   supply_bot は tier3栄養9 の8種ローテーションに(市民16の再飢餓 sat0→19.5 で実証)
 
+## 2026-07-06 夜: builder作業半径問題の全面解決(ユーザー判断: 増設で対応)
+
+- **第2の停滞**: rebalance後もWARNが2時間不動 → builderは動くのに建てない。真因は2つ:
+  1. builderの作業半径はハットから**100ブロック**(WorkOrderBuilding.canBuild)。
+     bridge側の自動割当が距離を見ておらず、圏外orderがハットに束縛されキュー凍結
+  2. **建設地のチャンクがアンロードだとbuilder AIは無言で待機**。無人運転の辺境は
+     誰も踏まないので永遠にロードされない(forceloadで即回復するのを実証)
+- 恒久修正: rebalance/requestBuildの距離対応(圏外はunclaim+エラー)、placeNextの
+  「builder hutから90ブロック以内」配置ガード、**バインド中work orderのチャンクを
+  自動force-load**するkeepBuildSitesLoaded(完了で解除)
+- **圏外93棟への対応(ユーザー指示: 撤去せず増設)**: builder hutの自己建設例外
+  (canBuildIgnoringDistanceのbuilderLocation==location)を使い、**フロンティアの
+  クラスタ中心7か所にbuilder hutを直接設置→自己建設**。全93件を半径88でカバーする
+  配置をフットプリント回避付き貪欲法で計算。全7棟にbuilder配置済み、
+  lv1到達後にrebalanceで93件を自動配分するウォッチャー稼働中
+- 中心180ブロック圏は建物飽和(gap=1でも空き5か所)— 今後の拡張はフロンティア
+  builder hutを起点に外へ伸びる構造になった
+
 ## 進行中 / 次の作業
 
 - **研究パイプライン(2026-07-04 完成・実証済み)**: 「University配置→建設→研究員配属
