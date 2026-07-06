@@ -384,6 +384,7 @@ public class VoyagerBridge {
             httpServer.createContext("/setMenu", this::handleSetMenu);
             httpServer.createContext("/upgradeWarehouse", this::handleUpgradeWarehouse);
             httpServer.createContext("/debugBuildGates", this::handleDebugBuildGates);
+            httpServer.createContext("/assignHome", this::handleAssignHome);
             httpServer.createContext("/stockRestaurant", this::handleStockRestaurant);
             httpServer.createContext("/neededResources", this::handleNeededResources);
             httpServer.createContext("/fillBuilderResources", this::handleFillBuilderResources);
@@ -1343,6 +1344,64 @@ public class VoyagerBridge {
             if (cap != null) {
                 cap.addBuildingClaim(colony.getID(), pos, chunk); // sets owner if unowned; idempotent otherwise
             }
+        }
+    }
+
+    // POST /assignHome?x=&y=&z=&citizenId=[&colonyId=1]
+    //
+    // Moves a citizen's HOME to the residence at (x,y,z). MineColonies only
+    // exposes this via the residence GUI; auto-assignment ignores workplace
+    // distance, so frontier workers commuted 180+ blocks each morning and -
+    // at 10x, where a whole day is ~2 real minutes - reached the site just in
+    // time for nightfall (the 64-order frontier stall, 2026-07-07). Mirrors
+    // the GUI: remove from the old home's LivingBuildingModule, assign to the
+    // new one.
+    private void handleAssignHome(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+            int citizenId = Integer.parseInt(params.get("citizenId"));
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
+                    if (colony == null) { result.complete("ERROR: no colony " + colonyId); return; }
+                    ICitizenData citizen = colony.getCitizenManager().getCivilian(citizenId);
+                    if (citizen == null) { result.complete("ERROR: no citizen " + citizenId); return; }
+                    IBuilding home = colony.getServerBuildingManager().getBuilding(new BlockPos(x, y, z));
+                    if (home == null) { result.complete("ERROR: no building at " + x + "," + y + "," + z); return; }
+                    com.minecolonies.core.colony.buildings.modules.LivingBuildingModule module =
+                        home.getFirstModuleOccurance(com.minecolonies.core.colony.buildings.modules.LivingBuildingModule.class);
+                    if (module == null) { result.complete("ERROR: building at " + x + "," + y + "," + z + " is not a residence"); return; }
+                    IBuilding oldHome = citizen.getHomeBuilding();
+                    if (oldHome != null) {
+                        com.minecolonies.core.colony.buildings.modules.LivingBuildingModule oldModule =
+                            oldHome.getFirstModuleOccurance(com.minecolonies.core.colony.buildings.modules.LivingBuildingModule.class);
+                        if (oldModule != null) oldModule.removeCitizen(citizen);
+                    }
+                    boolean ok = module.assignCitizen(citizen);
+                    result.complete(ok
+                        ? "citizen " + citizenId + " now lives at " + x + "," + y + "," + z
+                        : "ERROR: assignCitizen returned false (residence full?)");
+                } catch (Exception e) {
+                    LOGGER.error("assignHome failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            respond(exchange, outcome.startsWith("ERROR") ? 500 : 200,
+                "{\"result\":\"" + escape(outcome) + "\"}");
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
         }
     }
 
