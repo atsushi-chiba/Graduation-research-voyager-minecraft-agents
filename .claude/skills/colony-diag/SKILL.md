@@ -73,6 +73,23 @@ echo 'minecolonies citizens info <colonyId> <citizenId>' > /root/mc-server-forge
 - 日付ベースのスケジューラは他職にもあり得るので、「特定の職だけ1日1回しか
   働かない/全く働かない」ときはまず colonyDay の進行を疑う。
 
+## 建設が進まない: 資材も健康も正常なのに work order が減らない(2026-07-07 実例)
+
+チェック順(全部 curl で読めるものから):
+
+1. **距離**: builderは自ハットから**100ブロック以内**しか建てられない(canBuild)。
+   rebalance/requestBuild は距離対応済みだが、古いorderが残っていたら
+   `POST /rebalanceWorkOrders?colonyId=1`(圏外は unclaim して件数報告)
+2. **建設地チャンクのアンロード**: builder AI は無言で待機する。bridge の
+   keepBuildSitesLoaded が自動force-loadするはずだが、疑わしければ
+   `forceload add <x1> <z1> <x2> <z2>` で即検証できる(数秒で stage が動き出す)
+3. **通勤**: 市民の自宅⇔職場が遠い(150ブロック超)と、10倍速では1日=実2分
+   なので日中が通勤で消える。症状: citizens info で job が START_WORKING のまま、
+   位置が自宅と職場の中間。対処: `POST /assignHome?x&y&z&citizenId` で
+   職場60ブロック以内の建設済み住居へ引っ越し(2026-07-07 実装)
+4. **lv1ハットの新米builder**: スキルが低く建築が遅いのは仕様。ハットの
+   自己アップグレード(requestBuild をハット自身に発行)で速くなる
+
 ## requestBuild したのに work order が現れない/消える(2026-07-06 実例: 辺境のsawmill)
 
 - まず `curl -s 'http://localhost:8089/debugBuildGates?x&y&z'` — 黙って発注を握り潰す
