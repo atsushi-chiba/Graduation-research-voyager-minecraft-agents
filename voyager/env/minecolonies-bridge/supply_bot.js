@@ -114,6 +114,11 @@ const FEED_ITEMS = [
 // 30 saturation vs the 20 cap. Keeping the stack small stops uneaten food
 // from packing inventories (which is what blocked cure deliveries on 07-04).
 const FEED_ITEM_COUNT = 4;
+// Couriers (and builders commuting to frontier sites) sprint all day at 10x
+// and burn through 4 meals before the next cooldown - their saturation
+// oscillated 0 <-> 4 while everyone else sat near 20 (2026-07-06 audit).
+const HIGH_DRAIN_JOBS = new Set(["deliveryman", "builder"]);
+const HIGH_DRAIN_COUNT = 8;
 const feedRotation = new Map(); // citizenId -> next index into FEED_ITEMS
 const FEED_COOLDOWN_MS = (10 * 60 * 1000) / TICK_MULTIPLIER;
 const lastFed = new Map(); // citizenId -> timestamp of last delivery
@@ -134,10 +139,11 @@ async function feedHungryCitizens(colony, cycle) {
     const idx = feedRotation.get(citizen.id) || 0;
     const item = FEED_ITEMS[idx % FEED_ITEMS.length];
     feedRotation.set(citizen.id, idx + 1);
-    await giveToCitizen(colony.id, citizen.id, item, FEED_ITEM_COUNT);
+    const count = HIGH_DRAIN_JOBS.has(citizen.job) ? HIGH_DRAIN_COUNT : FEED_ITEM_COUNT;
+    await giveToCitizen(colony.id, citizen.id, item, count);
     lastFed.set(citizen.id, Date.now());
     console.log(
-      `[supply #${cycle}] fed citizen ${citizen.id} (saturation ${citizen.saturation}): ${FEED_ITEM_COUNT}x ${item}`
+      `[supply #${cycle}] fed citizen ${citizen.id} (saturation ${citizen.saturation}): ${count}x ${item}`
     );
     fed++;
     await sleep(RESOLVE_DELAY_MS);
