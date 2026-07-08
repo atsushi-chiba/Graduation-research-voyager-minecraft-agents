@@ -388,6 +388,7 @@ public class VoyagerBridge {
             httpServer.createContext("/teachRecipe", this::handleTeachRecipe);
             httpServer.createContext("/recipes", this::handleRecipes);
             httpServer.createContext("/setHiringMode", this::handleSetHiringMode);
+            httpServer.createContext("/setItemList", this::handleSetItemList);
             httpServer.createContext("/stockRestaurant", this::handleStockRestaurant);
             httpServer.createContext("/neededResources", this::handleNeededResources);
             httpServer.createContext("/fillBuilderResources", this::handleFillBuilderResources);
@@ -1546,6 +1547,65 @@ public class VoyagerBridge {
                 }
             });
             respond(exchange, 200, result.get());
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // POST /setItemList?x=&y=&z=&listId=compostables&items=minecraft:wheat_seeds,minecraft:oak_sapling
+    //
+    // Generic setter for ItemListModule-based GUI configs (composter's
+    // compostables list, etc.). Without the list the composter wedges at
+    // GET_MATERIALS forever. Items are ADDED to the named list; the response
+    // echoes the list size afterwards.
+    private void handleSetItemList(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+            String listId = params.getOrDefault("listId", "compostables");
+            String itemsCsv = params.getOrDefault("items", "");
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IColony colony = findColonyAt(level, pos);
+                    if (colony == null) { result.complete("ERROR: no colony at " + x + "," + y + "," + z); return; }
+                    IBuilding building = colony.getServerBuildingManager().getBuilding(pos);
+                    if (building == null) { result.complete("ERROR: no building at " + x + "," + y + "," + z); return; }
+                    com.minecolonies.core.colony.buildings.modules.ItemListModule module =
+                        building.getModuleMatching(
+                            com.minecolonies.core.colony.buildings.modules.ItemListModule.class,
+                            m -> m.getId().equals(listId));
+                    if (module == null) { result.complete("ERROR: no ItemListModule '" + listId + "' on this building"); return; }
+                    int added = 0;
+                    for (String id : itemsCsv.split(",")) {
+                        id = id.trim();
+                        if (id.isEmpty()) continue;
+                        Item item = ForgeRegistries.ITEMS.getValue(new ResourceLocation(id));
+                        if (item == null || item == net.minecraft.world.item.Items.AIR) {
+                            result.complete("ERROR: unknown item " + id); return;
+                        }
+                        module.addItem(new com.minecolonies.api.crafting.ItemStorage(new ItemStack(item, 1)));
+                        added++;
+                    }
+                    building.markDirty();
+                    result.complete("added " + added + " item(s) to '" + listId + "' (list now "
+                        + module.getList().size() + ")");
+                } catch (Exception e) {
+                    LOGGER.error("setItemList failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            respond(exchange, outcome.startsWith("ERROR") ? 500 : 200,
+                "{\"result\":\"" + escape(outcome) + "\"}");
         } catch (Exception e) {
             respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
         }
