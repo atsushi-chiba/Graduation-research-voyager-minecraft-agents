@@ -1023,6 +1023,14 @@ public class VoyagerBridge {
             int x = Integer.parseInt(params.get("x"));
             int y = Integer.parseInt(params.get("y"));
             int z = Integer.parseInt(params.get("z"));
+            // Items the caller wants left to the colony's own crafter economy:
+            // not bulk-delivered, so the builder requests them individually and
+            // the request resolver routes them to a crafter with the taught
+            // recipe (supply_bot passes its taught-outputs set here).
+            java.util.Set<String> skip = new java.util.HashSet<>();
+            for (String s : params.getOrDefault("skip", "").split(",")) {
+                if (!s.trim().isEmpty()) skip.add(s.trim());
+            }
 
             java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
             server.execute(() -> {
@@ -1110,8 +1118,10 @@ public class VoyagerBridge {
                             }
                             available = Math.max(available, inRacks);
                         }
+                        ResourceLocation protoKey = ForgeRegistries.ITEMS.getKey(proto.getItem());
+                        boolean leftToCrafters = protoKey != null && skip.contains(protoKey.toString());
                         int inserted = 0;
-                        if (fill && needed > available) {
+                        if (fill && !leftToCrafters && needed > available) {
                             int remaining = needed - available;
                             while (remaining > 0) {
                                 int emptySlots = 0;

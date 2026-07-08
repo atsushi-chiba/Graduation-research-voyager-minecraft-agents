@@ -162,9 +162,10 @@ async function fillBuilderHuts(colony, cycle) {
   for (const building of colony.buildings || []) {
     if (building.type !== "blockhutbuilder") continue;
     try {
+      const skip = encodeURIComponent([...taughtOutputs].join(","));
       const res = await httpRequest(
         "POST",
-        `/fillBuilderResources?x=${building.x}&y=${building.y}&z=${building.z}`
+        `/fillBuilderResources?x=${building.x}&y=${building.y}&z=${building.z}&skip=${skip}`
       );
       if (res.status !== 200) continue;
       const given = JSON.parse(res.body).filter((i) => i.given > 0);
@@ -189,6 +190,36 @@ async function fillBuilderHuts(colony, cycle) {
 // the next level-up or RECIPES research the loop picks up where it left off.
 // /teachRecipe is idempotent ("already taught" is a success).
 const CRAFTER_RECIPES = require("./crafter_recipes.json");
+
+// The colony's own production economy. Items some crafter has been TAUGHT
+// are left to the request system: excluded from the builder bulk-fill (so
+// builders file real requests), and their requests are NOT cheat-resolved
+// for CRAFT_DEFER_MS - the resolver routes them to the crafter, the crafter
+// works, a courier delivers. Only if the economy fails to deliver in time
+// does the cheat supply step in, so construction never deadlocks. Raw
+// inputs (logs, stone, iron) are never taught outputs and stay cheated -
+// the cheat retreats to the resource frontier, the middle becomes real.
+let taughtOutputs = new Set();
+const CRAFT_DEFER_MS = 180000; // 3 real minutes = 30 game-minutes at 10x
+const deferredSince = new Map(); // request signature -> first-seen timestamp
+
+async function refreshTaughtOutputs(colony, cycle) {
+  if (cycle % 10 !== 7 && taughtOutputs.size > 0) return;
+  const next = new Set();
+  for (const building of colony.buildings || []) {
+    if (!CRAFTER_RECIPES[building.type] || !building.operational || !(building.workers || []).length) continue;
+    try {
+      const res = await httpRequest("GET", `/recipes?x=${building.x}&y=${building.y}&z=${building.z}`);
+      if (res.status !== 200) continue;
+      for (const m of JSON.parse(res.body).modules || []) {
+        for (const r of m.recipes || []) next.add(r.output);
+      }
+    } catch {
+      return; // transient - keep the old set
+    }
+  }
+  taughtOutputs = next;
+}
 
 async function teachCrafterRecipes(colony, cycle) {
   if (cycle % 10 !== 5) return 0; // same cadence as autoResearch, offset phase
@@ -333,6 +364,7 @@ async function loop() {
       let totalResolved = 0;
 
       for (const colony of colonies) {
+        await refreshTaughtOutputs(colony, cycle);
         totalResolved += await treatSickCitizens(colony, cycle);
         totalResolved += await feedHungryCitizens(colony, cycle);
         totalResolved += await stockRestaurants(colony, cycle);
@@ -377,6 +409,18 @@ async function loop() {
                     console.log(`[supply #${cycle}] textured resolve failed: ${res.body}`);
                   }
                 } else if (!req.textured) {
+                  // Craftable by a colony crafter? Leave it to the real economy
+                  // for a grace period; cheat only if it doesn't arrive.
+                  if (taughtOutputs.has(req.item)) {
+                    const sig = `${building.x},${building.z}:${citizenId}:${req.item}:${req.count}`;
+                    const t0 = deferredSince.get(sig) || Date.now();
+                    deferredSince.set(sig, t0);
+                    if (Date.now() - t0 < CRAFT_DEFER_MS) continue;
+                    console.log(
+                      `[supply #${cycle}] crafter economy missed ${req.item} x${req.count} for citizen ${citizenId} - cheating it in`
+                    );
+                    deferredSince.delete(sig);
+                  }
                   // Plain material request: give item then close the request.
                   // Give exactly what the request asks for (the old 64-item floor
                   // that avoided re-request round-trips is obsolete now that

@@ -104,6 +104,25 @@ echo 'minecolonies citizens info <colonyId> <citizenId>' > /root/mc-server-forge
 - 豆知識: MineColonies 純正の claim 経路は「アンロードチャンク=次回ロード時に適用」に
   先送りするが、無人コロニーの辺境チャンクは誰も踏まないので永遠に適用されない。
 
+## 「働いていない職場」の一括診断(2026-07-07 実装)
+
+- `node /root/Voyager/voyager/env/minecolonies-bridge/work_stats.js [samples] [intervalMs]`
+  — /status を複数回サンプリングして職場ごとの実働率を出す(単発スナップショットは
+  通勤・就寝で誤判定するため)。0%が並ぶ職場の典型原因と対処:
+  - **牧畜系(swineherder等)が DECIDE 空回り** → superflatは動物が湧かない。
+    `summon minecraft:pig <x> <y+1> <z>` で各ハットに繁殖ペアを4匹置く
+  - **composter が GET_MATERIALS 張り付き** → GUI限定の compostables リストが空。
+    `POST /setItemList?x&y&z&listId=compostables&items=minecraft:wheat_seeds,...`
+  - **crafter/courier が全員 idle** → チート供給が需要を吸い尽くしている。
+    supply_bot の「教示済みレシピ品はdefer」機構(2026-07-07)が有効か確認
+  - **リクエストが overrule returned false で解決不能**(インベントリ操作等で孤児化)
+    → `minecolonies colony requestsystem-reset 1` で健全に再構築される(公式の救済コマンド)
+  - **INVENTORY_FULL 張り付き** → ハットのラック満杯で荷下ろし不能。
+    fillBuilderResources のrack janitor+空き予約(2026-07-07)が対処済みのはずだが、
+    緊急時は `/clearCitizenInventory`(**道具も消えるので直後に配り直すこと**)
+- jobStatus は粗い指標(物理作業中以外はidle)。確定診断は
+  `minecolonies citizens info` の Job 行(NEEDS_ITEM/INVENTORY_FULL/DECIDE等)で行う
+
 ## 病気×飢餓の悪循環(2026-07-04 に 33人中23人が病気になった実例)
 
 メカニズム(CitizenAI.calculateNextState / EntityAISickTask / EntityAIEatTask を逆コンパイルで確認):
