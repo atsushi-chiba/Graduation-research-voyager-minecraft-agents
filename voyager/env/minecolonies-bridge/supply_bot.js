@@ -12,6 +12,21 @@
 // Textured (Domum Ornamentum framed-block) requests are skipped - those
 // require raw materials in the citizen's inventory first.
 const http = require("http");
+const fs = require("fs");
+
+const CMD_PIPE = "/root/mc-server-forge/cmd_pipe";
+
+// Non-blocking console command (mirrors council.js sayInGame): O_NONBLOCK so
+// a wedged pipe can never hang the supply loop.
+function consoleCmd(cmd) {
+  try {
+    const fd = fs.openSync(CMD_PIPE, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+    fs.writeSync(fd, cmd + "\n");
+    fs.closeSync(fd);
+  } catch {
+    // pipe not ready - skip, retry next cycle
+  }
+}
 
 const BRIDGE_HOST = "localhost";
 const BRIDGE_PORT = 8089;
@@ -435,10 +450,25 @@ async function warehouseJanitor(colony, cycle) {
   return 0;
 }
 
+// Visitors spawn within +-5 blocks VERTICALLY of the tavern
+// (EntityUtils.getSpawnPoint) - i.e. sometimes on its roof - and their
+// wander AI also climbs tall buildings via stairs; either way they walk off
+// unfenced blueprint edges and splat (all "mystery pit" deaths were
+// visitors, 2026-07-08). Rescue any visitor 5+ blocks above ground by
+// teleporting them to the tavern forecourt. Citizens are NOT touched
+// (builders legitimately work at height).
+const VISITOR_RESCUE_SPOT = "171 -60 228"; // in front of tavern1
+function rescueElevatedVisitors() {
+  consoleCmd(
+    `execute as @e[type=minecolonies:visitor,y=-55,dy=60] at @s run tp @s ${VISITOR_RESCUE_SPOT}`
+  );
+}
+
 async function loop() {
   let cycle = 0;
   while (true) {
     cycle++;
+    rescueElevatedVisitors();
     try {
       const colonies = await getStatus();
       let totalResolved = 0;
