@@ -182,6 +182,44 @@ async function fillBuilderHuts(colony, cycle) {
   return filled;
 }
 
+// Crafters only produce what they have been TAUGHT (normally via the crafting
+// GUI). crafter_recipes.json is a priority-ordered teach list per building
+// type; recipe slots scale as 2^buildingLevel (x research), so we teach from
+// the top and simply stop when the building refuses (capacity full) - after
+// the next level-up or RECIPES research the loop picks up where it left off.
+// /teachRecipe is idempotent ("already taught" is a success).
+const CRAFTER_RECIPES = require("./crafter_recipes.json");
+
+async function teachCrafterRecipes(colony, cycle) {
+  if (cycle % 10 !== 5) return 0; // same cadence as autoResearch, offset phase
+  let taught = 0;
+  for (const building of colony.buildings || []) {
+    const list = CRAFTER_RECIPES[building.type];
+    if (!list || !building.operational || building.level < 1) continue;
+    for (const r of list) {
+      const inputs = encodeURIComponent(r.inputs);
+      const out = encodeURIComponent(r.output);
+      let res;
+      try {
+        res = await httpRequest(
+          "POST",
+          `/teachRecipe?x=${building.x}&y=${building.y}&z=${building.z}` +
+            `&output=${out}&outputCount=${r.count || 1}&inputs=${inputs}&grid=${r.grid || 3}`
+        );
+      } catch {
+        break; // transient - retry next round
+      }
+      if (res.status !== 200) break; // capacity full (or incompatible) - stop here for now
+      if ((res.body || "").includes("taught ")) {
+        console.log(`[supply #${cycle}] ${building.type}@(${building.x},${building.z}): ${res.body.slice(0, 120)}`);
+        taught++;
+      }
+      await sleep(RESOLVE_DELAY_MS);
+    }
+  }
+  return taught;
+}
+
 // Research progresses on its own once started (the university researcher
 // works it down), but finished research frees slots and unlocks children -
 // periodically ask the bridge to start whatever is startable next. Item
@@ -299,6 +337,7 @@ async function loop() {
         totalResolved += await feedHungryCitizens(colony, cycle);
         totalResolved += await stockRestaurants(colony, cycle);
         totalResolved += await autoResearch(colony, cycle);
+        totalResolved += await teachCrafterRecipes(colony, cycle);
         totalResolved += await fillBuilderHuts(colony, cycle);
         for (const building of colony.buildings) {
           if (building.workers.length === 0) continue;

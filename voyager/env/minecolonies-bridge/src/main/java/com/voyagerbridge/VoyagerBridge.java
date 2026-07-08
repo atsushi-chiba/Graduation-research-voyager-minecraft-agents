@@ -385,6 +385,9 @@ public class VoyagerBridge {
             httpServer.createContext("/upgradeWarehouse", this::handleUpgradeWarehouse);
             httpServer.createContext("/debugBuildGates", this::handleDebugBuildGates);
             httpServer.createContext("/assignHome", this::handleAssignHome);
+            httpServer.createContext("/teachRecipe", this::handleTeachRecipe);
+            httpServer.createContext("/recipes", this::handleRecipes);
+            httpServer.createContext("/setHiringMode", this::handleSetHiringMode);
             httpServer.createContext("/stockRestaurant", this::handleStockRestaurant);
             httpServer.createContext("/neededResources", this::handleNeededResources);
             httpServer.createContext("/fillBuilderResources", this::handleFillBuilderResources);
@@ -1344,6 +1347,227 @@ public class VoyagerBridge {
             if (cap != null) {
                 cap.addBuildingClaim(colony.getID(), pos, chunk); // sets owner if unowned; idempotent otherwise
             }
+        }
+    }
+
+    // POST /teachRecipe?x=&y=&z=&output=<item id>[&outputCount=1]&inputs=<id:count,id:count,...>[&grid=3]
+    //
+    // Teaches a crafter building a recipe, exactly like the crafting GUI's
+    // teach button: build a RecipeStorage, register it with the global recipe
+    // manager, then offer it to each of the building's crafting modules until
+    // one accepts. The module's own canRecipeBeAdded enforces both the
+    // capacity formula (2^buildingLevel x research x canLearnManyRecipes) and
+    // the per-crafter compatibility tags (crafting_sawmill etc.), so no
+    // validation is duplicated here. grid=1 marks a furnace (smelting) recipe
+    // per the GUI's convention; 2/3 are crafting-grid recipes.
+    private void handleTeachRecipe(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+            String outputId = params.get("output");
+            int outputCount = Integer.parseInt(params.getOrDefault("outputCount", "1"));
+            String inputsCsv = params.getOrDefault("inputs", "");
+            int grid = Integer.parseInt(params.getOrDefault("grid", "3"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IColony colony = findColonyAt(level, pos);
+                    if (colony == null) { result.complete("ERROR: no colony at " + x + "," + y + "," + z); return; }
+                    IBuilding building = colony.getServerBuildingManager().getBuilding(pos);
+                    if (building == null) { result.complete("ERROR: no building at " + x + "," + y + "," + z); return; }
+
+                    Item outItem = ForgeRegistries.ITEMS.getValue(new ResourceLocation(outputId));
+                    if (outItem == null || outItem == net.minecraft.world.item.Items.AIR) {
+                        result.complete("ERROR: unknown output item " + outputId); return;
+                    }
+                    java.util.List<com.minecolonies.api.crafting.ItemStorage> inputs = new java.util.ArrayList<>();
+                    for (String part : inputsCsv.split(",")) {
+                        part = part.trim();
+                        if (part.isEmpty()) continue;
+                        String[] kv = part.split(":");
+                        // item ids contain a namespace colon: ns:name[:count]
+                        String id = kv.length >= 2 ? kv[0] + ":" + kv[1] : kv[0];
+                        int count = kv.length >= 3 ? Integer.parseInt(kv[2]) : 1;
+                        Item inItem = ForgeRegistries.ITEMS.getValue(new ResourceLocation(id));
+                        if (inItem == null || inItem == net.minecraft.world.item.Items.AIR) {
+                            result.complete("ERROR: unknown input item " + id); return;
+                        }
+                        inputs.add(new com.minecolonies.api.crafting.ItemStorage(new ItemStack(inItem, count)));
+                    }
+                    if (inputs.isEmpty()) { result.complete("ERROR: no inputs given"); return; }
+
+                    com.minecolonies.api.crafting.IRecipeStorage storage =
+                        com.minecolonies.api.crafting.RecipeStorage.builder()
+                            .withInputs(inputs)
+                            .withPrimaryOutput(new ItemStack(outItem, outputCount))
+                            .withGridSize(grid)
+                            .withIntermediate(grid == 1
+                                ? net.minecraft.world.level.block.Blocks.FURNACE
+                                : net.minecraft.world.level.block.Blocks.AIR)
+                            .build();
+                    com.minecolonies.api.colony.requestsystem.token.IToken<?> token =
+                        IColonyManager.getInstance().getRecipeManager().checkOrAddRecipe(storage);
+
+                    java.util.List<com.minecolonies.core.colony.buildings.modules.AbstractCraftingBuildingModule> modules =
+                        building.getModulesByType(com.minecolonies.core.colony.buildings.modules.AbstractCraftingBuildingModule.class);
+                    if (modules.isEmpty()) {
+                        result.complete("ERROR: building at " + x + "," + y + "," + z + " has no crafting modules"); return;
+                    }
+                    for (com.minecolonies.core.colony.buildings.modules.AbstractCraftingBuildingModule m : modules) {
+                        // already taught? (idempotency for the auto-teach loop)
+                        for (com.minecolonies.api.colony.requestsystem.token.IToken<?> t : m.getRecipes()) {
+                            com.minecolonies.api.crafting.IRecipeStorage rs =
+                                IColonyManager.getInstance().getRecipeManager().getRecipes().get(t);
+                            if (rs != null && ItemStack.isSameItem(rs.getPrimaryOutput(), storage.getPrimaryOutput())) {
+                                result.complete("already taught: " + outputId + " (module " + m.getClass().getSimpleName() + ")");
+                                return;
+                            }
+                        }
+                    }
+                    for (com.minecolonies.core.colony.buildings.modules.AbstractCraftingBuildingModule m : modules) {
+                        if (m.addRecipe(token)) {
+                            building.markDirty();
+                            result.complete("taught " + outputId + " x" + outputCount + " to "
+                                + m.getClass().getSimpleName() + " (recipes now " + m.getRecipes().size() + ")");
+                            return;
+                        }
+                    }
+                    result.complete("ERROR: no crafting module accepted the recipe (capacity full or incompatible with this crafter)");
+                } catch (Exception e) {
+                    LOGGER.error("teachRecipe failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            respond(exchange, outcome.startsWith("ERROR") ? 500 : 200,
+                "{\"result\":\"" + escape(outcome) + "\"}");
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // GET /recipes?x=&y=&z= - taught recipes and capacity per crafting module.
+    // getMaxRecipes is protected, so it's read via reflection; the auto-teach
+    // loop uses "taught" + "max" to know when a building has free slots again
+    // (level-ups and the RECIPES research both raise max).
+    private void handleRecipes(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IColony colony = findColonyAt(level, pos);
+                    if (colony == null) { result.complete("{\"error\":\"no colony\"}"); return; }
+                    IBuilding building = colony.getServerBuildingManager().getBuilding(pos);
+                    if (building == null) { result.complete("{\"error\":\"no building\"}"); return; }
+                    StringBuilder json = new StringBuilder("{\"modules\":[");
+                    boolean firstM = true;
+                    for (com.minecolonies.core.colony.buildings.modules.AbstractCraftingBuildingModule m
+                            : building.getModulesByType(com.minecolonies.core.colony.buildings.modules.AbstractCraftingBuildingModule.class)) {
+                        if (!firstM) json.append(',');
+                        firstM = false;
+                        int max = -1;
+                        try {
+                            java.lang.reflect.Method gm = com.minecolonies.core.colony.buildings.modules.AbstractCraftingBuildingModule.class
+                                .getDeclaredMethod("getMaxRecipes");
+                            gm.setAccessible(true);
+                            max = (Integer) gm.invoke(m);
+                        } catch (Exception ignored) {}
+                        json.append("{\"module\":\"").append(m.getClass().getSimpleName())
+                            .append("\",\"taught\":").append(m.getRecipes().size())
+                            .append(",\"max\":").append(max).append(",\"recipes\":[");
+                        boolean firstR = true;
+                        for (com.minecolonies.api.colony.requestsystem.token.IToken<?> t : m.getRecipes()) {
+                            com.minecolonies.api.crafting.IRecipeStorage rs =
+                                IColonyManager.getInstance().getRecipeManager().getRecipes().get(t);
+                            if (rs == null) continue;
+                            if (!firstR) json.append(',');
+                            firstR = false;
+                            ResourceLocation outKey = ForgeRegistries.ITEMS.getKey(rs.getPrimaryOutput().getItem());
+                            json.append("{\"output\":\"").append(outKey)
+                                .append("\",\"count\":").append(rs.getPrimaryOutput().getCount()).append('}');
+                        }
+                        json.append("]}");
+                    }
+                    json.append("]}");
+                    result.complete(json.toString());
+                } catch (Exception e) {
+                    LOGGER.error("recipes failed", e);
+                    result.complete("{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+                }
+            });
+            respond(exchange, 200, result.get());
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // POST /setHiringMode?x=&y=&z=&mode=MANUAL|AUTO|DEFAULT[&fire=true]
+    //
+    // MANUAL stops the auto-hire loop from refilling the building (used to
+    // decommission the mayor's surplus alchemist towers without deregistering
+    // them - a deregistered building's structure becomes invisible to the
+    // placement collision logic, which is worse). fire=true also unassigns
+    // the current workers so they return to the jobless pool.
+    private void handleSetHiringMode(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"use POST\"}");
+            return;
+        }
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+            String mode = params.getOrDefault("mode", "MANUAL").toUpperCase(java.util.Locale.ROOT);
+            boolean fire = "true".equalsIgnoreCase(params.getOrDefault("fire", "false"));
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    BlockPos pos = new BlockPos(x, y, z);
+                    IColony colony = findColonyAt(level, pos);
+                    if (colony == null) { result.complete("ERROR: no colony at " + x + "," + y + "," + z); return; }
+                    IBuilding building = colony.getServerBuildingManager().getBuilding(pos);
+                    if (building == null) { result.complete("ERROR: no building at " + x + "," + y + "," + z); return; }
+                    com.minecolonies.core.colony.buildings.modules.WorkerBuildingModule wm =
+                        building.getFirstModuleOccurance(com.minecolonies.core.colony.buildings.modules.WorkerBuildingModule.class);
+                    if (wm == null) { result.complete("ERROR: no worker module at " + x + "," + y + "," + z); return; }
+                    wm.setHiringMode(com.minecolonies.api.colony.buildings.HiringMode.valueOf(mode));
+                    int fired = 0;
+                    if (fire) {
+                        for (ICitizenData c : new java.util.ArrayList<>(wm.getAssignedCitizen())) {
+                            wm.removeCitizen(c);
+                            fired++;
+                        }
+                    }
+                    building.markDirty();
+                    result.complete("hiring mode " + mode + " at " + x + "," + y + "," + z
+                        + (fire ? " (fired " + fired + ")" : ""));
+                } catch (Exception e) {
+                    LOGGER.error("setHiringMode failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            respond(exchange, outcome.startsWith("ERROR") ? 500 : 200,
+                "{\"result\":\"" + escape(outcome) + "\"}");
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
         }
     }
 
