@@ -104,6 +104,7 @@ public class VoyagerBridge {
         if (event.phase != TickEvent.Phase.START) return;
         keepColoniesActive();
         keepBuildSitesLoaded();
+        tickrateGovernor();
         int mult = tickMultiplier;
         if (mult <= 1 || server == null) return;
         java.lang.reflect.Field f = resolveNextTickTimeField(server);
@@ -3220,19 +3221,81 @@ public class VoyagerBridge {
     // POST /tickrate?multiplier=10
     // Sets the tick rate multiplier. multiplier=1 restores normal 20 TPS.
     // The actual sleep removal is implemented in MinecraftServerMixin via Mixin.
+    // POST /tickrate?multiplier=N     - fixed speed, disables the governor
+    // POST /tickrate?auto=true[&max=40][&headroom=0.8] - adaptive governor:
+    //   every 15s set multiplier to what the measured tick time can sustain.
+    // GET  /tickrate                  - current state incl. measured mspt.
+    //
+    // Measured 2026-07-08: at 130 citizens + ~80 animals this machine peaks
+    // around 10-11x (mspt ~4.8ms) - a fixed 15x just burns CPU with no gain.
+    // The governor exists to (a) always run at the max the hardware allows -
+    // a fresh small colony flies at 20x+, a heavy one degrades gracefully -
+    // and (b) quantify how much a stronger machine buys.
     private void handleTickrate(HttpExchange exchange) throws IOException {
-        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
-            respond(exchange, 405, "{\"error\":\"use POST\"}");
-            return;
-        }
         try {
+            if ("GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                respond(exchange, 200, "{\"multiplier\":" + tickMultiplier
+                    + ",\"auto\":" + autoTickrate
+                    + ",\"msptMs\":" + Math.round(currentMspt() * 100.0) / 100.0
+                    + ",\"autoMax\":" + autoTickMax
+                    + ",\"headroom\":" + autoTickHeadroom + "}");
+                return;
+            }
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                respond(exchange, 405, "{\"error\":\"use POST or GET\"}");
+                return;
+            }
             java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            if ("true".equalsIgnoreCase(params.getOrDefault("auto", "false"))) {
+                autoTickMax = Integer.parseInt(params.getOrDefault("max", "40"));
+                autoTickHeadroom = Double.parseDouble(params.getOrDefault("headroom", "0.8"));
+                autoTickrate = true;
+                lastGovernorMs = 0; // run on next tick
+                respond(exchange, 200, "{\"result\":\"auto tickrate enabled (max=" + autoTickMax
+                    + ", headroom=" + autoTickHeadroom + ")\"}");
+                return;
+            }
             int mult = Integer.parseInt(params.getOrDefault("multiplier", "1"));
             if (mult < 1) mult = 1;
+            autoTickrate = false;
             tickMultiplier = mult;
-            respond(exchange, 200, "{\"result\":\"multiplier=" + mult + "\"}");
+            respond(exchange, 200, "{\"result\":\"multiplier=" + mult + " (auto off)\"}");
         } catch (Exception e) {
             respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    private static volatile boolean autoTickrate = false;
+    private static volatile int autoTickMax = 40;
+    private static volatile double autoTickHeadroom = 0.8;
+    private long lastGovernorMs = 0;
+
+    // Average of the server's own per-tick execution times (the /forge tps
+    // mspt). tickTimes is nanoseconds over the last 100 ticks.
+    private double currentMspt() {
+        long[] times = server.tickTimes;
+        if (times == null || times.length == 0) return 50.0;
+        long sum = 0;
+        for (long t : times) sum += t;
+        return sum / (double) times.length / 1.0e6;
+    }
+
+    // Called every server tick (from onServerTick). Re-targets the multiplier
+    // to what the measured tick cost can sustain: budget per tick at N x is
+    // 50/N ms, so sustainable N = 50/mspt * headroom. Hysteresis of +-1 keeps
+    // it from flapping; changes are logged for the speedup studies.
+    private void tickrateGovernor() {
+        if (!autoTickrate || server == null) return;
+        long now = System.currentTimeMillis();
+        if (now - lastGovernorMs < 15000) return;
+        lastGovernorMs = now;
+        double mspt = Math.max(0.4, currentMspt());
+        int target = (int) Math.floor(50.0 / mspt * autoTickHeadroom);
+        target = Math.max(1, Math.min(autoTickMax, target));
+        if (Math.abs(target - tickMultiplier) >= 2) {
+            LOGGER.info("[tickgov] mspt={}ms -> multiplier {} (was {})",
+                String.format("%.2f", mspt), target, tickMultiplier);
+            tickMultiplier = target;
         }
     }
 
