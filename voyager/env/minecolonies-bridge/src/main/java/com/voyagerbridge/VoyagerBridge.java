@@ -389,6 +389,7 @@ public class VoyagerBridge {
             httpServer.createContext("/recipes", this::handleRecipes);
             httpServer.createContext("/setHiringMode", this::handleSetHiringMode);
             httpServer.createContext("/setItemList", this::handleSetItemList);
+            httpServer.createContext("/warehouseStats", this::handleWarehouseStats);
             httpServer.createContext("/stockRestaurant", this::handleStockRestaurant);
             httpServer.createContext("/neededResources", this::handleNeededResources);
             httpServer.createContext("/fillBuilderResources", this::handleFillBuilderResources);
@@ -1553,6 +1554,58 @@ public class VoyagerBridge {
                     result.complete(json.toString());
                 } catch (Exception e) {
                     LOGGER.error("recipes failed", e);
+                    result.complete("{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+                }
+            });
+            respond(exchange, 200, result.get());
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // GET /warehouseStats?colonyId=1 - rack occupancy of every warehouse.
+    // "Is the warehouse full?" had no measurable answer before (user asked
+    // twice); couriers wedge silently when they can't dump pickups.
+    private void handleWarehouseStats(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
+                    if (colony == null) { result.complete("{\"error\":\"no colony\"}"); return; }
+                    StringBuilder json = new StringBuilder("{\"warehouses\":[");
+                    boolean first = true;
+                    for (IBuilding b : colony.getServerBuildingManager().getBuildings().values()) {
+                        if (!(b instanceof com.minecolonies.core.colony.buildings.workerbuildings.BuildingWareHouse wh)) continue;
+                        int racks = 0, slots = 0, used = 0;
+                        for (BlockPos rp : wh.getContainers()) {
+                            BlockEntity te = level.getBlockEntity(rp);
+                            if (!(te instanceof com.minecolonies.core.tileentities.TileEntityRack rack)
+                                    || te instanceof TileEntityColonyBuilding) continue;
+                            racks++;
+                            net.minecraftforge.items.IItemHandler h = rack.getInventory();
+                            slots += h.getSlots();
+                            for (int i = 0; i < h.getSlots(); i++) {
+                                if (!h.getStackInSlot(i).isEmpty()) used++;
+                            }
+                        }
+                        if (!first) json.append(',');
+                        first = false;
+                        json.append("{\"pos\":\"").append(b.getPosition().toShortString())
+                            .append("\",\"level\":").append(b.getBuildingLevel())
+                            .append(",\"racks\":").append(racks)
+                            .append(",\"slots\":").append(slots)
+                            .append(",\"usedSlots\":").append(used)
+                            .append(",\"fullness\":").append(slots == 0 ? 0 : Math.round(100.0 * used / slots) / 100.0)
+                            .append('}');
+                    }
+                    json.append("]}");
+                    result.complete(json.toString());
+                } catch (Exception e) {
+                    LOGGER.error("warehouseStats failed", e);
                     result.complete("{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
                 }
             });

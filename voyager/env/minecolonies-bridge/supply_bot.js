@@ -18,6 +18,52 @@ const BRIDGE_PORT = 8089;
 const POLL_INTERVAL_MS = 6000;
 const RESOLVE_DELAY_MS = 300;
 
+// SUPPLY_MODE=observe turns the bot into a pure recorder: NO interventions
+// (no feeding, curing, stocking, research, teaching, filling, resolving) -
+// the colony runs on its own economy while every open request and welfare
+// stat is aggregated into bottleneck_report.json. After OBSERVE_MINUTES the
+// final report is written and the process exits; colony_watch restarts the
+// bot without the env var, restoring normal (economy) mode automatically.
+// Purpose (2026-07-08, user): find the colony's REAL bottlenecks to derive
+// the mayor's build-priority criteria from data.
+const SUPPLY_MODE = process.env.SUPPLY_MODE || "economy";
+const OBSERVE_MINUTES = parseInt(process.env.OBSERVE_MINUTES || "120", 10);
+const observeStart = Date.now();
+const observedRequests = new Map(); // item -> {occurrences, maxCount, buildings:Set, description}
+const observeTimeline = [];
+
+function recordRequest(building, req) {
+  const key = req.item || req.description || "?";
+  if (!observedRequests.has(key)) {
+    observedRequests.set(key, { occurrences: 0, maxCount: 0, buildings: new Set(), description: req.description });
+  }
+  const a = observedRequests.get(key);
+  a.occurrences++;
+  a.maxCount = Math.max(a.maxCount, req.count || 0);
+  a.buildings.add(`${building.type}@${building.x},${building.z}`);
+}
+
+function writeObserveReport(final_) {
+  const items = [...observedRequests.entries()]
+    .map(([item, a]) => ({
+      item, description: a.description, occurrences: a.occurrences,
+      maxCount: a.maxCount, requesters: [...a.buildings],
+    }))
+    .sort((x, y) => y.occurrences - x.occurrences);
+  const report = {
+    mode: "observe", startedAt: new Date(observeStart).toISOString(),
+    minutes: Math.round((Date.now() - observeStart) / 60000), final: !!final_,
+    unresolvedRequests: items, timeline: observeTimeline,
+  };
+  require("fs").writeFileSync(`${__dirname}/bottleneck_report.json`, JSON.stringify(report, null, 2));
+  if (final_) {
+    console.log(`[observe] FINAL REPORT: ${items.length} distinct unresolved items; top:`);
+    for (const it of items.slice(0, 15)) {
+      console.log(`  ${it.occurrences}x ${it.item} (max ${it.maxCount}) <- ${it.requesters.slice(0, 3).join(", ")}${it.requesters.length > 3 ? ` +${it.requesters.length - 3}` : ""}`);
+    }
+  }
+}
+
 function httpRequest(method, path) {
   return new Promise((resolve, reject) => {
     const req = http.request(
@@ -364,6 +410,33 @@ async function loop() {
       let totalResolved = 0;
 
       for (const colony of colonies) {
+        if (SUPPLY_MODE === "observe") {
+          // Pure recorder: no interventions of any kind (user decision
+          // 2026-07-08: full stop, welfare included, for a clean picture).
+          const cits = colony.citizens || [];
+          observeTimeline.push({
+            t: Math.round((Date.now() - observeStart) / 1000),
+            citizens: cits.length,
+            sick: cits.filter((c) => c.sick).length,
+            starving: cits.filter((c) => c.saturation <= 2.5).length,
+            pendingBuilds: (colony.buildings || []).filter((b) => b.pending).length,
+          });
+          for (const building of colony.buildings || []) {
+            for (const citizenId of building.workers || []) {
+              try {
+                const reqs = await getOpenRequests(building.x, building.y, building.z, citizenId);
+                for (const req of reqs) recordRequest(building, req);
+              } catch { /* transient */ }
+            }
+          }
+          if (cycle % 10 === 0) writeObserveReport(false);
+          if (Date.now() - observeStart > OBSERVE_MINUTES * 60000) {
+            writeObserveReport(true);
+            console.log("[observe] window complete - exiting so colony_watch restarts economy mode");
+            process.exit(0);
+          }
+          continue;
+        }
         await refreshTaughtOutputs(colony, cycle);
         totalResolved += await treatSickCitizens(colony, cycle);
         totalResolved += await feedHungryCitizens(colony, cycle);
