@@ -322,14 +322,23 @@ async function autoResearch(colony, cycle) {
 // Keep the restaurant's racks stocked with every menu food so the cook can
 // serve arrivals immediately (the built-in MinimumStock pipeline is too slow
 // at 10x and citizens loiter at the restaurant waiting to be fed).
+// Menu items the colony can bake/cook itself: the bot leaves these OUT of
+// the restaurant stocking so the MinimumStock requests reach the baker and
+// the cook (their data-driven custom recipes cover bread and the
+// minecolonies dishes; ingredient requests cascade to the cheat supply).
+// Direct emergency feeding of citizens is unchanged - this only moves the
+// restaurant's shelf-stocking onto the real economy.
+const SELF_COOKED = new Set(["minecraft:bread", ...FEED_ITEMS]);
+
 async function stockRestaurants(colony, cycle) {
   let stocked = 0;
+  const skip = encodeURIComponent([...SELF_COOKED].join(","));
   for (const building of colony.buildings || []) {
     if (building.type !== "blockhutcook" || !building.operational) continue;
     try {
       const res = await httpRequest(
         "POST",
-        `/stockRestaurant?x=${building.x}&y=${building.y}&z=${building.z}&countPerItem=32`
+        `/stockRestaurant?x=${building.x}&y=${building.y}&z=${building.z}&countPerItem=32&skip=${skip}`
       );
       if (res.status !== 200) continue;
       const given = JSON.parse(res.body).filter((i) => i.given > 0);
@@ -401,6 +410,31 @@ async function treatSickCitizens(colony, cycle) {
   return treated;
 }
 
+// The warehouse saturates (hit 6696/6696 slots, 2026-07-08) because 120
+// citizens' harvests inflow with no real outflow. When fullness passes 90%,
+// cap every item to 256 and void the surplus - couriers need dump space or
+// they wedge silently.
+async function warehouseJanitor(colony, cycle) {
+  if (cycle % 20 !== 3) return 0;
+  try {
+    const res = await httpRequest("GET", `/warehouseStats?colonyId=${colony.id}`);
+    if (res.status !== 200) return 0;
+    const whs = JSON.parse(res.body).warehouses || [];
+    if (!whs.some((w) => w.fullness >= 0.9)) return 0;
+    const trim = await httpRequest("POST", `/trimWarehouse?colonyId=${colony.id}&keepPerItem=256`);
+    if (trim.status === 200) {
+      const d = JSON.parse(trim.body);
+      console.log(
+        `[supply #${cycle}] warehouse janitor: trimmed ${d.trimmedTotal} items across ${d.trimmedTypes} types`
+      );
+      return 1;
+    }
+  } catch {
+    // transient
+  }
+  return 0;
+}
+
 async function loop() {
   let cycle = 0;
   while (true) {
@@ -443,6 +477,7 @@ async function loop() {
         totalResolved += await stockRestaurants(colony, cycle);
         totalResolved += await autoResearch(colony, cycle);
         totalResolved += await teachCrafterRecipes(colony, cycle);
+        totalResolved += await warehouseJanitor(colony, cycle);
         totalResolved += await fillBuilderHuts(colony, cycle);
         for (const building of colony.buildings) {
           if (building.workers.length === 0) continue;

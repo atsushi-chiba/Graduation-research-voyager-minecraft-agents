@@ -40,7 +40,15 @@
   "blockhutfletcher": [
     { "output": "minecraft:arrow", "count": 4, "inputs": "minecraft:flint:1,minecraft:stick:1,minecraft:feather:1" },
     { "output": "minecraft:bow", "count": 1, "inputs": "minecraft:stick:3,minecraft:string:3" },
-    { "output": "minecraft:string", "count": 4, "inputs": "minecraft:white_wool:1" }
+    { "output": "minecraft:string", "count": 4, "inputs": "minecraft:white_wool:1" },
+    { "output": "minecraft:paper", "count": 3, "inputs": "minecraft:sugar_cane:3" },
+    { "output": "minecraft:book", "count": 1, "inputs": "minecraft:paper:3,minecraft:leather:1" }
+  ],
+  "blockhutsmeltery": [
+    { "output": "minecraft:iron_ingot", "count": 1, "inputs": "minecraft:raw_iron:1", "grid": 1 },
+    { "output": "minecraft:gold_ingot", "count": 1, "inputs": "minecraft:raw_gold:1", "grid": 1 },
+    { "output": "minecraft:copper_ingot", "count": 1, "inputs": "minecraft:raw_copper:1", "grid": 1 },
+    { "output": "minecraft:charcoal", "count": 1, "inputs": "minecraft:oak_log:1", "grid": 1 }
   ],
   "blockhutmechanic": [
     { "output": "minecraft:torch", "count": 4, "inputs": "minecraft:coal:1,minecraft:stick:1" },

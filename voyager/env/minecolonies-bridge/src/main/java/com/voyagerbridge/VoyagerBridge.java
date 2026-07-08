@@ -390,6 +390,8 @@ public class VoyagerBridge {
             httpServer.createContext("/setHiringMode", this::handleSetHiringMode);
             httpServer.createContext("/setItemList", this::handleSetItemList);
             httpServer.createContext("/warehouseStats", this::handleWarehouseStats);
+            httpServer.createContext("/trimWarehouse", this::handleTrimWarehouse);
+            httpServer.createContext("/scanHoles", this::handleScanHoles);
             httpServer.createContext("/stockRestaurant", this::handleStockRestaurant);
             httpServer.createContext("/neededResources", this::handleNeededResources);
             httpServer.createContext("/fillBuilderResources", this::handleFillBuilderResources);
@@ -1193,6 +1195,13 @@ public class VoyagerBridge {
             int y = Integer.parseInt(params.get("y"));
             int z = Integer.parseInt(params.get("z"));
             int target = Integer.parseInt(params.getOrDefault("countPerItem", "32"));
+            // Menu items the colony can produce itself (baker's bread, the
+            // cook's own dishes): skipping them here leaves the restaurant's
+            // MinimumStock requests for the real economy to fulfil.
+            java.util.Set<String> stockSkip = new java.util.HashSet<>();
+            for (String s : params.getOrDefault("skip", "").split(",")) {
+                if (!s.trim().isEmpty()) stockSkip.add(s.trim());
+            }
 
             java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
             server.execute(() -> {
@@ -1235,8 +1244,9 @@ public class VoyagerBridge {
                                 have += s.getCount();
                             }
                         }
+                        ResourceLocation stKey = ForgeRegistries.ITEMS.getKey(proto.getItem());
                         int inserted = 0;
-                        int remaining = target - have;
+                        int remaining = (stKey != null && stockSkip.contains(stKey.toString())) ? 0 : target - have;
                         while (remaining > 0) {
                             int chunkSize = Math.min(remaining, proto.getMaxStackSize());
                             ItemStack chunk = proto.copy();
@@ -1606,6 +1616,129 @@ public class VoyagerBridge {
                     result.complete(json.toString());
                 } catch (Exception e) {
                     LOGGER.error("warehouseStats failed", e);
+                    result.complete("{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+                }
+            });
+            respond(exchange, 200, result.get());
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // POST /trimWarehouse?colonyId=1&keepPerItem=256[&dryRun=true]
+    //
+    // The warehouse hit 100% (6696/6696 slots) because 120 citizens' harvest
+    // inflow has no outflow in a cheat economy. Caps each distinct item to
+    // keepPerItem and voids the surplus (deletion is free here); dryRun just
+    // reports the top stacks so the caller can see what's hoarded.
+    private void handleTrimWarehouse(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+            int keep = Integer.parseInt(params.getOrDefault("keepPerItem", "256"));
+            boolean dryRun = "true".equalsIgnoreCase(params.getOrDefault("dryRun", "false"));
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
+                    if (colony == null) { result.complete("{\"error\":\"no colony\"}"); return; }
+                    java.util.Map<String, Integer> totals = new java.util.HashMap<>();
+                    java.util.Map<String, Integer> trimmed = new java.util.HashMap<>();
+                    for (IBuilding b : colony.getServerBuildingManager().getBuildings().values()) {
+                        if (!(b instanceof com.minecolonies.core.colony.buildings.workerbuildings.BuildingWareHouse wh)) continue;
+                        for (BlockPos rp : wh.getContainers()) {
+                            BlockEntity te = level.getBlockEntity(rp);
+                            if (!(te instanceof com.minecolonies.core.tileentities.TileEntityRack rack)
+                                    || te instanceof TileEntityColonyBuilding) continue;
+                            net.minecraftforge.items.IItemHandler h = rack.getInventory();
+                            for (int i = 0; i < h.getSlots(); i++) {
+                                ItemStack s = h.getStackInSlot(i);
+                                if (s.isEmpty()) continue;
+                                ResourceLocation k = ForgeRegistries.ITEMS.getKey(s.getItem());
+                                String key = k == null ? "?" : k.toString();
+                                int seen = totals.getOrDefault(key, 0);
+                                totals.put(key, seen + s.getCount());
+                                if (!dryRun && seen + s.getCount() > keep) {
+                                    int over = Math.min(s.getCount(), seen + s.getCount() - keep);
+                                    h.extractItem(i, over, false);
+                                    trimmed.merge(key, over, Integer::sum);
+                                }
+                            }
+                        }
+                    }
+                    java.util.List<java.util.Map.Entry<String, Integer>> top = new java.util.ArrayList<>(totals.entrySet());
+                    top.sort((a, b2) -> b2.getValue() - a.getValue());
+                    StringBuilder json = new StringBuilder("{\"distinctItems\":" + totals.size());
+                    json.append(",\"trimmedTypes\":").append(trimmed.size());
+                    json.append(",\"trimmedTotal\":").append(trimmed.values().stream().mapToInt(Integer::intValue).sum());
+                    json.append(",\"topItems\":[");
+                    for (int i = 0; i < Math.min(20, top.size()); i++) {
+                        if (i > 0) json.append(',');
+                        json.append("{\"item\":\"").append(escape(top.get(i).getKey()))
+                            .append("\",\"count\":").append(top.get(i).getValue()).append('}');
+                    }
+                    json.append("]}");
+                    result.complete(json.toString());
+                } catch (Exception e) {
+                    LOGGER.error("trimWarehouse failed", e);
+                    result.complete("{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+                }
+            });
+            respond(exchange, 200, result.get());
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // GET /scanHoles?minX=&minZ=&maxX=&maxZ=[&colonyId=1]
+    //
+    // Finds surface pits: columns whose top superflat layer (y=-61) is air.
+    // Columns inside any registered building's footprint are skipped -
+    // basements and active construction digs are intentional. Returns up to
+    // 2000 hole columns for a fill script to close.
+    private void handleScanHoles(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int minX = Integer.parseInt(params.getOrDefault("minX", "0"));
+            int minZ = Integer.parseInt(params.getOrDefault("minZ", "0"));
+            int maxX = Integer.parseInt(params.getOrDefault("maxX", "400"));
+            int maxZ = Integer.parseInt(params.getOrDefault("maxZ", "400"));
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
+                    java.util.List<int[]> rects = new java.util.ArrayList<>();
+                    if (colony != null) {
+                        for (IBuilding b : colony.getServerBuildingManager().getBuildings().values()) {
+                            int[] r = realFootprintRect(b);
+                            if (r != null) rects.add(r);
+                        }
+                    }
+                    StringBuilder json = new StringBuilder("{\"holes\":[");
+                    int count = 0;
+                    outer:
+                    for (int x = minX; x <= maxX; x++) {
+                        for (int z = minZ; z <= maxZ; z++) {
+                            boolean inside = false;
+                            for (int[] r : rects) {
+                                if (x >= r[0] - 1 && x <= r[2] + 1 && z >= r[1] - 1 && z <= r[3] + 1) { inside = true; break; }
+                            }
+                            if (inside) continue;
+                            BlockPos top = new BlockPos(x, -61, z);
+                            if (!com.minecolonies.api.util.WorldUtil.isBlockLoaded(level, top)) continue;
+                            if (!level.getBlockState(top).isAir()) continue;
+                            if (count > 0) json.append(',');
+                            json.append('[').append(x).append(',').append(z).append(']');
+                            if (++count >= 2000) break outer;
+                        }
+                    }
+                    json.append("],\"count\":").append(count).append('}');
+                    result.complete(json.toString());
+                } catch (Exception e) {
+                    LOGGER.error("scanHoles failed", e);
                     result.complete("{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
                 }
             });
