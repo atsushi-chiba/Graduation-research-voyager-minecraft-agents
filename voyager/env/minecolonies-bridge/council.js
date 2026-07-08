@@ -269,7 +269,19 @@ function buildCandidates(status, researchNeeds = {}) {
       }
     }
   }
-  return candidates;
+  // Shuffle everything except wait (index 0). gemma e4b has a strong
+  // low-number position bias - it declared "farms first!" while picking
+  // choice 3 - and the registry's alphabetical order put the alchemist
+  // first among placeNext options every cycle, compounding into 88
+  // alchemist placements (2026-07-07 post-mortem). Randomizing the order
+  // spreads the bias uniformly so no building type is systematically
+  // favored; the dedup/backlog governors bound the damage of any one pick.
+  const rest = candidates.slice(1);
+  for (let i = rest.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [rest[i], rest[j]] = [rest[j], rest[i]];
+  }
+  return [candidates[0], ...rest];
 }
 
 function askLLM(model, messages, { format = null } = {}) {

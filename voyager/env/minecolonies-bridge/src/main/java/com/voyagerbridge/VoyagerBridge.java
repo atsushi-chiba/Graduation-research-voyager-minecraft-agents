@@ -1057,6 +1057,36 @@ public class VoyagerBridge {
                             return;
                         }
                     }
+                    // Rack janitor + dump reserve (2026-07-07). Builders dump
+                    // CLEAR-stage debris (dug dirt/stone) into their hut racks;
+                    // if the racks are stuffed, the worker wedges in
+                    // INVENTORY_FULL forever. On lv1 frontier huts the old
+                    // fill-to-the-brim behaviour caused exactly that. Now:
+                    // (1) evict rack stacks that are NOT on the current bill of
+                    // materials (debris / stale leftovers - cheat economy, no
+                    // loss that matters), (2) never fill past a reserve of
+                    // empty slots kept free for the builder's dumps.
+                    final int DUMP_RESERVE_SLOTS = 9;
+                    int evicted = 0;
+                    if (fill) {
+                        java.util.List<ItemStack> neededProtos = new java.util.ArrayList<>();
+                        for (com.minecolonies.core.colony.buildings.utils.BuildingBuilderResource r
+                                : sb.getNeededResources().values()) {
+                            neededProtos.add(r.getItemStack());
+                        }
+                        for (int slot = 0; slot < handler.getSlots(); slot++) {
+                            ItemStack s = handler.getStackInSlot(slot);
+                            if (s.isEmpty()) continue;
+                            boolean needed0 = false;
+                            for (ItemStack p : neededProtos) {
+                                if (ItemStack.isSameItemSameTags(s, p)) { needed0 = true; break; }
+                            }
+                            if (!needed0) {
+                                evicted += s.getCount();
+                                handler.extractItem(slot, s.getCount(), false);
+                            }
+                        }
+                    }
                     StringBuilder json = new StringBuilder("[");
                     boolean first = true;
                     for (com.minecolonies.core.colony.buildings.utils.BuildingBuilderResource res
@@ -1083,6 +1113,11 @@ public class VoyagerBridge {
                         if (fill && needed > available) {
                             int remaining = needed - available;
                             while (remaining > 0) {
+                                int emptySlots = 0;
+                                for (int slot = 0; slot < handler.getSlots(); slot++) {
+                                    if (handler.getStackInSlot(slot).isEmpty()) emptySlots++;
+                                }
+                                if (emptySlots <= DUMP_RESERVE_SLOTS) break; // keep dump space
                                 int chunkSize = Math.min(remaining, proto.getMaxStackSize());
                                 ItemStack chunk = proto.copy();
                                 chunk.setCount(chunkSize);
