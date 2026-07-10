@@ -312,6 +312,30 @@ async function teachCrafterRecipes(colony, cycle) {
   return taught;
 }
 
+// Skill-optimal job assignment. MineColonies' own auto-hire fills open slots
+// with an arbitrary jobless citizen; /autoAssignJobs instead matches the
+// best-skilled unemployed to each open civilian slot (respecting MANUAL
+// decommissions). Auto-hire usually wins the race for a single slot, so this
+// mainly earns its keep when a batch of new buildings opens several slots at
+// once. Silent unless it actually assigns someone.
+async function autoAssignJobs(colony, cycle) {
+  if (cycle % 20 !== 11) return 0;
+  try {
+    const res = await httpRequest("POST", `/autoAssignJobs?colonyId=${colony.id}&max=10`);
+    if (res.status !== 200) return 0;
+    const d = JSON.parse(res.body);
+    if (d.assigned > 0) {
+      console.log(
+        `[supply #${cycle}] skill-matched ${d.assigned} unemployed to jobs: ` +
+          d.assignments.map((a) => `${a.name}→${a.to.split("@")[0]}`).join(", ")
+      );
+    }
+    return d.assigned || 0;
+  } catch {
+    return 0;
+  }
+}
+
 // Research progresses on its own once started (the university researcher
 // works it down), but finished research frees slots and unlocks children -
 // periodically ask the bridge to start whatever is startable next. Item
@@ -506,6 +530,7 @@ async function loop() {
         totalResolved += await feedHungryCitizens(colony, cycle);
         totalResolved += await stockRestaurants(colony, cycle);
         totalResolved += await autoResearch(colony, cycle);
+        totalResolved += await autoAssignJobs(colony, cycle);
         totalResolved += await teachCrafterRecipes(colony, cycle);
         totalResolved += await warehouseJanitor(colony, cycle);
         totalResolved += await fillBuilderHuts(colony, cycle);

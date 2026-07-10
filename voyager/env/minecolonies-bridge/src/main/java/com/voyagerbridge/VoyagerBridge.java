@@ -402,6 +402,8 @@ public class VoyagerBridge {
             httpServer.createContext("/debugFarm", this::handleDebugFarm);
             httpServer.createContext("/debugBuilder", this::handleDebugBuilder);
             httpServer.createContext("/assignWorker", this::handleAssignWorker);
+            httpServer.createContext("/citizenSkills", this::handleCitizenSkills);
+            httpServer.createContext("/autoAssignJobs", this::handleAutoAssignJobs);
             httpServer.createContext("/research", this::handleResearch);
             httpServer.createContext("/startResearch", this::handleStartResearch);
             httpServer.createContext("/autoResearch", this::handleAutoResearch);
@@ -2386,6 +2388,176 @@ public class VoyagerBridge {
     // hire/fire buttons call IAssignsJob.assignCitizen/removeCitizen). With
     // fire=true just removes them. Needed because MineColonies only auto-hires
     // UNEMPLOYED citizens - reassigning an employed one is a GUI-only action.
+    private static final com.minecolonies.api.entity.citizen.Skill[] ALL_SKILLS =
+        com.minecolonies.api.entity.citizen.Skill.values();
+
+    // Buildings whose worker slots are combat / training / children / students -
+    // excluded from the civilian job matcher. Their own auto-hire handles them.
+    private static final java.util.Set<String> NON_CIVILIAN_BUILDINGS = java.util.Set.of(
+        "blockhutguardtower", "blockhutbarracks", "blockhutbarrackstower",
+        "blockhutcombatacademy", "blockhutarchery", "blockhutgatehouse",
+        "blockhutstable", "blockhutschool", "blockhutlibrary");
+
+    // GET /citizenSkills?colonyId=1 - read-only. Every citizen's id/name/child
+    // flag/jobless flag/workplace + all 11 skill levels. This is the "see the
+    // unemployed's stats" view; also the matcher's raw input.
+    private void handleCitizenSkills(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
+                    if (colony == null) { result.complete("{\"error\":\"no colony\"}"); return; }
+                    StringBuilder json = new StringBuilder("{\"citizens\":[");
+                    boolean firstC = true;
+                    for (ICitizenData cd : colony.getCitizenManager().getCitizens()) {
+                        if (!firstC) json.append(',');
+                        firstC = false;
+                        String workBlock = "null";
+                        if (cd.getWorkBuilding() != null) {
+                            ResourceLocation k = ForgeRegistries.BLOCKS.getKey(
+                                level.getBlockState(cd.getWorkBuilding().getPosition()).getBlock());
+                            if (k != null) workBlock = "\"" + escape(k.getPath()) + "\"";
+                        }
+                        json.append("{\"id\":").append(cd.getId())
+                            .append(",\"name\":\"").append(escape(cd.getName())).append('"')
+                            .append(",\"child\":").append(cd.isChild())
+                            .append(",\"jobless\":").append(cd.getJob() == null)
+                            .append(",\"workBuilding\":").append(workBlock)
+                            .append(",\"skills\":{");
+                        com.minecolonies.api.entity.citizen.citizenhandlers.ICitizenSkillHandler sh =
+                            cd.getCitizenSkillHandler();
+                        boolean firstS = true;
+                        for (com.minecolonies.api.entity.citizen.Skill sk : ALL_SKILLS) {
+                            if (!firstS) json.append(',');
+                            firstS = false;
+                            json.append('"').append(sk.name()).append("\":").append(sh.getLevel(sk));
+                        }
+                        json.append("}}");
+                    }
+                    json.append("]}");
+                    result.complete(json.toString());
+                } catch (Exception e) {
+                    LOGGER.error("citizenSkills failed", e);
+                    result.complete("{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+                }
+            });
+            respond(exchange, 200, result.get());
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // POST /autoAssignJobs?colonyId=1[&max=20][&dryRun=true]
+    //
+    // Skill-optimal job assignment: MineColonies' own auto-hire grabs an
+    // ARBITRARY jobless citizen (getJoblessCitizen), ignoring skills. This
+    // matches unemployed adults to open civilian worker slots by fit score
+    // 2*primary + secondary (primary-weighted, mirroring MineColonies' own
+    // primary-centric levelling), greedy best-first. Runs server-side so it
+    // holds the exact module reference and assigns to the right module even in
+    // multi-module huts. Combat/training/children/student buildings excluded.
+    private void handleAutoAssignJobs(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+            int max = Integer.parseInt(params.getOrDefault("max", "20"));
+            boolean dryRun = "true".equalsIgnoreCase(params.getOrDefault("dryRun", "false"));
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
+                    if (colony == null) { result.complete("{\"error\":\"no colony\"}"); return; }
+
+                    // Unemployed adults.
+                    java.util.List<ICitizenData> unemployed = new java.util.ArrayList<>();
+                    for (ICitizenData cd : colony.getCitizenManager().getCitizens()) {
+                        if (cd.getJob() == null && !cd.isChild()) unemployed.add(cd);
+                    }
+                    // Open civilian slots.
+                    class Slot {
+                        com.minecolonies.core.colony.buildings.modules.WorkerBuildingModule m;
+                        com.minecolonies.api.entity.citizen.Skill primary, secondary;
+                        String building; int open;
+                    }
+                    java.util.List<Slot> slots = new java.util.ArrayList<>();
+                    for (IBuilding b : colony.getServerBuildingManager().getBuildings().values()) {
+                        if (b.getBuildingLevel() <= 0) continue;
+                        ResourceLocation bk = ForgeRegistries.BLOCKS.getKey(
+                            level.getBlockState(b.getPosition()).getBlock());
+                        String bpath = bk == null ? "" : bk.getPath();
+                        if (NON_CIVILIAN_BUILDINGS.contains(bpath)) continue;
+                        for (com.minecolonies.core.colony.buildings.modules.WorkerBuildingModule m
+                                : b.getModulesByType(com.minecolonies.core.colony.buildings.modules.WorkerBuildingModule.class)) {
+                            if (m instanceof com.minecolonies.core.colony.buildings.modules.GuardBuildingModule) continue;
+                            if (m instanceof com.minecolonies.core.colony.buildings.modules.ChildrenBuildingModule) continue;
+                            if (m.getPrimarySkill() == com.minecolonies.api.entity.citizen.Skill.Intelligence) continue; // student
+                            // MANUAL = operator deliberately decommissioned this slot
+                            // (e.g. the surplus alchemists); don't re-fill it.
+                            if (m.getHiringMode() == com.minecolonies.api.colony.buildings.HiringMode.MANUAL) continue;
+                            int open = m.getModuleMax() - m.getAssignedCitizen().size();
+                            if (open <= 0) continue;
+                            Slot s = new Slot();
+                            s.m = m; s.primary = m.getPrimarySkill(); s.secondary = m.getSecondarySkill();
+                            s.building = bpath + "@" + b.getPosition().toShortString(); s.open = open;
+                            slots.add(s);
+                        }
+                    }
+
+                    // All (citizen, slot) pairs by descending fit; greedy assign.
+                    class Pair { ICitizenData c; Slot s; int score; }
+                    java.util.List<Pair> pairs = new java.util.ArrayList<>();
+                    for (ICitizenData c : unemployed) {
+                        com.minecolonies.api.entity.citizen.citizenhandlers.ICitizenSkillHandler sh = c.getCitizenSkillHandler();
+                        for (Slot s : slots) {
+                            Pair p = new Pair();
+                            p.c = c; p.s = s;
+                            p.score = 2 * sh.getLevel(s.primary) + sh.getLevel(s.secondary);
+                            pairs.add(p);
+                        }
+                    }
+                    pairs.sort((a, b2) -> b2.score - a.score);
+
+                    java.util.Set<Integer> usedCitizens = new java.util.HashSet<>();
+                    StringBuilder assignedJson = new StringBuilder();
+                    int assigned = 0;
+                    boolean firstA = true;
+                    for (Pair p : pairs) {
+                        if (assigned >= max) break;
+                        if (usedCitizens.contains(p.c.getId()) || p.s.open <= 0) continue;
+                        boolean ok = dryRun || p.s.m.assignCitizen(p.c);
+                        if (!ok) continue;
+                        usedCitizens.add(p.c.getId());
+                        p.s.open--;
+                        assigned++;
+                        if (!firstA) assignedJson.append(',');
+                        firstA = false;
+                        assignedJson.append("{\"citizen\":").append(p.c.getId())
+                            .append(",\"name\":\"").append(escape(p.c.getName())).append('"')
+                            .append(",\"to\":\"").append(escape(p.s.building)).append('"')
+                            .append(",\"primary\":\"").append(p.s.primary.name()).append('"')
+                            .append(",\"score\":").append(p.score).append('}');
+                    }
+                    result.complete("{\"dryRun\":" + dryRun
+                        + ",\"unemployed\":" + unemployed.size()
+                        + ",\"openSlots\":" + slots.size()
+                        + ",\"assigned\":" + assigned
+                        + ",\"assignments\":[" + assignedJson + "]}");
+                } catch (Exception e) {
+                    LOGGER.error("autoAssignJobs failed", e);
+                    result.complete("{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+                }
+            });
+            respond(exchange, 200, result.get());
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
     private void handleAssignWorker(HttpExchange exchange) throws IOException {
         if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
             respond(exchange, 405, "{\"error\":\"use POST\"}");
