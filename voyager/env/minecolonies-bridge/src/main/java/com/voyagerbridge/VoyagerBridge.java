@@ -2391,6 +2391,15 @@ public class VoyagerBridge {
     private static final com.minecolonies.api.entity.citizen.Skill[] ALL_SKILLS =
         com.minecolonies.api.entity.citizen.Skill.values();
 
+    // Job-fit score: primary double-weighted (mirrors MineColonies' own
+    // primary-centric levelling), secondary breaks ties.
+    private int fitScore(ICitizenData c, com.minecolonies.api.entity.citizen.Skill primary,
+                         com.minecolonies.api.entity.citizen.Skill secondary) {
+        com.minecolonies.api.entity.citizen.citizenhandlers.ICitizenSkillHandler sh =
+            c.getCitizenSkillHandler();
+        return 2 * sh.getLevel(primary) + sh.getLevel(secondary);
+    }
+
     // Buildings whose worker slots are combat / training / children / students -
     // excluded from the civilian job matcher. Their own auto-hire handles them.
     private static final java.util.Set<String> NON_CIVILIAN_BUILDINGS = java.util.Set.of(
@@ -2466,6 +2475,8 @@ public class VoyagerBridge {
             int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
             int max = Integer.parseInt(params.getOrDefault("max", "20"));
             boolean dryRun = "true".equalsIgnoreCase(params.getOrDefault("dryRun", "false"));
+            boolean reassign = "true".equalsIgnoreCase(params.getOrDefault("reassign", "false"));
+            int threshold = Integer.parseInt(params.getOrDefault("threshold", "10"));
             java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
             server.execute(() -> {
                 try {
@@ -2473,12 +2484,14 @@ public class VoyagerBridge {
                     IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
                     if (colony == null) { result.complete("{\"error\":\"no colony\"}"); return; }
 
-                    // Unemployed adults.
-                    java.util.List<ICitizenData> unemployed = new java.util.ArrayList<>();
+                    // Assignable pool: unemployed adults.
+                    java.util.List<ICitizenData> pool = new java.util.ArrayList<>();
                     for (ICitizenData cd : colony.getCitizenManager().getCitizens()) {
-                        if (cd.getJob() == null && !cd.isChild()) unemployed.add(cd);
+                        if (cd.getJob() == null && !cd.isChild()) pool.add(cd);
                     }
-                    // Open civilian slots.
+                    int unemployedCount = pool.size();
+
+                    // Every civilian assignment slot (open or filled).
                     class Slot {
                         com.minecolonies.core.colony.buildings.modules.WorkerBuildingModule m;
                         com.minecolonies.api.entity.citizen.Skill primary, secondary;
@@ -2496,57 +2509,101 @@ public class VoyagerBridge {
                             if (m instanceof com.minecolonies.core.colony.buildings.modules.GuardBuildingModule) continue;
                             if (m instanceof com.minecolonies.core.colony.buildings.modules.ChildrenBuildingModule) continue;
                             if (m.getPrimarySkill() == com.minecolonies.api.entity.citizen.Skill.Intelligence) continue; // student
-                            // MANUAL = operator deliberately decommissioned this slot
-                            // (e.g. the surplus alchemists); don't re-fill it.
+                            // MANUAL = operator deliberately decommissioned this slot.
                             if (m.getHiringMode() == com.minecolonies.api.colony.buildings.HiringMode.MANUAL) continue;
-                            int open = m.getModuleMax() - m.getAssignedCitizen().size();
-                            if (open <= 0) continue;
                             Slot s = new Slot();
                             s.m = m; s.primary = m.getPrimarySkill(); s.secondary = m.getSecondarySkill();
-                            s.building = bpath + "@" + b.getPosition().toShortString(); s.open = open;
+                            s.building = bpath + "@" + b.getPosition().toShortString();
+                            s.open = m.getModuleMax() - m.getAssignedCitizen().size();
                             slots.add(s);
                         }
                     }
 
-                    // All (citizen, slot) pairs by descending fit; greedy assign.
-                    class Pair { ICitizenData c; Slot s; int score; }
-                    java.util.List<Pair> pairs = new java.util.ArrayList<>();
-                    for (ICitizenData c : unemployed) {
-                        com.minecolonies.api.entity.citizen.citizenhandlers.ICitizenSkillHandler sh = c.getCitizenSkillHandler();
+                    java.util.Set<Integer> used = new java.util.HashSet<>();
+                    StringBuilder acts = new StringBuilder();
+                    boolean firstAct = true;
+                    int filled = 0, swapped = 0;
+
+                    // Phase 1: fill OPEN slots from the pool, best-fit first.
+                    class FillPair { ICitizenData c; Slot s; int score; }
+                    java.util.List<FillPair> fills = new java.util.ArrayList<>();
+                    for (ICitizenData c : pool) {
                         for (Slot s : slots) {
-                            Pair p = new Pair();
-                            p.c = c; p.s = s;
-                            p.score = 2 * sh.getLevel(s.primary) + sh.getLevel(s.secondary);
-                            pairs.add(p);
+                            if (s.open <= 0) continue;
+                            FillPair fp = new FillPair();
+                            fp.c = c; fp.s = s; fp.score = fitScore(c, s.primary, s.secondary);
+                            fills.add(fp);
                         }
                     }
-                    pairs.sort((a, b2) -> b2.score - a.score);
-
-                    java.util.Set<Integer> usedCitizens = new java.util.HashSet<>();
-                    StringBuilder assignedJson = new StringBuilder();
-                    int assigned = 0;
-                    boolean firstA = true;
-                    for (Pair p : pairs) {
-                        if (assigned >= max) break;
-                        if (usedCitizens.contains(p.c.getId()) || p.s.open <= 0) continue;
-                        boolean ok = dryRun || p.s.m.assignCitizen(p.c);
-                        if (!ok) continue;
-                        usedCitizens.add(p.c.getId());
-                        p.s.open--;
-                        assigned++;
-                        if (!firstA) assignedJson.append(',');
-                        firstA = false;
-                        assignedJson.append("{\"citizen\":").append(p.c.getId())
-                            .append(",\"name\":\"").append(escape(p.c.getName())).append('"')
-                            .append(",\"to\":\"").append(escape(p.s.building)).append('"')
-                            .append(",\"primary\":\"").append(p.s.primary.name()).append('"')
-                            .append(",\"score\":").append(p.score).append('}');
+                    fills.sort((a, b2) -> b2.score - a.score);
+                    for (FillPair fp : fills) {
+                        if (filled + swapped >= max) break;
+                        if (used.contains(fp.c.getId()) || fp.s.open <= 0) continue;
+                        if (!dryRun && !fp.s.m.assignCitizen(fp.c)) continue;
+                        used.add(fp.c.getId());
+                        fp.s.open--;
+                        filled++;
+                        if (!firstAct) acts.append(',');
+                        firstAct = false;
+                        acts.append("{\"action\":\"fill\",\"citizen\":").append(fp.c.getId())
+                            .append(",\"name\":\"").append(escape(fp.c.getName())).append('"')
+                            .append(",\"to\":\"").append(escape(fp.s.building)).append('"')
+                            .append(",\"score\":").append(fp.score).append('}');
                     }
+
+                    // Phase 2: reassignment. MineColonies auto-hire assigned workers
+                    // arbitrarily; replace a slot's weakest occupant with a clearly
+                    // better pool member (fit improvement >= threshold). The fired
+                    // worker returns jobless and is re-placed on a later pass.
+                    if (reassign) {
+                        class Swap { ICitizenData in, out; Slot s; int imp; }
+                        java.util.List<Swap> swaps = new java.util.ArrayList<>();
+                        for (Slot s : slots) {
+                            java.util.List<ICitizenData> occ = s.m.getAssignedCitizen();
+                            if (occ.isEmpty()) continue;
+                            ICitizenData weakest = null; int weakFit = Integer.MAX_VALUE;
+                            for (ICitizenData o : occ) {
+                                int f = fitScore(o, s.primary, s.secondary);
+                                if (f < weakFit) { weakFit = f; weakest = o; }
+                            }
+                            for (ICitizenData c : pool) {
+                                int imp = fitScore(c, s.primary, s.secondary) - weakFit;
+                                if (imp >= threshold) {
+                                    Swap sw = new Swap();
+                                    sw.in = c; sw.out = weakest; sw.s = s; sw.imp = imp;
+                                    swaps.add(sw);
+                                }
+                            }
+                        }
+                        swaps.sort((a, b2) -> b2.imp - a.imp);
+                        java.util.Set<Integer> displaced = new java.util.HashSet<>();
+                        for (Swap sw : swaps) {
+                            if (filled + swapped >= max) break;
+                            if (used.contains(sw.in.getId()) || displaced.contains(sw.out.getId())) continue;
+                            if (!sw.s.m.getAssignedCitizen().contains(sw.out)) continue;
+                            if (!dryRun) {
+                                sw.s.m.removeCitizen(sw.out);
+                                if (!sw.s.m.assignCitizen(sw.in)) { sw.s.m.assignCitizen(sw.out); continue; }
+                            }
+                            used.add(sw.in.getId());
+                            displaced.add(sw.out.getId());
+                            swapped++;
+                            if (!firstAct) acts.append(',');
+                            firstAct = false;
+                            acts.append("{\"action\":\"swap\",\"in\":\"").append(escape(sw.in.getName()))
+                                .append("\",\"out\":\"").append(escape(sw.out.getName()))
+                                .append("\",\"at\":\"").append(escape(sw.s.building))
+                                .append("\",\"improvement\":").append(sw.imp).append('}');
+                        }
+                    }
+
                     result.complete("{\"dryRun\":" + dryRun
-                        + ",\"unemployed\":" + unemployed.size()
-                        + ",\"openSlots\":" + slots.size()
-                        + ",\"assigned\":" + assigned
-                        + ",\"assignments\":[" + assignedJson + "]}");
+                        + ",\"reassign\":" + reassign
+                        + ",\"unemployed\":" + unemployedCount
+                        + ",\"civilianSlots\":" + slots.size()
+                        + ",\"filled\":" + filled
+                        + ",\"swapped\":" + swapped
+                        + ",\"actions\":[" + acts + "]}");
                 } catch (Exception e) {
                     LOGGER.error("autoAssignJobs failed", e);
                     result.complete("{\"error\":\"" + escape(String.valueOf(e)) + "\"}");

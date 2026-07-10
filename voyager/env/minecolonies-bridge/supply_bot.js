@@ -321,16 +321,23 @@ async function teachCrafterRecipes(colony, cycle) {
 async function autoAssignJobs(colony, cycle) {
   if (cycle % 20 !== 11) return 0;
   try {
-    const res = await httpRequest("POST", `/autoAssignJobs?colonyId=${colony.id}&max=10`);
+    // reassign=true: also swap a slot's weakest occupant for a clearly-better
+    // unemployed one (fit improvement >= threshold). Converges - displaced
+    // low-fit workers cascade to jobs they suit, and stops when no swap clears
+    // the threshold. This is what turns MineColonies' arbitrary auto-hire into
+    // skill-based staffing over time.
+    const res = await httpRequest(
+      "POST",
+      `/autoAssignJobs?colonyId=${colony.id}&reassign=true&threshold=10&max=10`
+    );
     if (res.status !== 200) return 0;
     const d = JSON.parse(res.body);
-    if (d.assigned > 0) {
+    if (d.filled > 0 || d.swapped > 0) {
       console.log(
-        `[supply #${cycle}] skill-matched ${d.assigned} unemployed to jobs: ` +
-          d.assignments.map((a) => `${a.name}→${a.to.split("@")[0]}`).join(", ")
+        `[supply #${cycle}] job matcher: filled ${d.filled}, swapped ${d.swapped} for skill fit`
       );
     }
-    return d.assigned || 0;
+    return (d.filled || 0) + (d.swapped || 0);
   } catch {
     return 0;
   }
