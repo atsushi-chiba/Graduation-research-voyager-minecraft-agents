@@ -252,6 +252,63 @@ async function fillBuilderHuts(colony, cycle) {
 // /teachRecipe is idempotent ("already taught" is a success).
 const CRAFTER_RECIPES = require("./crafter_recipes.json");
 
+// ---- Bottleneck-driven demand signal ----
+// The colony's real demand is invisible in economy mode because supply_bot
+// fulfils every request. But it SEES every request as it fulfils them, so it
+// can tally what's actually consumed and, via the item->producer map, tell the
+// mayor which producer buildings to build/upgrade. Written to demand.json;
+// council.js reads it and annotates its build menu. This is the data-driven
+// build-priority the observation window was meant to inform.
+//
+// item -> producer building, derived from crafter_recipes.json (what each
+// crafter is taught to make) plus farm/food staples the world can grow.
+const ITEM_PRODUCER = {};
+for (const [buildingType, recipes] of Object.entries(CRAFTER_RECIPES)) {
+  if (buildingType.startsWith("_")) continue;
+  const key = buildingType.replace(/^blockhut/, "");
+  for (const r of recipes) if (r.output) ITEM_PRODUCER[r.output] = key;
+}
+Object.assign(ITEM_PRODUCER, {
+  "minecraft:carrot": "farmer", "minecraft:wheat": "farmer", "minecraft:potato": "farmer",
+  "minecraft:wheat_seeds": "farmer", "minecraft:beetroot": "farmer", "minecraft:pumpkin": "farmer",
+  "minecraft:melon_slice": "farmer", "minecraft:sugar_cane": "farmer",
+  "minecraft:cooked_beef": "cook", "minecraft:cooked_porkchop": "cook", "minecraft:cooked_chicken": "cook",
+  "minecraft:cooked_mutton": "cook", "minecraft:cod": "fisherman", "minecraft:salmon": "fisherman",
+  "minecraft:cooked_cod": "fisherman", "minecraft:cooked_salmon": "fisherman",
+  "minecraft:leather": "cowboy", "minecraft:beef": "cowboy", "minecraft:porkchop": "swineherder",
+  "minecraft:mutton": "shepherd", "minecraft:white_wool": "shepherd", "minecraft:rabbit": "rabbithutch",
+  "minecraft:oak_log": "lumberjack", "minecraft:oak_sapling": "lumberjack",
+});
+
+const demandTally = new Map(); // item -> decayed weighted count
+function recordDemand(item, weight) {
+  if (!item) return;
+  demandTally.set(item, (demandTally.get(item) || 0) + weight);
+}
+function writeDemand() {
+  // Aggregate item demand into producer-building scores.
+  const byBuilding = new Map();
+  const topItems = [];
+  for (const [item, cnt] of demandTally) {
+    if (cnt < 1) continue;
+    topItems.push({ item, count: Math.round(cnt) });
+    const prod = ITEM_PRODUCER[item];
+    if (prod) byBuilding.set(prod, (byBuilding.get(prod) || 0) + cnt);
+  }
+  topItems.sort((a, b) => b.count - a.count);
+  const buildingPriority = [...byBuilding.entries()]
+    .map(([building, score]) => ({ building, score: Math.round(score) }))
+    .sort((a, b) => b.score - a.score);
+  try {
+    require("fs").writeFileSync(
+      `${__dirname}/demand.json`,
+      JSON.stringify({ updated: Date.now(), buildingPriority, topItems: topItems.slice(0, 20) })
+    );
+  } catch {
+    /* non-fatal */
+  }
+}
+
 // The colony's own production economy. Items some crafter has been TAUGHT
 // are left to the request system: excluded from the builder bulk-fill (so
 // builders file real requests), and their requests are NOT cheat-resolved
@@ -520,6 +577,12 @@ async function loop() {
   while (true) {
     cycle++;
     rescueElevatedVisitors();
+    // Decay the demand tally into a rolling ~30-cycle window, then publish.
+    for (const [item, cnt] of demandTally) {
+      const d = cnt * 0.95;
+      if (d < 0.5) demandTally.delete(item); else demandTally.set(item, d);
+    }
+    if (cycle % 10 === 0) writeDemand();
     try {
       const colonies = await getStatus();
       let totalResolved = 0;
@@ -580,6 +643,7 @@ async function loop() {
 
             for (const req of requests) {
               if (!req.item || req.count <= 0) continue;
+              recordDemand(req.item, req.count > 0 ? 1 : 0); // every request is a demand signal
               try {
                 if (req.textured && req.materials && req.materials.length > 0) {
                   // Textured (Domum Ornamentum framed-block): give each raw material
@@ -610,6 +674,7 @@ async function loop() {
                     console.log(
                       `[supply #${cycle}] crafter economy missed ${req.item} x${req.count} for citizen ${citizenId} - cheating it in`
                     );
+                    recordDemand(req.item, 3); // a missed craft is a strong "need more capacity" signal
                     deferredSince.delete(sig);
                   }
                   // Plain material request: give item then close the request.

@@ -198,7 +198,23 @@ async function getResearchNeeds() {
 
 // Enumerate every action that makes sense against the current status.
 // Index 0 is always wait so an out-of-range choice degrades to a no-op.
-function buildCandidates(status, researchNeeds = {}) {
+// Read the demand signal supply_bot publishes (item shortfalls mapped to the
+// producer buildings that would relieve them). Reloaded every turn so the
+// mayor's build priorities track live consumption.
+function readDemand() {
+  try {
+    const d = JSON.parse(fs.readFileSync(path.join(__dirname, "demand.json"), "utf8"));
+    const rank = {};
+    (d.buildingPriority || []).forEach((b, i) => {
+      rank[b.building] = { rank: i + 1, score: b.score };
+    });
+    return { rank, top: d.buildingPriority || [] };
+  } catch {
+    return { rank: {}, top: [] };
+  }
+}
+
+function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
   const candidates = [{ label: "wait(様子見。建設中で他にやることがない時のみ)", action: { action: "wait" } }];
   const colony = status[0];
   if (colony) {
@@ -260,8 +276,10 @@ function buildCandidates(status, researchNeeds = {}) {
         const rn = researchNeeds[key];
         const unlock = rn && b.level < rn.level
           ? `(さらに lv${rn.level} で研究「${rn.research}」が解禁される)` : "";
+        const dem = demandRank[key];
+        const demand = dem ? `【需要↑ ${dem.rank}位: この生産を増強すべき】` : "";
         candidates.push({
-          label: `requestBuild ${b.type} @(${b.x},${b.y},${b.z}) lv${b.level}→lv${b.level + 1}にアップグレード${effect ? "(効果: " + effect + ")" : ""}${unlock}`,
+          label: `requestBuild ${b.type} @(${b.x},${b.y},${b.z}) lv${b.level}→lv${b.level + 1}にアップグレード${effect ? "(効果: " + effect + ")" : ""}${unlock}${demand}`,
           action: { action: "requestBuild", x: b.x, y: b.y, z: b.z },
         });
       }
@@ -287,8 +305,10 @@ function buildCandidates(status, researchNeeds = {}) {
         if (existingTypes.has(regKey)) continue;
         const rn = researchNeeds[regKey];
         const unlock = rn ? `(建てると研究「${rn.research}」の解禁に近づく)` : "";
+        const dem = demandRank[regKey];
+        const demand = dem ? `【不足解消 需要↑ ${dem.rank}位】` : "";
         candidates.push({
-          label: `placeNext ${v.block}(${v.job || "-"}: ${(v.role || "").slice(0, 40)}) 新設を配置${unlock}`,
+          label: `placeNext ${v.block}(${v.job || "-"}: ${(v.role || "").slice(0, 40)}) 新設を配置${unlock}${demand}`,
           action: { action: "placeNext", block: v.block },
         });
       }
@@ -378,7 +398,9 @@ function buildGovernorSystemPrompt(gov) {
 }
 
 async function governorTurn(gov, history, status) {
-  const candidates = buildCandidates(status);
+  const researchNeeds = await getResearchNeeds();
+  const demand = readDemand();
+  const candidates = buildCandidates(status, researchNeeds, demand.rank);
   const menu = candidates.map((c, i) => `${i}: ${c.label}`).join("\n");
   // Pre-computed hints: small models don't reliably derive these from the
   // raw status JSON, and the housing deficit drives the top-priority rule.
@@ -389,6 +411,10 @@ async function governorTurn(gov, history, status) {
     const pop = (colony.citizens || []).length;
     const pending = (colony.buildings || []).filter((b) => b.pending).length;
     hint = `\n[HINT] 市民${pop}人/住居容量${cap}人${pop > cap ? ` → 住居が${pop - cap}人分不足!住居の新設/アップグレードを優先` : "(充足)"}、建設中(pending)${pending}件`;
+    if (demand.top.length > 0) {
+      hint += `\n[DEMAND] 今コロニーで不足しがちな物を作る建物(上位・これらの新設/増強を優先): `
+        + demand.top.slice(0, 5).map((b, i) => `${i + 1}位 ${b.building}`).join(", ");
+    }
   }
   const userMsg = `[STATE] anchor ${ANCHOR.x},${ANCHOR.y},${ANCHOR.z}\ncolonies: ${JSON.stringify(status)}${hint}\n直近の会話: ${sharedChatLog
     .slice(-8)
