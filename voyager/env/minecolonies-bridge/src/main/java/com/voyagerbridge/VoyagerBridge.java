@@ -105,6 +105,7 @@ public class VoyagerBridge {
         keepColoniesActive();
         keepBuildSitesLoaded();
         tickrateGovernor();
+        rescueVoidFallers();
         int mult = tickMultiplier;
         if (mult <= 1 || server == null) return;
         java.lang.reflect.Field f = resolveNextTickTimeField(server);
@@ -199,6 +200,40 @@ public class VoyagerBridge {
             });
         } catch (Exception e) {
             LOGGER.warn("keepBuildSitesLoaded failed: {}", e.toString());
+        }
+    }
+
+    // A citizen that slips below the world (into the void under the superflat
+    // bedrock at y=-64) would keep falling to void-damage death. Checked every
+    // ~0.5s in-process (fast enough - void damage only starts far below, and a
+    // poll-based rescue at the 6s supply_bot cadence would miss fast falls):
+    // any citizen below THRESHOLD is teleported back to its home (or work, or
+    // colony centre) at the surface, with fall state reset so it lands safely.
+    private int voidRescueCounter = 0;
+    private static final double VOID_RESCUE_Y = -70.0;
+
+    private void rescueVoidFallers() {
+        if (server == null || ++voidRescueCounter < 10) return;
+        voidRescueCounter = 0;
+        try {
+            for (IColony colony : IColonyManager.getInstance().getAllColonies()) {
+                BlockPos center = colony.getCenter();
+                for (ICitizenData cd : colony.getCitizenManager().getCitizens()) {
+                    java.util.Optional<com.minecolonies.api.entity.citizen.AbstractEntityCitizen> opt = cd.getEntity();
+                    if (opt.isEmpty()) continue;
+                    com.minecolonies.api.entity.citizen.AbstractEntityCitizen ent = opt.get();
+                    if (ent.getY() >= VOID_RESCUE_Y) continue;
+                    BlockPos t = cd.getHomeBuilding() != null ? cd.getHomeBuilding().getPosition()
+                        : (cd.getWorkBuilding() != null ? cd.getWorkBuilding().getPosition() : center);
+                    ent.teleportTo(t.getX() + 0.5, t.getY() + 1, t.getZ() + 0.5);
+                    ent.setDeltaMovement(0.0, 0.0, 0.0);
+                    ent.fallDistance = 0.0f; // no fall damage on landing
+                    LOGGER.info("[voidrescue] {} fell below y={}, returned to {}",
+                        cd.getName(), VOID_RESCUE_Y, t.toShortString());
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.warn("rescueVoidFallers failed: {}", e.toString());
         }
     }
 
