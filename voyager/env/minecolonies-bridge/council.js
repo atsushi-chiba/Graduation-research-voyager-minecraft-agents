@@ -206,7 +206,17 @@ function buildCandidates(status, researchNeeds = {}) {
     // picks it every single turn and the population runs away past housing.
     const housing = housingCapacity(colony);
     const pop = (colony.citizens || []).length;
-    if (pop < housing) {
+    // Population balance: every residence built OR upgraded adds a citizen, so
+    // housing growth IS population growth. When too many are already jobless,
+    // freeze all population levers (spawn, new residence, residence upgrade) -
+    // the mayor should build WORKPLACES to absorb the surplus first, then
+    // housing unfreezes. Without this, housing runs ahead of jobs indefinitely.
+    const unemployedCount = (colony.citizens || []).filter(
+      (c) => c.job === "unemployed" || !c.job
+    ).length;
+    const HOUSING_UNEMPLOYMENT_CAP = 12;
+    const housingFrozen = unemployedCount > HOUSING_UNEMPLOYMENT_CAP;
+    if (pop < housing && !housingFrozen) {
       candidates.push({
         label: `spawnCitizen(市民を1人追加。住居容量 ${housing} に空きあり)`,
         action: { action: "spawnCitizen", colonyId: COLONY_ID },
@@ -237,6 +247,9 @@ function buildCandidates(status, researchNeeds = {}) {
           label: `requestBuild ${b.type} @(${b.x},${b.y},${b.z}) 未着工→着工させる(重要)`,
           action: { action: "requestBuild", x: b.x, y: b.y, z: b.z },
         });
+      } else if (b.type === "blockhutcitizen" && housingFrozen) {
+        // residence upgrade adds a citizen; skip while jobless surplus is high
+        continue;
       } else if (b.level < (b.maxLevel ?? 5) && (b.type === "blockhutbuilder" || b.level + 1 <= maxBuilderLevel)) {
         // maxLevel comes from /status (building.getMaxBuildingLevel()) - e.g.
         // Colonial tavern caps at 3, postbox at 1; offering those upgrades
@@ -253,7 +266,7 @@ function buildCandidates(status, researchNeeds = {}) {
         });
       }
     }
-    if (pop > housing && !backlogFull) {
+    if (pop > housing && !backlogFull && !housingFrozen) {
       candidates.push({
         label: `placeNext minecolonies:blockhutcitizen(住居の新設。市民${pop}人>容量${housing}人なので最優先級)`,
         action: { action: "placeNext", block: "minecolonies:blockhutcitizen" },

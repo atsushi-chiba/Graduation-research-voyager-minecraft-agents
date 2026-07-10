@@ -386,6 +386,7 @@ public class VoyagerBridge {
             httpServer.createContext("/upgradeWarehouse", this::handleUpgradeWarehouse);
             httpServer.createContext("/debugBuildGates", this::handleDebugBuildGates);
             httpServer.createContext("/assignHome", this::handleAssignHome);
+            httpServer.createContext("/optimizeHomes", this::handleOptimizeHomes);
             httpServer.createContext("/teachRecipe", this::handleTeachRecipe);
             httpServer.createContext("/recipes", this::handleRecipes);
             httpServer.createContext("/setHiringMode", this::handleSetHiringMode);
@@ -1860,6 +1861,92 @@ public class VoyagerBridge {
             String outcome = result.get();
             respond(exchange, outcome.startsWith("ERROR") ? 500 : 200,
                 "{\"result\":\"" + escape(outcome) + "\"}");
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // POST /optimizeHomes?colonyId=1[&maxDist=50][&max=20][&dryRun=true]
+    //
+    // Citizens complain when home is far from work (a happiness penalty), and
+    // MineColonies' home auto-assignment doesn't optimize for it. For each
+    // worker whose home is more than maxDist blocks from their workplace, move
+    // them to the nearest residence (blockhutcitizen) with a free bed that is
+    // closer than their current home. Mirrors the residence-GUI reassignment
+    // (remove from old LivingBuildingModule, assign to new).
+    private void handleOptimizeHomes(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+            double maxDist = Double.parseDouble(params.getOrDefault("maxDist", "50"));
+            int max = Integer.parseInt(params.getOrDefault("max", "20"));
+            boolean dryRun = "true".equalsIgnoreCase(params.getOrDefault("dryRun", "false"));
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
+                    if (colony == null) { result.complete("{\"error\":\"no colony\"}"); return; }
+
+                    // Residences with free beds.
+                    class Res { com.minecolonies.core.colony.buildings.modules.LivingBuildingModule m; BlockPos pos; }
+                    java.util.List<Res> residences = new java.util.ArrayList<>();
+                    for (IBuilding b : colony.getServerBuildingManager().getBuildings().values()) {
+                        if (b.getBuildingLevel() <= 0) continue;
+                        ResourceLocation bk = ForgeRegistries.BLOCKS.getKey(
+                            level.getBlockState(b.getPosition()).getBlock());
+                        if (bk == null || !"blockhutcitizen".equals(bk.getPath())) continue;
+                        com.minecolonies.core.colony.buildings.modules.LivingBuildingModule m =
+                            b.getFirstModuleOccurance(com.minecolonies.core.colony.buildings.modules.LivingBuildingModule.class);
+                        if (m == null) continue;
+                        Res r = new Res(); r.m = m; r.pos = b.getPosition();
+                        residences.add(r);
+                    }
+
+                    StringBuilder acts = new StringBuilder();
+                    boolean first = true;
+                    int moved = 0;
+                    for (ICitizenData cd : colony.getCitizenManager().getCitizens()) {
+                        if (moved >= max) break;
+                        if (cd.getJob() == null || cd.getWorkBuilding() == null) continue;
+                        BlockPos work = cd.getWorkBuilding().getPosition();
+                        IBuilding homeB = cd.getHomeBuilding();
+                        double curDist = homeB == null ? Double.MAX_VALUE
+                            : Math.sqrt(homeB.getPosition().distSqr(work));
+                        if (curDist <= maxDist) continue;
+                        Res best = null; double bestDist = curDist;
+                        for (Res r : residences) {
+                            if (homeB != null && r.pos.equals(homeB.getPosition())) continue;
+                            if (r.m.getAssignedCitizen().size() >= r.m.getModuleMax()) continue;
+                            double d = Math.sqrt(r.pos.distSqr(work));
+                            if (d < bestDist) { bestDist = d; best = r; }
+                        }
+                        if (best == null) continue;
+                        if (!dryRun) {
+                            if (homeB != null) {
+                                com.minecolonies.core.colony.buildings.modules.LivingBuildingModule oldM =
+                                    homeB.getFirstModuleOccurance(com.minecolonies.core.colony.buildings.modules.LivingBuildingModule.class);
+                                if (oldM != null) oldM.removeCitizen(cd);
+                            }
+                            if (!best.m.assignCitizen(cd)) continue;
+                        }
+                        moved++;
+                        if (!first) acts.append(',');
+                        first = false;
+                        acts.append("{\"citizen\":").append(cd.getId())
+                            .append(",\"name\":\"").append(escape(cd.getName())).append('"')
+                            .append(",\"fromDist\":").append(Math.round(curDist))
+                            .append(",\"toDist\":").append(Math.round(bestDist))
+                            .append(",\"home\":\"").append(best.pos.toShortString()).append("\"}");
+                    }
+                    result.complete("{\"dryRun\":" + dryRun + ",\"maxDist\":" + maxDist
+                        + ",\"moved\":" + moved + ",\"moves\":[" + acts + "]}");
+                } catch (Exception e) {
+                    LOGGER.error("optimizeHomes failed", e);
+                    result.complete("{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+                }
+            });
+            respond(exchange, 200, result.get());
         } catch (Exception e) {
             respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
         }

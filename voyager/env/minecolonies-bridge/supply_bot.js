@@ -318,8 +318,11 @@ async function teachCrafterRecipes(colony, cycle) {
 // decommissions). Auto-hire usually wins the race for a single slot, so this
 // mainly earns its keep when a batch of new buildings opens several slots at
 // once. Silent unless it actually assigns someone.
+// Every 5 cycles (~30s at the 6s poll): fast enough that a slot vacated by a
+// dead worker gets a skill-optimal successor promptly (MineColonies auto-hire
+// also refills AUTO slots, but arbitrarily; this backstops and optimizes).
 async function autoAssignJobs(colony, cycle) {
-  if (cycle % 20 !== 11) return 0;
+  if (cycle % 5 !== 1) return 0;
   try {
     // reassign=true: also swap a slot's weakest occupant for a clearly-better
     // unemployed one (fit improvement >= threshold). Converges - displaced
@@ -338,6 +341,23 @@ async function autoAssignJobs(colony, cycle) {
       );
     }
     return (d.filled || 0) + (d.swapped || 0);
+  } catch {
+    return 0;
+  }
+}
+
+// Citizens are unhappy when home is far from work. Periodically move workers
+// to the nearest residence with a free bed. Cheap no-op once homes are good.
+async function optimizeHomes(colony, cycle) {
+  if (cycle % 30 !== 17) return 0;
+  try {
+    const res = await httpRequest("POST", `/optimizeHomes?colonyId=${colony.id}&maxDist=50&max=10`);
+    if (res.status !== 200) return 0;
+    const d = JSON.parse(res.body);
+    if (d.moved > 0) {
+      console.log(`[supply #${cycle}] moved ${d.moved} workers to homes nearer their workplace`);
+    }
+    return d.moved || 0;
   } catch {
     return 0;
   }
@@ -538,6 +558,7 @@ async function loop() {
         totalResolved += await stockRestaurants(colony, cycle);
         totalResolved += await autoResearch(colony, cycle);
         totalResolved += await autoAssignJobs(colony, cycle);
+        totalResolved += await optimizeHomes(colony, cycle);
         totalResolved += await teachCrafterRecipes(colony, cycle);
         totalResolved += await warehouseJanitor(colony, cycle);
         totalResolved += await fillBuilderHuts(colony, cycle);
