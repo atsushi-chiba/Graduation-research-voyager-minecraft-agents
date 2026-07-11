@@ -4227,10 +4227,15 @@ public class VoyagerBridge {
 
         // Fallback bookkeeping: if no candidate clears the flatness gate within
         // the whole scan disc we must still return *something* (placement must
-        // never fail), so we remember the collision-free candidate with the
-        // smallest terrain spread and use it, logging that terraform is needed.
-        int fbX = 0, fbY = 0, fbZ = 0, fbSpread = Integer.MAX_VALUE;
-        boolean haveFallback = false;
+        // never fail). Two tiers, preferred first:
+        //   dry*  = flattest DRY (no water in footprint) candidate that only
+        //           failed the flatness gate -> still never builds on water.
+        //   wet*  = flattest candidate of ANY kind (last resort when the whole
+        //           disc is water, e.g. the ~89% water founding area).
+        int dryX = 0, dryY = 0, dryZ = 0, drySpread = Integer.MAX_VALUE;
+        boolean haveDry = false;
+        int wetX = 0, wetY = 0, wetZ = 0, wetSpread = Integer.MAX_VALUE;
+        boolean haveWet = false;
 
         for (int[] off : offsets) {
             int nx = center.getX() + off[0];
@@ -4267,67 +4272,111 @@ public class VoyagerBridge {
             if (conflict) continue;
 
             // Candidate is collision-free. Only now (per the perf budget) do we
-            // pay for surface sampling: sample the real terrain height across the
-            // building's footprint and decide the per-cell placement Y.
+            // pay for surface sampling: sample the real terrain across the
+            // building's footprint (solid ground Y, spread, and whether any
+            // column is water) and decide the per-cell placement Y.
             int[] sample = sampleFootprintSurface(
                 level, cMinX, cMinZ, cMaxX, cMaxZ);
-            int repFloor = sample[0];   // modal getHeight (floor = top solid + 1)
-            int spread   = sample[1];   // max-min surface Y across the footprint
+            int repFloor = sample[0];        // modal OCEAN_FLOOR (floor = top solid + 1)
+            int spread   = sample[1];        // max-min solid-ground Y across footprint
+            boolean hasWater = sample[2] != 0;
 
             // repFloor is where a building floor rests (top solid block + 1), the
             // same convention center.getY() encodes at the townhall. The current
             // Y formula is center.getY()-1+groundAnchorOffset = townhallTopSolid +
             // offset; substituting this cell's top solid block (repFloor-1) gives
-            // the terrain-relative anchor. On flat terrain repFloor == the
-            // townhall floor for every column, so this reduces to the old
-            // baselineY exactly (backward-compatible).
+            // the terrain-relative anchor. Using OCEAN_FLOOR here (solid ground,
+            // fluids excluded) means we never anchor on a water surface. On dry
+            // land OCEAN_FLOOR == MOTION_BLOCKING_NO_LEAVES, so on flat terrain
+            // repFloor == the townhall floor for every column and this reduces to
+            // the old baselineY exactly (backward-compatible).
             int terrainY = repFloor - 1 + groundAnchorOffset;
 
+            if (hasWater) {
+                // Any water in the footprint disqualifies the cell just like a
+                // failed flatness gate. Still eligible as the very-last-resort
+                // (wet) fallback so placement never fails on an all-water map.
+                if (spread < wetSpread) {
+                    wetSpread = spread;
+                    wetX = nx; wetY = terrainY; wetZ = nz;
+                    haveWet = true;
+                }
+                continue;
+            }
+
+            // Dry cell.
             if (spread <= flatnessThreshold) {
                 return new int[]{nx, terrainY, nz};
             }
-            // Too steep for the builder to terrace cleanly: remember the flattest
-            // such cell as a last resort and keep scanning for a gate-passing one.
-            if (spread < fbSpread) {
-                fbSpread = spread;
-                fbX = nx; fbY = terrainY; fbZ = nz;
-                haveFallback = true;
+            // Dry but too steep for the builder to terrace cleanly: remember the
+            // flattest such (dry) cell and keep scanning for a gate-passing one.
+            if (spread < drySpread) {
+                drySpread = spread;
+                dryX = nx; dryY = terrainY; dryZ = nz;
+                haveDry = true;
+            }
+            // A dry cell is also a candidate for the wet-tier fallback (a dry
+            // steep site still beats building on water).
+            if (spread < wetSpread) {
+                wetSpread = spread;
+                wetX = nx; wetY = terrainY; wetZ = nz;
+                haveWet = true;
             }
         }
 
-        if (haveFallback) {
-            // No cell within the whole scan disc met the flatness gate. Placement
-            // must not fail, so we use the flattest collision-free candidate. It
-            // will build on uneven ground until terraforming (Agent C - flatten
-            // the footprint to a pad before building) is implemented.
-            LOGGER.warn("placeNext[{}]: no footprint within flatness<=" + flatnessThreshold
-                    + " for colony {}; falling back to flattest candidate at ({},{},{}) "
+        // Fallback order (placement must never fail):
+        //   (a) flattest DRY candidate (avoids water, just needs terracing)
+        if (haveDry) {
+            LOGGER.warn("placeNext[{}]: no dry footprint within flatness<=" + flatnessThreshold
+                    + " for colony {}; falling back to flattest dry candidate at ({},{},{}) "
                     + "with terrain spread {} - TERRAFORM NEEDED (Agent C, not yet implemented)",
-                    blockId, colonyId, fbX, fbY, fbZ, fbSpread);
-            return new int[]{fbX, fbY, fbZ};
+                    blockId, colonyId, dryX, dryY, dryZ, drySpread);
+            return new int[]{dryX, dryY, dryZ};
+        }
+        //   (b) no dry site anywhere in the disc -> old behaviour (flattest of
+        //       any kind, possibly on water). Anchor Y is still OCEAN_FLOOR so it
+        //       sits on the seabed, not the water surface, but it needs water
+        //       handling to be usable.
+        if (haveWet) {
+            LOGGER.warn("placeNext[{}]: no dry buildable site for colony {}; "
+                    + "falling back to flattest candidate at ({},{},{}) with spread {} "
+                    + "- TERRAFORM/water handling needed (Agent C, not yet implemented)",
+                    blockId, colonyId, wetX, wetY, wetZ, wetSpread);
+            return new int[]{wetX, wetY, wetZ};
         }
         return null;
     }
 
-    // Samples the terrain surface Y across a building footprint (inclusive world
-    // rect [minX..maxX] x [minZ..maxZ]) and returns {representativeFloorY, spread}:
-    //   - representativeFloorY: the modal level.getHeight(MOTION_BLOCKING_NO_LEAVES)
-    //     over the sampled columns (median on a multimodal tie). This is the same
-    //     heightmap the /surfaceY & /heightmap endpoints (Agent A) use, and
-    //     getHeight returns the floor (first empty y ABOVE the top solid block).
-    //     Mode minimises how much the builder must cut/fill vs the surrounding
-    //     ground.
-    //   - spread: max-min getHeight across the samples = the footprint's step
-    //     height, used by the flatness gate.
+    // Samples the terrain across a building footprint (inclusive world rect
+    // [minX..maxX] x [minZ..maxZ]) and returns {representativeFloorY, spread, water}:
+    //   - representativeFloorY: the modal level.getHeight(OCEAN_FLOOR) over the
+    //     sampled columns (median on a multimodal tie). OCEAN_FLOOR is the highest
+    //     motion-blocking block EXCLUDING fluids, so getHeight returns the floor
+    //     (first empty y ABOVE the top solid ground block) even under water - the
+    //     anchor therefore rests on solid ground, never on a water surface. Mode
+    //     minimises how much the builder must cut/fill vs the surrounding ground.
+    //   - spread: max-min OCEAN_FLOOR Y across the samples = the footprint's solid
+    //     step height, used by the flatness gate.
+    //   - water: 1 if ANY sampled column is covered by fluid, else 0. Detected by
+    //     MOTION_BLOCKING_NO_LEAVES (counts fluids) != OCEAN_FLOOR (ignores fluids):
+    //     a mismatch means something non-solid (water/lava) sits above the ground.
+    //     A single wet column flags the whole footprint (main fix for the ~89%-water
+    //     founding area, where flat WATER SURFACES were passing the flatness gate).
     // Perf: instead of every column (a farmer footprint is 25x20 = 500 columns,
     // times many candidates), we subsample on a fixed stride and always include
-    // the far edges/corners. getHeight is a cheap heightmap array lookup once the
-    // chunk is loaded, so this is a handful of reads per candidate. On flat
-    // terrain every sample is identical -> mode == that Y and spread == 0, so the
-    // gate always passes and the result matches the pre-terrain behaviour exactly.
+    // the far edges/corners. Both getHeight calls are cheap heightmap array lookups
+    // once the chunk is loaded, so this is a couple dozen reads per candidate.
+    // CAVEAT: the stride subsample can miss a narrow (< STRIDE-wide) water channel
+    // or a lone log/leaf column that falls between grid lines; corners+edges catch
+    // most, but a 1-2 block creek crossing diagonally between samples could slip
+    // through. Terraform/water handling (Agent C) is the backstop.
+    // On flat DRY land every sample is identical and OCEAN_FLOOR == the old
+    // MOTION_BLOCKING_NO_LEAVES value -> mode == that Y, spread == 0, water == 0,
+    // so the result matches the pre-water behaviour exactly (backward-compatible).
     private int[] sampleFootprintSurface(ServerLevel level,
             int minX, int minZ, int maxX, int maxZ) {
-        final Heightmap.Types type = Heightmap.Types.MOTION_BLOCKING_NO_LEAVES;
+        final Heightmap.Types SOLID = Heightmap.Types.OCEAN_FLOOR;              // ground, fluids excluded
+        final Heightmap.Types WITH_FLUID = Heightmap.Types.MOTION_BLOCKING_NO_LEAVES; // counts fluids
         final int STRIDE = 4;
 
         // Ensure the footprint's chunks are loaded before reading heightmaps (see
@@ -4343,16 +4392,18 @@ public class VoyagerBridge {
         int[] zs = strideCoords(minZ, maxZ, STRIDE);
         java.util.Map<Integer, Integer> counts = new java.util.HashMap<>();
         int min = Integer.MAX_VALUE, max = Integer.MIN_VALUE;
+        boolean water = false;
         for (int x : xs) {
             for (int z : zs) {
-                int y = level.getHeight(type, x, z);
-                counts.merge(y, 1, Integer::sum);
-                if (y < min) min = y;
-                if (y > max) max = y;
+                int solidY = level.getHeight(SOLID, x, z);
+                if (level.getHeight(WITH_FLUID, x, z) != solidY) water = true;
+                counts.merge(solidY, 1, Integer::sum);
+                if (solidY < min) min = solidY;
+                if (solidY > max) max = solidY;
             }
         }
         int spread = (min == Integer.MAX_VALUE) ? 0 : (max - min);
-        return new int[]{modeOrMedian(counts), spread};
+        return new int[]{modeOrMedian(counts), spread, water ? 1 : 0};
     }
 
     // Sample coordinates from lo..hi on the given stride, always including both
