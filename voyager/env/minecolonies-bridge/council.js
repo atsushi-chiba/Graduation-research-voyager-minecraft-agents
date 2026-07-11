@@ -220,6 +220,26 @@ function readDemand() {
   }
 }
 
+// Count targets = "how much to build", tied to progression. Most buildings are
+// singletons (target 1); these scale. pop and building-count grow with town-hall
+// level, so they track progression indirectly. Crafters scale only while
+// demand.json flags their output short. (house/residence keeps its own
+// pop>housing path.) Numbers set with the user 2026-07-11 - easy to tune here.
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+const SCALE_RULES = {
+  builder:     (c) => clamp(4 + Math.floor(c.totalBuildings / 15), 4, 6), // 初期4→上限6
+  deliveryman: (c) => clamp(3 + Math.floor(c.totalBuildings / 15), 3, 5), // 初期3→上限5
+  farmer:      (c) => 4,
+  fisherman:   (c) => 1,
+  lumberjack:  (c) => clamp(1 + Math.floor(c.pop / 12), 1, 3),
+  miner:       (c) => clamp(1 + Math.floor(c.pop / 12), 1, 3),
+  // crafters: base 1, +1 while their output is a flagged shortage (demand.json)
+  sawmill:     (c) => 1 + (c.demandHot.has("sawmill") ? 1 : 0),
+  smeltery:    (c) => 1 + (c.demandHot.has("smeltery") ? 1 : 0),
+  stonemason:  (c) => 1 + (c.demandHot.has("stonemason") ? 1 : 0),
+};
+const targetCount = (regKey, ctx) => (SCALE_RULES[regKey] ? SCALE_RULES[regKey](ctx) : 1);
+
 function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
   const candidates = [{ label: "wait(様子見。建設中で他にやることがない時のみ)", action: { action: "wait" } }];
   const colony = status[0];
@@ -253,6 +273,21 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
       0,
       ...buildings.filter((b) => b.type === "blockhutbuilder" && b.operational).map((b) => b.level)
     );
+    // Progression = town-hall level (MineColonies: buildings can't exceed it, it
+    // caps colony size, gates research). It is the axis for "how much" (count)
+    // and "how deep" (level) targets.
+    const townHallLevel = buildings.find((b) => b.type === "blockhuttownhall")?.level ?? 0;
+    const countByType = {};
+    for (const b of buildings) {
+      const k = String(b.type).replace(/^blockhut/, "");
+      countByType[k] = (countByType[k] || 0) + 1;
+    }
+    const unbuiltCount = buildings.filter((b) => !b.operational && b.level === 0).length;
+    const scaleCtx = {
+      pop,
+      totalBuildings: buildings.length,
+      demandHot: new Set(Object.keys(demandRank)),
+    };
     // Backlog governor. The menu offered construction every cycle regardless
     // of the queue, and gemma happily picked one each time - 130 queued work
     // orders / 38 alchemists / 65 houses by the time it was caught
@@ -272,7 +307,21 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
       } else if (b.type === "blockhutcitizen" && housingFrozen) {
         // residence upgrade adds a citizen; skip while jobless surplus is high
         continue;
-      } else if (b.level < (b.maxLevel ?? 5) && (b.type === "blockhutbuilder" || b.level + 1 <= maxBuilderLevel)) {
+      } else if (
+        // Level target follows the town hall (2026-07-11). Non-townhall buildings
+        // upgrade only up to the town-hall level (MineColonies caps them there).
+        // - town hall: the exception - it leads (no builder-level gate) and
+        //   advances the stage, but only once the current stage is fully built
+        //   (no unbuilt placed buildings), so depth never races ahead of breadth.
+        // - builder: self-builds, so capped by town hall only (no builder gate).
+        // - others: capped by min(town hall, an operational builder that high).
+        b.type === "blockhuttownhall"
+          ? (unbuiltCount === 0 && b.level < (b.maxLevel ?? 5))
+          : (
+              b.level < Math.min(townHallLevel, b.maxLevel ?? 5) &&
+              (b.type === "blockhutbuilder" || b.level + 1 <= maxBuilderLevel)
+            )
+      ) {
         // maxLevel comes from /status (building.getMaxBuildingLevel()) - e.g.
         // Colonial tavern caps at 3, postbox at 1; offering those upgrades
         // wasted mayor turns on silent no-ops.
@@ -296,25 +345,38 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
         action: { action: "placeNext", block: "minecolonies:blockhutcitizen" },
       });
     }
-    // New building types: only ones the colony doesn't have yet. Offering
-    // every type every cycle produced 38 alchemists - the mayor treats any
-    // visible option as worth picking, so duplicates must simply not appear.
-    // (Deliberate duplicates - couriers, builders - are placed via the bridge
-    // by the operator, not the mayor.)
+    // New buildings: what to place, in priority order. Two gates combine:
+    //  - tier (1=foundation..4=luxury/military): only surface the LOWEST tier
+    //    that still has an unmet target, so essentials come before a rabbit hutch.
+    //  - count target (targetCount): most buildings are singletons, a few scale
+    //    with progression (builder/deliveryman/food/resource) or demand (crafters).
+    // A type is "wanted" when its placed count is below its target. citizen
+    // (housing) has its own pop>housing path above and is excluded here.
+    // (Before this, every unbuilt type was an equal shuffled option, so gemma
+    // placed luxury buildings as readily as farms - 2026-07-11.)
     if (!backlogFull) {
-      const existingTypes = new Set(
-        buildings.map((b) => String(b.type).replace(/^blockhut/, ""))
-      );
+      const tierOf = (v) => (typeof v.tier === "number" ? v.tier : 4);
+      const wanted = (regKey, v) =>
+        v.blueprint !== null &&
+        v.block !== "minecolonies:blockhuttownhall" &&
+        regKey !== "citizen" &&
+        (countByType[regKey] || 0) < targetCount(regKey, scaleCtx);
+      let activeTier = Infinity;
       for (const [regKey, v] of Object.entries(BUILDING_REGISTRY)) {
-        if (v.blueprint === null) continue;
-        if (v.block === "minecolonies:blockhuttownhall") continue; // manual bootstrap only
-        if (existingTypes.has(regKey)) continue;
+        if (wanted(regKey, v) && tierOf(v) < activeTier) activeTier = tierOf(v);
+      }
+      for (const [regKey, v] of Object.entries(BUILDING_REGISTRY)) {
+        if (!wanted(regKey, v)) continue;
+        if (tierOf(v) > activeTier) continue; // tier gate: hold back higher tiers
+        const have = countByType[regKey] || 0;
+        const want = targetCount(regKey, scaleCtx);
+        const countTag = want > 1 ? `[${have}/${want}]` : "";
         const rn = researchNeeds[regKey];
         const unlock = rn ? `(建てると研究「${rn.research}」の解禁に近づく)` : "";
         const dem = demandRank[regKey];
         const demand = dem ? `【不足解消 需要↑ ${dem.rank}位】` : "";
         candidates.push({
-          label: `placeNext ${v.block}(${v.job || "-"}: ${(v.role || "").slice(0, 40)}) 新設を配置${unlock}${demand}`,
+          label: `placeNext ${v.block}(T${tierOf(v)}${countTag} ${v.job || "-"}: ${(v.role || "").slice(0, 40)}) 新設を配置${unlock}${demand}`,
           action: { action: "placeNext", block: v.block },
         });
       }
