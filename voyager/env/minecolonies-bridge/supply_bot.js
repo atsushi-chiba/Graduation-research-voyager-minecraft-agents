@@ -13,6 +13,9 @@
 // require raw materials in the citizen's inventory first.
 const http = require("http");
 const fs = require("fs");
+// Reused production-detection primitives (jobStatus==="working" heuristic +
+// the no-worker building set) for the boot-time taper below.
+const workStats = require("./work_stats.js");
 
 const CMD_PIPE = "/root/mc-server-forge/cmd_pipe";
 
@@ -218,12 +221,15 @@ async function feedHungryCitizens(colony, cycle) {
 // builder takes from the hut's racks before filing requests - so bulk-filling
 // the racks via /fillBuilderResources removes the ping-pong. Tools/armor are
 // not in that list and still flow through the request loop below.
-async function fillBuilderHuts(colony, cycle) {
+async function fillBuilderHuts(colony, cycle, tapered) {
   let filled = 0;
   for (const building of colony.buildings || []) {
     if (building.type !== "blockhutbuilder") continue;
     try {
-      const skip = encodeURIComponent([...taughtOutputs].join(","));
+      // Skip both crafter-economy outputs and tapered (self-produced) items so
+      // bulk-fill doesn't stuff racks with what the colony now makes itself;
+      // the builder then files real requests that the taper/economy handle.
+      const skip = encodeURIComponent([...taughtOutputs, ...(tapered || [])].join(","));
       const res = await httpRequest(
         "POST",
         `/fillBuilderResources?x=${building.x}&y=${building.y}&z=${building.z}&skip=${skip}`
@@ -279,6 +285,186 @@ Object.assign(ITEM_PRODUCER, {
   "minecraft:mutton": "shepherd", "minecraft:white_wool": "shepherd", "minecraft:rabbit": "rabbithutch",
   "minecraft:oak_log": "lumberjack", "minecraft:oak_sapling": "lumberjack",
 });
+// Miner raws + the rest of the tree-species logs/saplings, so the taper can
+// see "this ore/log now has a live producer" for the normal-world gatherers.
+Object.assign(ITEM_PRODUCER, {
+  "minecraft:cobblestone": "miner", "minecraft:stone": "miner", "minecraft:coal": "miner",
+  "minecraft:raw_iron": "miner", "minecraft:iron_ore": "miner", "minecraft:raw_copper": "miner",
+  "minecraft:copper_ore": "miner", "minecraft:raw_gold": "miner", "minecraft:gold_ore": "miner",
+  "minecraft:redstone": "miner", "minecraft:lapis_lazuli": "miner", "minecraft:diamond": "miner",
+  "minecraft:diorite": "miner", "minecraft:andesite": "miner", "minecraft:granite": "miner",
+  "minecraft:gravel": "miner", "minecraft:dirt": "miner",
+  "minecraft:birch_log": "lumberjack", "minecraft:spruce_log": "lumberjack",
+  "minecraft:jungle_log": "lumberjack", "minecraft:acacia_log": "lumberjack",
+  "minecraft:dark_oak_log": "lumberjack", "minecraft:stick": "lumberjack",
+  "minecraft:birch_sapling": "lumberjack", "minecraft:spruce_sapling": "lumberjack",
+  "minecraft:jungle_sapling": "lumberjack", "minecraft:acacia_sapling": "lumberjack",
+  "minecraft:dark_oak_sapling": "lumberjack",
+});
+
+// ============================================================================
+// Boot-time taper: supply_bot from primary supplier -> safety net (design D3).
+//
+// The colony is migrating superflat -> normal world, where miner/lumberjack/
+// farmer become real gatherers. We want to STOP cheat-supplying an item once
+// the colony can produce it itself, but not so early that construction stalls
+// waiting for materials. So each item is tapered only when BOTH hold:
+//   (1) production detected  - a producer building for the item is actively
+//       working, AND
+//   (2) time floor cleared   - the colony is older than N in-game days
+//       (early-stall insurance).
+// A tapered item gets NO primary supply; only a persistent unmet request
+// (economy provably behind, STARVE_GUARD_MS) makes the safety net step back
+// in. Items with no known producer are never tapered - they keep full
+// gap-fill supply, which is exactly "gap-fill only for zero-production items".
+//
+// Production-detection PROXY = worker activity (jobStatus==="working") from
+// /status, aggregated over a rolling window and mapped item->producer through
+// ITEM_PRODUCER. Rationale: it is the only self-sufficiency signal available
+// from existing endpoints. /warehouseStats reports rack OCCUPANCY, not per-item
+// counts, so a true "warehouse stock delta per item" would need a new Java
+// endpoint (out of scope here). Worker activity is the same heuristic
+// work_stats.js already uses to find dead workplaces, so we reuse it verbatim.
+// It is a proxy: a "working" lumberjack is assumed to be yielding its logs/
+// saplings, a "working" miner its ores, etc. - true at the building-type
+// granularity we taper on.
+//
+// All thresholds are env-overridable constants; defaults are deliberately
+// CONSERVATIVE (slow to cut supply) to protect early construction.
+// ============================================================================
+const TAPER_ENABLED = process.env.TAPER !== "off"; // TAPER=off restores pre-taper behavior
+// In-game days the colony must reach before any item may taper. At 10x a game
+// day is ~2 real minutes, but crops/economy advance on GAME time, so the floor
+// is expressed in game days. 4 days = the producers have had several harvest/
+// mining cycles to actually stock the warehouse before we lean on them.
+const TAPER_FLOOR_DAYS = parseFloat(process.env.TAPER_FLOOR_DAYS || "4");
+// Logs taper earlier: plains are tree-sparse, so we bootstrap logging with
+// SAPLINGS (below) and want to stop free-log supply as soon as the lumberjack
+// is on the job, forcing the colony onto its own replant harvest.
+const LOG_TAPER_FLOOR_DAYS = parseFloat(process.env.LOG_TAPER_FLOOR_DAYS || "2");
+// Detection window: how many recent poll cycles decide "producer is active".
+// 15 cycles x 6s poll = ~90s real observation (~15 game-min at 10x).
+const DETECT_WINDOW_CYCLES = parseInt(process.env.TAPER_DETECT_WINDOW || "15", 10);
+// Don't judge a producer until we have this many samples (avoid deciding on a
+// lucky/unlucky single snapshot right after startup).
+const DETECT_MIN_SAMPLES = parseInt(process.env.TAPER_DETECT_MIN || "8", 10);
+// Fraction of window samples in which the producer must be "working" to count
+// as active. Gatherers commute/sleep/eat a lot at 10x, so sustained ~1/3
+// working is already a live production line. Higher = slower to taper (safer,
+// may never fire); lower = eager to taper (risks cutting a marginal producer).
+const DETECT_WORKING_FRACTION = parseFloat(process.env.TAPER_DETECT_FRACTION || "0.35");
+// A tapered item whose request stays UNMET this long means the real economy is
+// too slow; the safety net supplies it anyway so construction never deadlocks.
+// 5 real min = ~50 game-min at 10x.
+const STARVE_GUARD_MS = parseInt(process.env.TAPER_STARVE_GUARD_MS || "300000", 10);
+const TICKS_PER_DAY = 24000;
+
+// Saplings SEED the lumberjack replant loop. Plains barely have trees, so we
+// keep supplying saplings (never taper them) as the boot input that gets the
+// logging loop spinning; the lumberjack then plants them and harvests logs.
+const SAPLING_ITEMS = new Set([
+  "minecraft:oak_sapling", "minecraft:birch_sapling", "minecraft:spruce_sapling",
+  "minecraft:jungle_sapling", "minecraft:acacia_sapling", "minecraft:dark_oak_sapling",
+]);
+const LOG_ITEMS = new Set([
+  "minecraft:oak_log", "minecraft:birch_log", "minecraft:spruce_log",
+  "minecraft:jungle_log", "minecraft:acacia_log", "minecraft:dark_oak_log",
+]);
+
+// producerKey (building type minus "blockhut", matching ITEM_PRODUCER values)
+// -> rolling array of 0/1: was any of that producer's staffed operational
+// buildings observed working this cycle?
+const producerWindow = new Map();
+function recordProducerActivity(colony, citById) {
+  const activeNow = new Set();
+  const presentNow = new Set();
+  for (const b of colony.buildings || []) {
+    if (workStats.NO_WORKER.has(b.type)) continue;
+    if (!b.operational || !(b.workers || []).length) continue;
+    const key = b.type.replace(/^blockhut/, "");
+    presentNow.add(key);
+    const working = (b.workers || []).some((id) => workStats.isCitizenWorking(citById.get(id)));
+    if (working) activeNow.add(key);
+  }
+  // Sample every producer we have ever seen, so a producer that goes absent
+  // (building removed / worker died) decays back toward "inactive".
+  for (const key of new Set([...producerWindow.keys(), ...presentNow])) {
+    const arr = producerWindow.get(key) || [];
+    arr.push(activeNow.has(key) ? 1 : 0);
+    while (arr.length > DETECT_WINDOW_CYCLES) arr.shift();
+    producerWindow.set(key, arr);
+  }
+}
+function producerActive(key) {
+  const arr = producerWindow.get(key);
+  if (!arr || arr.length < DETECT_MIN_SAMPLES) return false;
+  const frac = arr.reduce((a, b) => a + b, 0) / arr.length;
+  return frac >= DETECT_WORKING_FRACTION;
+}
+
+// Colony age in game-days, anchored to the first gameTime we ever saw for this
+// colony (persisted so it survives colony_watch restarts). Using an anchor
+// rather than raw gameTime keeps the floor correct even if the world's clock
+// is already large; if gameTime ever goes backwards (world rollback) we
+// re-anchor, erring toward MORE supply.
+const TAPER_STATE_FILE = `${__dirname}/taper_state.json`;
+let taperState = { foundingGameTime: {} };
+try { taperState = JSON.parse(fs.readFileSync(TAPER_STATE_FILE, "utf8")); } catch { /* first run */ }
+function colonyAgeDays(colony) {
+  const gt = colony.gameTime;
+  if (typeof gt !== "number") return 0;
+  const key = String(colony.id);
+  const anchor = taperState.foundingGameTime[key];
+  if (anchor == null || anchor > gt) {
+    taperState.foundingGameTime[key] = gt;
+    try { fs.writeFileSync(TAPER_STATE_FILE, JSON.stringify(taperState)); } catch { /* non-fatal */ }
+    return 0;
+  }
+  return (gt - anchor) / TICKS_PER_DAY;
+}
+
+// Items currently in safety-net (tapered) mode - only for transition logging.
+const taperedItems = new Set();
+// item -> first timestamp it was seen still-requested while tapered (starve guard).
+const taperedRequestSince = new Map();
+
+function itemProducerKey(item) {
+  return ITEM_PRODUCER[item];
+}
+// True => stop primary supply of this item (colony produces it, past the floor).
+function shouldTaper(item, ageDays, cycle) {
+  if (!TAPER_ENABLED) return false;
+  if (SAPLING_ITEMS.has(item)) return false; // boot seed: always supplied
+  const key = itemProducerKey(item);
+  if (!key) return false; // no known producer -> zero-production -> keep gap-filling
+  const floor = LOG_ITEMS.has(item) ? LOG_TAPER_FLOOR_DAYS : TAPER_FLOOR_DAYS;
+  const active = ageDays >= floor && producerActive(key);
+  if (active && !taperedItems.has(item)) {
+    taperedItems.add(item);
+    console.log(
+      `[taper #${cycle}] ${item}: primary supply STOPPED -> safety net ` +
+      `(producer '${key}' active, colony age ${ageDays.toFixed(1)}d >= floor ${floor}d)`
+    );
+  } else if (!active && taperedItems.has(item)) {
+    taperedItems.delete(item);
+    taperedRequestSince.delete(item);
+    console.log(
+      `[taper #${cycle}] ${item}: primary supply RESUMED ` +
+      `(producer '${key}' no longer active at age ${ageDays.toFixed(1)}d)`
+    );
+  }
+  return active;
+}
+// Recompute the tapered set for a colony once per cycle (also emits the
+// STOPPED/RESUMED transition logs). Iterating ITEM_PRODUCER keys is enough:
+// only items with a known producer can ever taper.
+function computeTapered(ageDays, cycle) {
+  const set = new Set();
+  for (const item of Object.keys(ITEM_PRODUCER)) {
+    if (shouldTaper(item, ageDays, cycle)) set.add(item);
+  }
+  return set;
+}
 
 const demandTally = new Map(); // item -> decayed weighted count
 function recordDemand(item, weight) {
@@ -586,6 +772,9 @@ async function loop() {
     try {
       const colonies = await getStatus();
       let totalResolved = 0;
+      // Tapered items still seen requested this cycle - used to reset the
+      // starvation guard for items the economy has caught up on.
+      const requestedThisCycle = new Set();
 
       for (const colony of colonies) {
         if (SUPPLY_MODE === "observe") {
@@ -616,6 +805,14 @@ async function loop() {
           continue;
         }
         await refreshTaughtOutputs(colony, cycle);
+        // Boot-time taper: sample producer activity and recompute which items
+        // the colony now makes for itself (past their time floor). Welfare
+        // (feed/cure/restaurant) is intentionally NOT tapered - only material
+        // supply retreats to a safety net.
+        const citById = new Map((colony.citizens || []).map((c) => [c.id, c]));
+        recordProducerActivity(colony, citById);
+        const ageDays = colonyAgeDays(colony);
+        const currentTapered = computeTapered(ageDays, cycle);
         totalResolved += await treatSickCitizens(colony, cycle);
         totalResolved += await feedHungryCitizens(colony, cycle);
         totalResolved += await stockRestaurants(colony, cycle);
@@ -624,7 +821,7 @@ async function loop() {
         totalResolved += await optimizeHomes(colony, cycle);
         totalResolved += await teachCrafterRecipes(colony, cycle);
         totalResolved += await warehouseJanitor(colony, cycle);
-        totalResolved += await fillBuilderHuts(colony, cycle);
+        totalResolved += await fillBuilderHuts(colony, cycle, currentTapered);
         for (const building of colony.buildings) {
           if (building.workers.length === 0) continue;
 
@@ -677,6 +874,25 @@ async function loop() {
                     recordDemand(req.item, 3); // a missed craft is a strong "need more capacity" signal
                     deferredSince.delete(sig);
                   }
+                  // Boot-time taper gate: if the colony now produces this item
+                  // (past its time floor), leave it to the real economy - the
+                  // safety net only steps back in once the request has gone
+                  // unmet for STARVE_GUARD_MS (economy provably behind), so
+                  // construction can never deadlock on a slow producer.
+                  if (currentTapered.has(req.item)) {
+                    requestedThisCycle.add(req.item);
+                    const first = taperedRequestSince.get(req.item) || Date.now();
+                    taperedRequestSince.set(req.item, first);
+                    if (Date.now() - first < STARVE_GUARD_MS) {
+                      continue; // economy owns it this cycle
+                    }
+                    console.log(
+                      `[taper #${cycle}] ${req.item}: economy behind ` +
+                      `${Math.round((Date.now() - first) / 1000)}s - safety net supplying (starvation guard)`
+                    );
+                    recordDemand(req.item, 3); // persistent shortfall => producer needs upgrading
+                    taperedRequestSince.delete(req.item); // reset guard after intervening
+                  }
                   // Plain material request: give item then close the request.
                   // Give exactly what the request asks for (the old 64-item floor
                   // that avoided re-request round-trips is obsolete now that
@@ -703,6 +919,12 @@ async function loop() {
         }
       }
 
+      // Reset the starvation guard for tapered items no longer being requested
+      // (the economy caught up) so a later re-request starts its timer fresh.
+      for (const item of [...taperedRequestSince.keys()]) {
+        if (!requestedThisCycle.has(item)) taperedRequestSince.delete(item);
+      }
+
       if (totalResolved > 0) {
         console.log(`[supply #${cycle}] resolved ${totalResolved} request(s)`);
       }
@@ -714,5 +936,12 @@ async function loop() {
   }
 }
 
-console.log("[supply_bot] starting - auto-resolving all open citizen requests");
-loop().catch((e) => console.error("FATAL", e));
+// Only auto-start when launched directly (colony_watch / start scripts do
+// `node supply_bot.js`); allow `require()` for unit-testing the taper logic
+// without kicking off the live poll loop.
+if (require.main === module) {
+  console.log("[supply_bot] starting - auto-resolving all open citizen requests");
+  loop().catch((e) => console.error("FATAL", e));
+}
+
+module.exports = { shouldTaper, computeTapered, colonyAgeDays, recordProducerActivity, producerActive };

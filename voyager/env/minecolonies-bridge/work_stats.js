@@ -33,6 +33,14 @@ const NO_WORKER = new Set([
   "blockpostbox", "blockhutgraveyard", "blockhutmysticalsite",
 ]);
 
+// The single "is this citizen actually producing right now?" heuristic, shared
+// with supply_bot.js's boot-time taper (production detection). A worker in the
+// "working" jobStatus is on the job (not commuting/sleeping/eating/idle); a
+// single snapshot is noisy, so callers aggregate it over a window.
+function isCitizenWorking(c) {
+  return !!c && c.jobStatus === "working";
+}
+
 async function main() {
   // key: "type@x,z" -> { type, pos, workerSamples, workingSamples, statuses: {status: n}, citizens:Set }
   const acc = new Map();
@@ -54,7 +62,7 @@ async function main() {
           a.workerSamples++;
           a.citizens.add(id);
           a.statuses[c.jobStatus] = (a.statuses[c.jobStatus] || 0) + 1;
-          if (c.jobStatus === "working") a.workingSamples++;
+          if (isCitizenWorking(c)) a.workingSamples++;
         }
       }
     }
@@ -82,4 +90,10 @@ async function main() {
   }
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+// Only run the sampling CLI when invoked directly; when required as a module
+// (supply_bot.js's taper reuses NO_WORKER / isCitizenWorking) do nothing.
+if (require.main === module) {
+  main().catch((e) => { console.error(e); process.exit(1); });
+}
+
+module.exports = { NO_WORKER, isCitizenWorking };
