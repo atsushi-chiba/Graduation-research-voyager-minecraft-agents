@@ -25,6 +25,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.common.util.FakePlayer;
 import net.minecraftforge.event.TickEvent;
@@ -443,6 +444,8 @@ public class VoyagerBridge {
             httpServer.createContext("/research", this::handleResearch);
             httpServer.createContext("/startResearch", this::handleStartResearch);
             httpServer.createContext("/autoResearch", this::handleAutoResearch);
+            httpServer.createContext("/surfaceY", this::handleSurfaceY);
+            httpServer.createContext("/heightmap", this::handleHeightmap);
             httpServer.createContext("/ping", VoyagerBridge::handlePing);
             httpServer.setExecutor(null);
             httpServer.start();
@@ -4518,6 +4521,155 @@ public class VoyagerBridge {
             if (c.getServerBuildingManager().getBuildings().containsKey(pos)) return c;
         }
         return null;
+    }
+
+    // Maps a ?type= query value to a whitelisted Heightmap.Types.
+    // Default (null/absent) = MOTION_BLOCKING_NO_LEAVES: for building placement we
+    // want the terrain surface (grass/dirt/stone) and want tree *leaves* excluded
+    // so overhanging canopy doesn't inflate the sampled ground height. Returns null
+    // for an unrecognised name so the caller can answer HTTP 400.
+    //
+    // Caveat (Agent B handles): MOTION_BLOCKING_NO_LEAVES still counts tree TRUNKS
+    // (logs) and other motion-blocking blocks (e.g. water). A column under a tree
+    // therefore reports the trunk top, not the dirt beneath it. Callers that need
+    // true ground under vegetation must post-filter / probe downward themselves.
+    private static Heightmap.Types parseHeightmapType(String name) {
+        if (name == null || name.isEmpty()) return Heightmap.Types.MOTION_BLOCKING_NO_LEAVES;
+        switch (name.toUpperCase(java.util.Locale.ROOT)) {
+            case "WORLD_SURFACE": return Heightmap.Types.WORLD_SURFACE;
+            case "OCEAN_FLOOR": return Heightmap.Types.OCEAN_FLOOR;
+            case "MOTION_BLOCKING_NO_LEAVES": return Heightmap.Types.MOTION_BLOCKING_NO_LEAVES;
+            default: return null;
+        }
+    }
+
+    // GET /surfaceY?x=<int>&z=<int>[&type=WORLD_SURFACE|OCEAN_FLOOR|MOTION_BLOCKING_NO_LEAVES]
+    //
+    // Returns the surface Y for a single column: {"x":..,"z":..,"y":..,"type":".."}.
+    // NOTE: level.getHeight() returns the y of the first EMPTY position ABOVE the
+    // surface (topmost matching block + 1), i.e. where a building would rest its
+    // floor. The top solid block itself is at y-1. Agent B relies on this convention.
+    private void handleSurfaceY(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            final int x = Integer.parseInt(params.get("x"));
+            final int z = Integer.parseInt(params.get("z"));
+            String typeName = params.get("type");
+            final Heightmap.Types type = parseHeightmapType(typeName);
+            if (type == null) {
+                respond(exchange, 400, "{\"error\":\"invalid type '" + escape(String.valueOf(typeName))
+                        + "', use WORLD_SURFACE|OCEAN_FLOOR|MOTION_BLOCKING_NO_LEAVES\"}");
+                return;
+            }
+            // Chunk loading + heightmap access must run on the server thread.
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    // getHeight needs the column's chunk loaded. Force a synchronous
+                    // full load first (returns cached chunk if already loaded), so an
+                    // unloaded/never-generated area is generated & sampled rather than
+                    // returning a stale/void height. This can generate terrain on demand.
+                    level.getChunk(x >> 4, z >> 4);
+                    int y = level.getHeight(type, x, z);
+                    result.complete("{\"x\":" + x + ",\"z\":" + z + ",\"y\":" + y
+                            + ",\"type\":\"" + type.name() + "\"}");
+                } catch (Exception e) {
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, outcome);
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // GET /heightmap?x0=<int>&z0=<int>&x1=<int>&z1=<int>[&type=...]
+    //
+    // Rectangular batch sample for one-shot footprint sampling. Corners are
+    // inclusive and order-independent (min/max are normalised). Response:
+    //   {"x0":,"z0":,"x1":,"z1":,"width":,"depth":,"type":"..","rows":[[..],..]}
+    // "rows" is ROW-MAJOR: rows[i] is the line at z = z0 + i (i in 0..depth-1),
+    // and rows[i][j] is the surface Y at x = x0 + j (j in 0..width-1).
+    // Rectangle is capped at 64x64 columns to bound per-request cost / on-demand
+    // chunk generation; larger requests get HTTP 400.
+    private void handleHeightmap(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int qx0 = Integer.parseInt(params.get("x0"));
+            int qz0 = Integer.parseInt(params.get("z0"));
+            int qx1 = Integer.parseInt(params.get("x1"));
+            int qz1 = Integer.parseInt(params.get("z1"));
+            String typeName = params.get("type");
+            final Heightmap.Types type = parseHeightmapType(typeName);
+            if (type == null) {
+                respond(exchange, 400, "{\"error\":\"invalid type '" + escape(String.valueOf(typeName))
+                        + "', use WORLD_SURFACE|OCEAN_FLOOR|MOTION_BLOCKING_NO_LEAVES\"}");
+                return;
+            }
+            final int minX = Math.min(qx0, qx1);
+            final int maxX = Math.max(qx0, qx1);
+            final int minZ = Math.min(qz0, qz1);
+            final int maxZ = Math.max(qz0, qz1);
+            final int width = maxX - minX + 1;
+            final int depth = maxZ - minZ + 1;
+            final int MAX_SIDE = 64;
+            if (width > MAX_SIDE || depth > MAX_SIDE) {
+                respond(exchange, 400, "{\"error\":\"rectangle " + width + "x" + depth
+                        + " exceeds " + MAX_SIDE + "x" + MAX_SIDE + " limit\"}");
+                return;
+            }
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    // Force-load every chunk overlapping the rectangle up front (see
+                    // handleSurfaceY note). getChunk returns cached chunks cheaply, so
+                    // this is O(#chunks) not O(#columns); heightmap reads below then hit
+                    // loaded chunks only.
+                    for (int cx = minX >> 4; cx <= (maxX >> 4); cx++) {
+                        for (int cz = minZ >> 4; cz <= (maxZ >> 4); cz++) {
+                            level.getChunk(cx, cz);
+                        }
+                    }
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("{\"x0\":").append(minX)
+                      .append(",\"z0\":").append(minZ)
+                      .append(",\"x1\":").append(maxX)
+                      .append(",\"z1\":").append(maxZ)
+                      .append(",\"width\":").append(width)
+                      .append(",\"depth\":").append(depth)
+                      .append(",\"type\":\"").append(type.name()).append("\"")
+                      .append(",\"rows\":[");
+                    for (int zz = minZ; zz <= maxZ; zz++) {
+                        if (zz > minZ) sb.append(",");
+                        sb.append("[");
+                        for (int xx = minX; xx <= maxX; xx++) {
+                            if (xx > minX) sb.append(",");
+                            sb.append(level.getHeight(type, xx, zz));
+                        }
+                        sb.append("]");
+                    }
+                    sb.append("]}");
+                    result.complete(sb.toString());
+                } catch (Exception e) {
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, outcome);
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
     }
 
     private static java.util.Map<String, String> parseQuery(String query) {
