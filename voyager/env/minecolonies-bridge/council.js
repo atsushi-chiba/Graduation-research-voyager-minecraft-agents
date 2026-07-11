@@ -422,7 +422,11 @@ async function governorTurn(gov, history, status) {
         + demand.top.slice(0, 5).map((b, i) => `${i + 1}位 ${b.building}`).join(", ");
     }
   }
-  const userMsg = `[STATE] anchor ${ANCHOR.x},${ANCHOR.y},${ANCHOR.z}\ncolonies: ${JSON.stringify(status)}${hint}\n直近の会話: ${sharedChatLog
+  // Anchor hint follows the live colony center so it stays correct after a
+  // colony_watch restart that doesn't pass ANCHOR_* env (normal-world colonies
+  // are founded at their real terrain coords, not the old 200,-60,200 default).
+  const anc = colony ? { x: colony.x, y: colony.y, z: colony.z } : ANCHOR;
+  const userMsg = `[STATE] anchor ${anc.x},${anc.y},${anc.z}\ncolonies: ${JSON.stringify(status)}${hint}\n直近の会話: ${sharedChatLog
     .slice(-8)
     .map((c) => `${c.who}: ${c.text}`)
     .join(" | ")}\n[ACTIONS] 次の行動を1つ選び {"say":"<日本語で40文字以内の短い一言>","choice":<番号>} で答えること。sayに分析や長文を書かない:\n${menu}`;
