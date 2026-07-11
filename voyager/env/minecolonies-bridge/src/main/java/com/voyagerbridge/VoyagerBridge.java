@@ -3696,11 +3696,24 @@ public class VoyagerBridge {
             java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
             String blockId = params.getOrDefault("block", "");
             int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+            // Optional per-request override of the flatness gate (max-min surface
+            // Y across the footprint); falls back to VOYAGER_PLACENEXT_FLATNESS /
+            // default when absent or unparseable.
+            final int flatness;
+            {
+                String fv = params.get("flatness");
+                int parsed = defaultFlatnessThreshold();
+                if (fv != null && !fv.isEmpty()) {
+                    try { parsed = Integer.parseInt(fv.trim()); }
+                    catch (NumberFormatException ignored) {}
+                }
+                flatness = parsed;
+            }
 
             java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
             server.execute(() -> {
                 try {
-                    int[] pos = findPlacementPos(blockId, colonyId);
+                    int[] pos = findPlacementPos(blockId, colonyId, flatness);
                     if (pos == null) {
                         result.complete("ERROR: no valid position found within territory for " + blockId);
                         return;
@@ -4079,9 +4092,31 @@ public class VoyagerBridge {
             + ",\"dist\":" + String.format("%.1f", dist) + "}";
     }
 
+    // Env/system-property override for the flatness gate threshold used by
+    // findPlacementPos (max-min surface Y across a candidate footprint, in
+    // blocks). A per-request ?flatness= query wins; this is the fallback default.
+    // Conservative default 3: MineColonies builders reliably terrace a footprint
+    // up to a ~3-block step, so cells whose terrain spread is <= T are accepted
+    // as-is; steeper cells are skipped (and, if no cell qualifies within the
+    // scan disc, the flattest is used and flagged for terraform - Agent C, not
+    // yet implemented). Set VOYAGER_PLACENEXT_FLATNESS (or -Dvoyager.placenext.flatness)
+    // to retune once the operator's builder-terracing test fixes the real limit.
+    private static int defaultFlatnessThreshold() {
+        String v = System.getenv("VOYAGER_PLACENEXT_FLATNESS");
+        if (v == null || v.isEmpty()) v = System.getProperty("voyager.placenext.flatness");
+        if (v != null && !v.isEmpty()) {
+            try { return Integer.parseInt(v.trim()); } catch (NumberFormatException ignored) {}
+        }
+        return 3;
+    }
+
     // Finds the nearest valid anchor position for a building type within the
     // colony's territory. Returns {x, y, z} or null if no valid position exists.
     private int[] findPlacementPos(String blockId, int colonyId) {
+        return findPlacementPos(blockId, colonyId, defaultFlatnessThreshold());
+    }
+
+    private int[] findPlacementPos(String blockId, int colonyId, int flatnessThreshold) {
         ServerLevel level = server.overworld();
         IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
         if (colony == null) return null;
@@ -4150,11 +4185,17 @@ public class VoyagerBridge {
         // claims are capped by the maxColonySize config (20 chunks = 320 blocks),
         // so the scan radius just needs to stay ahead of the claim frontier.
         final int MAX_DIST = 200;
-        // center.getY() is the townhall anchor = one above the terrain's top
-        // solid block, i.e. where a groundAnchorOffset==1 anchor belongs. Taller
-        // offsets raise the anchor so the blueprint's ground layer stays flush
-        // with the terrain instead of being excavated in.
-        final int Y = center.getY() - 1 + groundAnchorOffset;
+        // Baseline anchor Y, townhall-relative. center.getY() is the townhall
+        // anchor = one above the terrain's top solid block, i.e. where a
+        // groundAnchorOffset==1 anchor belongs. Taller offsets raise the anchor
+        // so the blueprint's ground layer stays flush with the terrain instead
+        // of being excavated in. On a flat world this is the actual placement Y
+        // for every candidate (matching the pre-terrain behaviour); on rolling
+        // terrain it is used only for the Y-insensitive candidate gates below
+        // (claim/isInBuilding/builder-proximity), while the real per-cell
+        // placement Y is derived from the sampled surface once a candidate clears
+        // the XZ collision check.
+        final int baselineY = center.getY() - 1 + groundAnchorOffset;
 
         java.util.List<int[]> offsets = new java.util.ArrayList<>(15000);
         for (int dx = -MAX_DIST; dx <= MAX_DIST; dx++) {
@@ -4184,10 +4225,17 @@ public class VoyagerBridge {
             }
         }
 
+        // Fallback bookkeeping: if no candidate clears the flatness gate within
+        // the whole scan disc we must still return *something* (placement must
+        // never fail), so we remember the collision-free candidate with the
+        // smallest terrain spread and use it, logging that terraform is needed.
+        int fbX = 0, fbY = 0, fbZ = 0, fbSpread = Integer.MAX_VALUE;
+        boolean haveFallback = false;
+
         for (int[] off : offsets) {
             int nx = center.getX() + off[0];
             int nz = center.getZ() + off[1];
-            BlockPos anchor = new BlockPos(nx, Y, nz);
+            BlockPos anchor = new BlockPos(nx, baselineY, nz);
             if (!colony.isCoordInColony(level, anchor)) continue;
             if (!builderHuts.isEmpty() && builderHuts.stream()
                     .noneMatch(h -> h.distSqr(anchor) <= PLACE_NEAR_BUILDER_SQ)) {
@@ -4216,9 +4264,126 @@ public class VoyagerBridge {
                     break;
                 }
             }
-            if (!conflict) return new int[]{nx, Y, nz};
+            if (conflict) continue;
+
+            // Candidate is collision-free. Only now (per the perf budget) do we
+            // pay for surface sampling: sample the real terrain height across the
+            // building's footprint and decide the per-cell placement Y.
+            int[] sample = sampleFootprintSurface(
+                level, cMinX, cMinZ, cMaxX, cMaxZ);
+            int repFloor = sample[0];   // modal getHeight (floor = top solid + 1)
+            int spread   = sample[1];   // max-min surface Y across the footprint
+
+            // repFloor is where a building floor rests (top solid block + 1), the
+            // same convention center.getY() encodes at the townhall. The current
+            // Y formula is center.getY()-1+groundAnchorOffset = townhallTopSolid +
+            // offset; substituting this cell's top solid block (repFloor-1) gives
+            // the terrain-relative anchor. On flat terrain repFloor == the
+            // townhall floor for every column, so this reduces to the old
+            // baselineY exactly (backward-compatible).
+            int terrainY = repFloor - 1 + groundAnchorOffset;
+
+            if (spread <= flatnessThreshold) {
+                return new int[]{nx, terrainY, nz};
+            }
+            // Too steep for the builder to terrace cleanly: remember the flattest
+            // such cell as a last resort and keep scanning for a gate-passing one.
+            if (spread < fbSpread) {
+                fbSpread = spread;
+                fbX = nx; fbY = terrainY; fbZ = nz;
+                haveFallback = true;
+            }
+        }
+
+        if (haveFallback) {
+            // No cell within the whole scan disc met the flatness gate. Placement
+            // must not fail, so we use the flattest collision-free candidate. It
+            // will build on uneven ground until terraforming (Agent C - flatten
+            // the footprint to a pad before building) is implemented.
+            LOGGER.warn("placeNext[{}]: no footprint within flatness<=" + flatnessThreshold
+                    + " for colony {}; falling back to flattest candidate at ({},{},{}) "
+                    + "with terrain spread {} - TERRAFORM NEEDED (Agent C, not yet implemented)",
+                    blockId, colonyId, fbX, fbY, fbZ, fbSpread);
+            return new int[]{fbX, fbY, fbZ};
         }
         return null;
+    }
+
+    // Samples the terrain surface Y across a building footprint (inclusive world
+    // rect [minX..maxX] x [minZ..maxZ]) and returns {representativeFloorY, spread}:
+    //   - representativeFloorY: the modal level.getHeight(MOTION_BLOCKING_NO_LEAVES)
+    //     over the sampled columns (median on a multimodal tie). This is the same
+    //     heightmap the /surfaceY & /heightmap endpoints (Agent A) use, and
+    //     getHeight returns the floor (first empty y ABOVE the top solid block).
+    //     Mode minimises how much the builder must cut/fill vs the surrounding
+    //     ground.
+    //   - spread: max-min getHeight across the samples = the footprint's step
+    //     height, used by the flatness gate.
+    // Perf: instead of every column (a farmer footprint is 25x20 = 500 columns,
+    // times many candidates), we subsample on a fixed stride and always include
+    // the far edges/corners. getHeight is a cheap heightmap array lookup once the
+    // chunk is loaded, so this is a handful of reads per candidate. On flat
+    // terrain every sample is identical -> mode == that Y and spread == 0, so the
+    // gate always passes and the result matches the pre-terrain behaviour exactly.
+    private int[] sampleFootprintSurface(ServerLevel level,
+            int minX, int minZ, int maxX, int maxZ) {
+        final Heightmap.Types type = Heightmap.Types.MOTION_BLOCKING_NO_LEAVES;
+        final int STRIDE = 4;
+
+        // Ensure the footprint's chunks are loaded before reading heightmaps (see
+        // handleSurfaceY). getChunk returns cached chunks cheaply, so this is
+        // O(#chunks) not O(#columns).
+        for (int cx = minX >> 4; cx <= (maxX >> 4); cx++) {
+            for (int cz = minZ >> 4; cz <= (maxZ >> 4); cz++) {
+                level.getChunk(cx, cz);
+            }
+        }
+
+        int[] xs = strideCoords(minX, maxX, STRIDE);
+        int[] zs = strideCoords(minZ, maxZ, STRIDE);
+        java.util.Map<Integer, Integer> counts = new java.util.HashMap<>();
+        int min = Integer.MAX_VALUE, max = Integer.MIN_VALUE;
+        for (int x : xs) {
+            for (int z : zs) {
+                int y = level.getHeight(type, x, z);
+                counts.merge(y, 1, Integer::sum);
+                if (y < min) min = y;
+                if (y > max) max = y;
+            }
+        }
+        int spread = (min == Integer.MAX_VALUE) ? 0 : (max - min);
+        return new int[]{modeOrMedian(counts), spread};
+    }
+
+    // Sample coordinates from lo..hi on the given stride, always including both
+    // endpoints (so opposite footprint edges/corners are covered exactly).
+    private static int[] strideCoords(int lo, int hi, int stride) {
+        java.util.List<Integer> l = new java.util.ArrayList<>();
+        for (int v = lo; v < hi; v += stride) l.add(v);
+        l.add(hi);
+        int[] a = new int[l.size()];
+        for (int i = 0; i < a.length; i++) a[i] = l.get(i);
+        return a;
+    }
+
+    // Modal key of a value->count histogram; on a multimodal tie (2+ keys share
+    // the top count) falls back to the count-weighted median, which is more
+    // robust for a bimodal footprint straddling two terraces.
+    private static int modeOrMedian(java.util.Map<Integer, Integer> counts) {
+        if (counts.isEmpty()) return 0;
+        int bestY = 0, bestCount = -1, tie = 0;
+        for (java.util.Map.Entry<Integer, Integer> e : counts.entrySet()) {
+            int c = e.getValue();
+            if (c > bestCount) { bestCount = c; bestY = e.getKey(); tie = 1; }
+            else if (c == bestCount) { tie++; }
+        }
+        if (tie <= 1) return bestY;
+        java.util.List<Integer> ys = new java.util.ArrayList<>();
+        for (java.util.Map.Entry<Integer, Integer> e : counts.entrySet()) {
+            for (int i = 0; i < e.getValue(); i++) ys.add(e.getKey());
+        }
+        java.util.Collections.sort(ys);
+        return ys.get(ys.size() / 2);
     }
 
     // Buildings that require university research before they can be built.
