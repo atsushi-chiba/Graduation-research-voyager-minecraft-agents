@@ -539,32 +539,55 @@ public class VoyagerBridge {
     private String foundOnServerThread(int x, int y, int z, String colonyName) {
         ServerLevel level = server.overworld();
         Player fakePlayer = new FakePlayer(level, AI_PROFILE);
-
-        // placing a townhall block already triggers MineColonies' setPlacedBy which
-        // auto-creates the colony - check for that before attempting a second createColony
-        IColony existingOwned = IColonyManager.getInstance().getIColonyByOwner(level, fakePlayer);
-        if (existingOwned != null) {
-            try { existingOwned.setName(colonyName); } catch (Exception ignored) {}
-            String packName = existingOwned.getStructurePack();
-            return "founded colony " + existingOwned.getID() + " (" + colonyName + ")"
-                + (packName != null && !packName.isEmpty() ? " with pack " + packName : "");
-        }
-
         BlockPos pos = new BlockPos(x, y, z);
-        BlockEntity tileEntity = level.getBlockEntity(pos);
-        if (!(tileEntity instanceof TileEntityColonyBuilding)) {
-            return "ERROR: no colony building tile entity at " + x + "," + y + "," + z;
-        }
-        TileEntityColonyBuilding hut = (TileEntityColonyBuilding) tileEntity;
 
-        StructurePackMeta pack = getPinnedPack();
-        if (pack == null) {
-            return "ERROR: no structure packs registered";
+        // Placing a town-hall block already fires MineColonies' setPlacedBy, which
+        // auto-creates a colony owned by the FakePlayer. So a colony usually exists
+        // here already; only create one if it doesn't yet (a race where found ran
+        // before the auto-creation finished).
+        IColony owned = IColonyManager.getInstance().getIColonyByOwner(level, fakePlayer);
+        if (owned == null) {
+            BlockEntity tileEntity = level.getBlockEntity(pos);
+            if (!(tileEntity instanceof TileEntityColonyBuilding)) {
+                return "ERROR: no colony building tile entity at " + x + "," + y + "," + z;
+            }
+            StructurePackMeta pack = getPinnedPack();
+            if (pack == null) {
+                return "ERROR: no structure packs registered";
+            }
+            try {
+                IColony created = IColonyManager.getInstance().createColony(level, pos, fakePlayer, colonyName, pack.getName());
+                created.getServerBuildingManager().addNewBuilding((TileEntityColonyBuilding) tileEntity, level);
+                owned = created;
+            } catch (Exception e) {
+                // createColony can NPE when the town-hall block entity isn't fully
+                // linked yet (AbstractSchematicProvider.getTileEntity() null). The
+                // setPlacedBy auto-creation usually wins that race - re-fetch it.
+                owned = IColonyManager.getInstance().getIColonyByOwner(level, fakePlayer);
+                if (owned == null) {
+                    return "ERROR: found failed (" + e + ") and no auto-created colony present";
+                }
+            }
         }
 
-        IColony created = IColonyManager.getInstance().createColony(level, pos, fakePlayer, colonyName, pack.getName());
-        created.getServerBuildingManager().addNewBuilding(hut, level);
-        return "founded colony " + created.getID() + " (" + colonyName + ") with pack " + pack.getName();
+        try { owned.setName(colonyName); } catch (Exception ignored) {}
+        // An auto-created (setPlacedBy) colony defers its chunk claim, which is
+        // never applied for an unattended colony - leaving the town hall
+        // !inTerritory and blocking upgrades/work orders. Force the claim now,
+        // mirroring the requestBuild/placeNext claim self-heal.
+        try {
+            IBuilding th = owned.getServerBuildingManager().getBuilding(pos);
+            if (th != null) {
+                forceLoadAndClaim(owned, level, pos, th.getClaimRadius(Math.max(1, th.getBuildingLevel())), th.getCorners());
+            } else {
+                forceLoadAndClaim(owned, level, pos, 2, null);
+            }
+        } catch (Exception e) {
+            LOGGER.warn("found: territory claim self-heal failed at {}: {}", pos, e.toString());
+        }
+        String packName = owned.getStructurePack();
+        return "founded colony " + owned.getID() + " (" + colonyName + ")"
+            + (packName != null && !packName.isEmpty() ? " with pack " + packName : "");
     }
 
     // POST /spawnCitizen?colonyId=1
