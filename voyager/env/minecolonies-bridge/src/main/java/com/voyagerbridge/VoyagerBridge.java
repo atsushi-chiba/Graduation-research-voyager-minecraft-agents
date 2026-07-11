@@ -3790,6 +3790,128 @@ public class VoyagerBridge {
         BUILDING_FOOTPRINTS.put("courier",     new int[]{4, 2});
     }
 
+    // ----------------------------------------------------------------------
+    // District zoning for placeNext (2026-07-11, Agent E).
+    //
+    // Keys are the block registry path with the "blockhut" prefix stripped
+    // (same normalisation findPlacementPos applies to `typeName`, and the same
+    // form used by BLUEPRINT_PATHS / BUILDING_FOOTPRINTS). Values are one of the
+    // 5 layout zones. "guardtower" and "citizen" are deliberately NOT listed
+    // here: they take the special ring / round-robin logic in findPlacementPos.
+    //
+    // Anything not in this map (and not guardtower/citizen) falls back to
+    // "secondary" - crafters are the largest, most heterogeneous family, so an
+    // unclassified new hut most likely belongs to the industrial ring; the
+    // fallback is logged so an unmapped building is easy to spot.
+    private static final java.util.Map<String, String> ZONE_MAP = new java.util.HashMap<>();
+    static {
+        // center: town core - governance, logistics, food service.
+        for (String s : new String[]{
+                "townhall", "builder", "warehouse", "deliveryman", "courier",
+                "cook", "kitchen", "tavern"}) ZONE_MAP.put(s, "center");
+        // primary (raw production / gathering).
+        for (String s : new String[]{
+                "farmer", "lumberjack", "miner", "cowboy", "shepherd",
+                "chickenherder", "swineherder", "fisherman", "beekeeper",
+                "plantation", "florist", "rabbithutch"}) ZONE_MAP.put(s, "primary");
+        // secondary (crafting / processing).
+        for (String s : new String[]{
+                "sawmill", "stonemason", "smeltery", "blacksmith", "baker",
+                "mechanic", "fletcher", "stonesmeltery", "composter", "crusher",
+                "concretemixer", "dyer", "glassblower", "sifter", "alchemist",
+                "netherworker"}) ZONE_MAP.put(s, "secondary");
+        // academic (research / learning / healing).
+        for (String s : new String[]{
+                "university", "library", "school", "hospital",
+                "enchanter"}) ZONE_MAP.put(s, "academic");
+        // military.
+        for (String s : new String[]{
+                "barracks", "barrackstower", "archery", "combatacademy",
+                "gatehouse", "graveyard"}) ZONE_MAP.put(s, "military");
+    }
+
+    // R1: radius (blocks) of the central hub. center-zone buildings live inside
+    // this disc; everything else lives in one of the 4 directional rings beyond
+    // it. Override with VOYAGER_ZONE_R1 / -Dvoyager.zone.r1.
+    private static double zoneCenterRadius() {
+        Double v = readDoubleProp("VOYAGER_ZONE_R1", "voyager.zone.r1");
+        return v != null ? v : 28.0;
+    }
+
+    // R2: nominal radius of the guardtower boundary ring (one tower per diagonal
+    // corner). Override with VOYAGER_ZONE_R2 / -Dvoyager.zone.r2.
+    private static double zoneGuardRadius() {
+        Double v = readDoubleProp("VOYAGER_ZONE_R2", "voyager.zone.r2");
+        return v != null ? v : 44.0;
+    }
+
+    private static Double readDoubleProp(String env, String prop) {
+        String v = System.getenv(env);
+        if (v == null || v.isEmpty()) v = System.getProperty(prop);
+        if (v != null && !v.isEmpty()) {
+            try { return Double.parseDouble(v.trim()); } catch (NumberFormatException ignored) {}
+        }
+        return null;
+    }
+
+    // Zone of a candidate offset (dx,dz) from the colony center. r<=R1 is the
+    // central hub; beyond it the plane is split into 4 quadrants along the
+    // diagonals. N/S claim the diagonal ties (>=) so the partition is total and
+    // disjoint (E/W use strict >): every (dx,dz) maps to exactly one zone.
+    //   primary  = north (dz<0)   academic = south (dz>0)
+    //   secondary= east  (dx>0)   military = west  (dx<0)
+    private static String zoneOf(int dx, int dz, double r1) {
+        double r = Math.sqrt((double) dx * dx + (double) dz * dz);
+        if (r <= r1) return "center";
+        int adx = Math.abs(dx), adz = Math.abs(dz);
+        if (dz < 0 && adz >= adx) return "primary";   // north
+        if (dz > 0 && adz >= adx) return "academic";  // south
+        if (dx > 0 && adx > adz) return "secondary";  // east
+        return "military";                            // west (dx<0, adx>adz)
+    }
+
+    // Whether `cand` is an acceptable relaxed zone for a building that wants
+    // `required` (used only after no exact-zone site was found). The central
+    // hub is adjacent to every ring (central overflow spills outward, and a
+    // ring building may spill into the hub); perpendicular quadrants are
+    // adjacent; the opposite quadrant is not (last-resort "any zone" tier
+    // handles that). Exact matches are handled by the caller, not here.
+    private static boolean zoneAdjacent(String required, String cand) {
+        if (required.equals(cand)) return false;
+        if ("center".equals(required) || "center".equals(cand)) return true;
+        return !opposite(required).equals(cand);
+    }
+
+    private static String opposite(String zone) {
+        switch (zone) {
+            case "primary":   return "academic";
+            case "academic":  return "primary";
+            case "secondary": return "military";
+            case "military":  return "secondary";
+            default:          return "";
+        }
+    }
+
+    // Diagonal corner (NE/SE/SW/NW) an offset points toward. Ties on an axis
+    // fold to the east/south side (>=0). Used to spread guardtowers over the 4
+    // corners of the boundary ring.
+    private static String diagOf(int dx, int dz) {
+        String ns = (dz < 0) ? "N" : "S";
+        String ew = (dx >= 0) ? "E" : "W";
+        return ns + ew;
+    }
+
+    // A candidate is "diagonal-ish" (suitable for a corner tower) when neither
+    // axis dominates too strongly: the shorter leg is at least half the longer.
+    // That keeps towers roughly on the 45-degree diagonals (~27deg..63deg band)
+    // rather than sliding onto the N/S/E/W ring edges shared with the quadrants.
+    private static boolean diagonalish(int dx, int dz) {
+        int adx = Math.abs(dx), adz = Math.abs(dz);
+        if (adx == 0 || adz == 0) return false;
+        int lo = Math.min(adx, adz), hi = Math.max(adx, adz);
+        return lo * 2 >= hi;
+    }
+
     // Returns {minX, minZ, maxX, maxZ} of a placed building's actual in-world
     // footprint via IBuilding.getCorners(). getCorners() lazily computes the
     // corners: from the tile entity's schematic data when present, otherwise by
@@ -4110,6 +4232,58 @@ public class VoyagerBridge {
         return 3;
     }
 
+    // Registry path (no namespace) of the block at a building's anchor, e.g.
+    // "blockhutguardtower". Empty string if it can't be resolved.
+    private String buildingBlockPath(ServerLevel level, IBuilding b) {
+        ResourceLocation k = ForgeRegistries.BLOCKS.getKey(level.getBlockState(b.getPosition()).getBlock());
+        return k != null ? k.getPath() : "";
+    }
+
+    // Guardtowers are spread one-per-corner over the boundary ring. Pick the
+    // diagonal (NE/SE/SW/NW, in that deterministic order) that currently holds
+    // the fewest towers, so the 4 corners fill before any doubles up.
+    private String pickGuardtowerDiagonal(java.util.List<IBuilding> buildings,
+            ServerLevel level, BlockPos center) {
+        String[] diags = {"NE", "SE", "SW", "NW"};
+        java.util.Map<String, Integer> counts = new java.util.HashMap<>();
+        for (String d : diags) counts.put(d, 0);
+        for (IBuilding b : buildings) {
+            if (!"blockhutguardtower".equals(buildingBlockPath(level, b))) continue;
+            BlockPos p = b.getPosition();
+            counts.merge(diagOf(p.getX() - center.getX(), p.getZ() - center.getZ()), 1, Integer::sum);
+        }
+        String best = diags[0];
+        int bestCount = Integer.MAX_VALUE;
+        for (String d : diags) {
+            if (counts.get(d) < bestCount) { bestCount = counts.get(d); best = d; }
+        }
+        return best;
+    }
+
+    // Residences (blockhutcitizen) are distributed round-robin across the 4
+    // directional districts so optimizeHomes later assigns workers to homes near
+    // their workplace. Returns the quadrant zone with the fewest houses (ties
+    // broken primary>secondary>academic>military). Houses that landed in the
+    // central hub don't count toward any quadrant.
+    private String pickLeastPopulatedResidenceZone(java.util.List<IBuilding> buildings,
+            ServerLevel level, BlockPos center, double r1) {
+        String[] zones = {"primary", "secondary", "academic", "military"};
+        java.util.Map<String, Integer> counts = new java.util.HashMap<>();
+        for (String z : zones) counts.put(z, 0);
+        for (IBuilding b : buildings) {
+            if (!"blockhutcitizen".equals(buildingBlockPath(level, b))) continue;
+            BlockPos p = b.getPosition();
+            String z = zoneOf(p.getX() - center.getX(), p.getZ() - center.getZ(), r1);
+            if (counts.containsKey(z)) counts.merge(z, 1, Integer::sum);
+        }
+        String best = zones[0];
+        int bestCount = Integer.MAX_VALUE;
+        for (String z : zones) {
+            if (counts.get(z) < bestCount) { bestCount = counts.get(z); best = z; }
+        }
+        return best;
+    }
+
     // Finds the nearest valid anchor position for a building type within the
     // colony's territory. Returns {x, y, z} or null if no valid position exists.
     private int[] findPlacementPos(String blockId, int colonyId) {
@@ -4225,6 +4399,38 @@ public class VoyagerBridge {
             }
         }
 
+        // District zoning (2026-07-11, Agent E). Every candidate (dx,dz) maps to
+        // a zone; a building is only placed in candidates matching its required
+        // zone, keeping the layout functionally clustered (workplaces / homes /
+        // food near each other). The existing terrain/water/flatness/collision/
+        // claim/builder-proximity gates are all still applied first - zoning is
+        // an extra accept/reject filter layered on the surviving candidates.
+        final double R1 = zoneCenterRadius();   // central hub radius
+        final double R2 = zoneGuardRadius();    // guardtower boundary ring radius
+        final boolean isGuardtower = "guardtower".equals(typeName);
+        final boolean isCitizen = "citizen".equals(typeName);
+        final String requiredZone;
+        final String targetDiag;
+        if (isGuardtower) {
+            requiredZone = "guardtower";
+            targetDiag = pickGuardtowerDiagonal(allBuildings, level, center);
+        } else if (isCitizen) {
+            requiredZone = pickLeastPopulatedResidenceZone(allBuildings, level, center, R1);
+            targetDiag = null;
+        } else {
+            String z = ZONE_MAP.get(typeName);
+            if (z == null) {
+                z = "secondary"; // unmapped hut -> industrial ring (see ZONE_MAP)
+                LOGGER.info("placeNext[{}]: type '{}' has no ZONE_MAP entry; "
+                        + "defaulting to zone 'secondary'", blockId, typeName);
+            }
+            requiredZone = z;
+            targetDiag = null;
+        }
+        LOGGER.info("placeNext[{}]: zoning colony {} -> requiredZone={}{} "
+                + "(R1={}, R2={})", blockId, colonyId, requiredZone,
+                isGuardtower ? " targetDiag=" + targetDiag : "", R1, R2);
+
         // Fallback bookkeeping: if no candidate clears the flatness gate within
         // the whole scan disc we must still return *something* (placement must
         // never fail). Two tiers, preferred first:
@@ -4236,6 +4442,20 @@ public class VoyagerBridge {
         boolean haveDry = false;
         int wetX = 0, wetY = 0, wetZ = 0, wetSpread = Integer.MAX_VALUE;
         boolean haveWet = false;
+
+        // Zone-relaxation fallbacks. All of these are DRY and pass the flatness
+        // gate (buildable as-is, no terraform) - only the *district* is
+        // compromised, so they rank above the terraform-needing steep tiers.
+        // Populated nearest-first (offsets are distance-sorted).
+        int adjX = 0, adjY = 0, adjZ = 0; boolean haveAdj = false;        // adjacent-zone dry+flat
+        int anyX = 0, anyY = 0, anyZ = 0; boolean haveAnyFlat = false;    // any-zone dry+flat
+        // Exact-zone but too steep for the flatness gate (keeps district, needs
+        // terracing); flattest such cell.
+        int exX = 0, exY = 0, exZ = 0, exSpread = Integer.MAX_VALUE; boolean haveEx = false;
+        // Guardtower: best on the target diagonal (min |r-R2|) and best on any
+        // diagonal (nearest fallback), both dry+flat.
+        int gX = 0, gY = 0, gZ = 0; long gScore = Long.MAX_VALUE; boolean haveG = false;
+        int gaX = 0, gaY = 0, gaZ = 0; boolean haveGAny = false;
 
         for (int[] off : offsets) {
             int nx = center.getX() + off[0];
@@ -4304,12 +4524,48 @@ public class VoyagerBridge {
                 continue;
             }
 
-            // Dry cell.
+            // Dry cell. Zone of this candidate (only depends on dx,dz).
+            final int dx = off[0], dz = off[1];
+            final double r = off[2] / 1000.0;   // Euclidean dist from center, blocks
+            final String candZone = zoneOf(dx, dz, R1);
+
             if (spread <= flatnessThreshold) {
-                return new int[]{nx, terrainY, nz};
+                // Dry AND flat: buildable with no terraform. Now apply zoning.
+                if (isGuardtower) {
+                    // Spread towers around the boundary ring corners. Ideal:
+                    // on the target diagonal, closest to radius R2.
+                    if (r >= R1 && diagonalish(dx, dz)) {
+                        String cd = diagOf(dx, dz);
+                        if (cd.equals(targetDiag)) {
+                            long score = Math.round(Math.abs(r - R2));
+                            if (score < gScore) {
+                                gScore = score; gX = nx; gY = terrainY; gZ = nz; haveG = true;
+                            }
+                        } else if (!haveGAny) {
+                            gaX = nx; gaY = terrainY; gaZ = nz; haveGAny = true;
+                        }
+                    }
+                    if (!haveAnyFlat) { anyX = nx; anyY = terrainY; anyZ = nz; haveAnyFlat = true; }
+                    continue;
+                }
+                // Regular building: exact zone wins (return the nearest such);
+                // otherwise remember relaxed tiers and keep scanning for an exact.
+                if (candZone.equals(requiredZone)) {
+                    return new int[]{nx, terrainY, nz};
+                }
+                if (!haveAdj && zoneAdjacent(requiredZone, candZone)) {
+                    adjX = nx; adjY = terrainY; adjZ = nz; haveAdj = true;
+                }
+                if (!haveAnyFlat) { anyX = nx; anyY = terrainY; anyZ = nz; haveAnyFlat = true; }
+                continue;
             }
-            // Dry but too steep for the builder to terrace cleanly: remember the
-            // flattest such (dry) cell and keep scanning for a gate-passing one.
+
+            // Dry but too steep for the builder to terrace cleanly. Prefer a
+            // steep cell that at least stays in the exact zone (keeps district).
+            if (!isGuardtower && candZone.equals(requiredZone) && spread < exSpread) {
+                exSpread = spread; exX = nx; exY = terrainY; exZ = nz; haveEx = true;
+            }
+            // remember the flattest such (dry) cell and keep scanning for a gate-passing one.
             if (spread < drySpread) {
                 drySpread = spread;
                 dryX = nx; dryY = terrainY; dryZ = nz;
@@ -4324,7 +4580,49 @@ public class VoyagerBridge {
             }
         }
 
-        // Fallback order (placement must never fail):
+        // No exact-zone dry+flat site was found. Relax, best-first. Zoning
+        // relaxation (still dry+flat, only the district compromised) is preferred
+        // over the terraform-needing steep tiers below.
+
+        // Guardtower: target diagonal, then any diagonal, before generic tiers.
+        if (isGuardtower) {
+            if (haveG) {
+                LOGGER.info("placeNext[{}]: guardtower on target diagonal {} near "
+                        + "ring R2={} at ({},{},{})", blockId, targetDiag, R2, gX, gY, gZ);
+                return new int[]{gX, gY, gZ};
+            }
+            if (haveGAny) {
+                LOGGER.info("placeNext[{}]: no buildable site on target diagonal {} "
+                        + "for colony {}; relaxing to nearest diagonal at ({},{},{})",
+                        blockId, targetDiag, colonyId, gaX, gaY, gaZ);
+                return new int[]{gaX, gaY, gaZ};
+            }
+        }
+
+        //   zone-relaxed (a): nearest adjacent-zone dry+flat candidate.
+        if (haveAdj) {
+            LOGGER.info("placeNext[{}]: zone '{}' had no buildable site in colony {}; "
+                    + "relaxing to adjacent district at ({},{},{})",
+                    blockId, requiredZone, colonyId, adjX, adjY, adjZ);
+            return new int[]{adjX, adjY, adjZ};
+        }
+        //   zone-relaxed (b): nearest dry+flat candidate anywhere (full circle).
+        if (haveAnyFlat) {
+            LOGGER.info("placeNext[{}]: zone '{}' and its neighbours had no buildable "
+                    + "site in colony {}; relaxing to any district at ({},{},{})",
+                    blockId, requiredZone, colonyId, anyX, anyY, anyZ);
+            return new int[]{anyX, anyY, anyZ};
+        }
+
+        // No dry+flat site in any zone -> terraform-needing fallbacks.
+        //   (exact-zone steep) keep the district, needs terracing.
+        if (haveEx) {
+            LOGGER.warn("placeNext[{}]: no flat site anywhere for colony {}; "
+                    + "using flattest exact-zone '{}' candidate at ({},{},{}) with spread {} "
+                    + "- TERRAFORM NEEDED (Agent C, not yet implemented)",
+                    blockId, colonyId, requiredZone, exX, exY, exZ, exSpread);
+            return new int[]{exX, exY, exZ};
+        }
         //   (a) flattest DRY candidate (avoids water, just needs terracing)
         if (haveDry) {
             LOGGER.warn("placeNext[{}]: no dry footprint within flatness<=" + flatnessThreshold
