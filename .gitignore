@@ -127,3 +127,5 @@ debug_*
 logs/
 plot_iter.py
 *.svg
+# claude agent worktrees
+.claude/worktrees/
