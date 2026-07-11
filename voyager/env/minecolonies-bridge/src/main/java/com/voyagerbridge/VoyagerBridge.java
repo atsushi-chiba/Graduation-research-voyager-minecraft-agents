@@ -164,7 +164,31 @@ public class VoyagerBridge {
         try {
             ServerLevel level = server.overworld();
             java.util.HashSet<Long> desired = new java.util.HashSet<>();
+            // Chunk radius (in chunks) of the always-loaded colony core. env
+            // VOYAGER_CORE_CHUNK_RADIUS overrides. Default 12 -> ~192 blocks,
+            // covering a compact colony; far build sites are handled per-hut below.
+            int coreR = 12;
+            try {
+                String cr = System.getenv("VOYAGER_CORE_CHUNK_RADIUS");
+                if (cr == null) cr = System.getProperty("voyager.core.chunkradius");
+                if (cr != null) coreR = Integer.parseInt(cr.trim());
+            } catch (Exception ignored) {}
             for (IColony colony : IColonyManager.getInstance().getAllColonies()) {
+                // Always keep the colony CORE loaded. The per-build-site set below
+                // is tiny and its cleanup calls setChunkForced(false), which -
+                // because vanilla forceload is one boolean per chunk - also clears
+                // the static start_server forceload on that chunk. As builds
+                // completed across the colony this unloaded citizen/work chunks and
+                // despawned workers (no-entity, construction frozen; seen on both
+                // superflat and normal worlds 2026-07-12). Pinning a core disc in
+                // `desired` keeps it force-loaded and off the unload path.
+                net.minecraft.core.BlockPos cc = colony.getCenter();
+                int ccx = cc.getX() >> 4, ccz = cc.getZ() >> 4;
+                for (int dx = -coreR; dx <= coreR; dx++) {
+                    for (int dz = -coreR; dz <= coreR; dz++) {
+                        desired.add((((long) (ccx + dx)) << 32) | ((ccz + dz) & 0xffffffffL));
+                    }
+                }
                 // Only the order each hut is BOUND to (workOrderId) - that's
                 // the one its builder is trying to start right now. Max one
                 // site per hut keeps the forced set small (~25 chunks/hut).
