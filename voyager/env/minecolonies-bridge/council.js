@@ -64,7 +64,7 @@ const MODEL = process.env.LLM_MODEL || "gemma4:e4b";
 const BRIDGE_HOST = "localhost";
 const BRIDGE_PORT = 8089;
 const CMD_PIPE = "/root/mc-server-forge/cmd_pipe";
-const COLONY_ID = 1;
+const COLONY_ID = parseInt(process.env.COLONY_ID || "1", 10);
 // Infinity = resident daemon. The 300-cycle cap predates the colony_watch
 // supervisor; with the cap, council exited every ~75min and the watch's
 // auto-restart fired a notification each time. Now a council death is an
@@ -77,7 +77,13 @@ const TURN_DELAY_MS = 2000;
 const CYCLE_DELAY_MS = 15000;
 const CITIZEN_VOICE_EVERY = 1;
 
-const ANCHOR = { x: 200, y: -60, z: 200 };
+// 通常ワールド移行対応(2026-07-11): env で上書き可。未設定なら旧スーパーフラット
+// 基盤コロニーの値(200,-60,200)を維持するので既存挙動は不変。
+const ANCHOR = {
+  x: parseInt(process.env.ANCHOR_X ?? "200", 10),
+  y: parseInt(process.env.ANCHOR_Y ?? "-60", 10),
+  z: parseInt(process.env.ANCHOR_Z ?? "200", 10),
+};
 
 const GOVERNORS = [
   {

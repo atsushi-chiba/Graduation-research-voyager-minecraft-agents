@@ -9,7 +9,7 @@ const http = require("http");
 
 const BRIDGE_HOST = "localhost";
 const BRIDGE_PORT = 8089;
-const COLONY_ID = 1;
+const COLONY_ID = parseInt(process.env.COLONY_ID || "1", 10);
 
 // Building types that have no assigned worker by design - grading them on
 // staffing would be a false FAIL.
