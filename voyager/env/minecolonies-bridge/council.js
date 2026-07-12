@@ -363,7 +363,14 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
       const k = String(b.type).replace(/^blockhut/, "");
       countByType[k] = (countByType[k] || 0) + 1;
     }
-    const unbuiltCount = buildings.filter((b) => !b.operational && b.level === 0).length;
+    // Pace gate for the town hall (below): it may only advance once the current
+    // stage is fully built. Research-locked empty shells are EXCLUDED - they are
+    // waiting on University research (never buildable now), so counting them
+    // would freeze town-hall progression forever and deadlock the whole colony
+    // at lv1 (user 2026-07-12 req 3). Only placeable-now unbuilt shells pace it.
+    const unbuiltPlaceableCount = buildings.filter(
+      (b) => !b.operational && b.level === 0 && !researchLocked(b.type)
+    ).length;
     const scaleCtx = {
       pop,
       totalBuildings: buildings.length,
@@ -392,19 +399,32 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
         // residence upgrade adds a citizen; skip while jobless surplus is high
         continue;
       } else if (
-        // Level target follows the town hall (2026-07-11). Non-townhall buildings
-        // upgrade only up to the town-hall level (MineColonies caps them there).
-        // - town hall: the exception - it leads (no builder-level gate) and
-        //   advances the stage, but only once the current stage is fully built
-        //   (no unbuilt placed buildings), so depth never races ahead of breadth.
-        // - builder: self-builds, so capped by town hall only (no builder gate).
-        // - others: capped by min(town hall, an operational builder that high).
+        // Leapfrog progression (user 2026-07-12). MineColonies requires a
+        // Builder's Hut one level AHEAD of the town hall before the town hall can
+        // advance (bridge-verified: townhall lv1->2 needs a builder hut lv2, and
+        // a builder hut CAN self-upgrade one level past the town hall). So:
+        // - builder: may lead the town hall by one level -> min(townHall+1, max).
+        //   This is the seed: at townHall lv1 the mayor can still order builder
+        //   lv1->2, which raises maxBuilderLevel and unblocks the town hall.
+        // - town hall: gated by maxBuilderLevel (needs a builder already at
+        //   level+1) AND by pace (current stage fully built, research-locked
+        //   shells excluded). Emitting it only once buildable avoids dead orders.
+        // - others: capped at the town-hall level and by an operational builder
+        //   that can already reach the next level.
+        // Order guaranteed: builder->lv2, then townhall->lv2, then others->lv2,
+        // then builder->lv3, ... the leapfrog cycle, mayor-driven end to end.
         b.type === "blockhuttownhall"
-          ? (unbuiltCount === 0 && b.level < (b.maxLevel ?? 5))
-          : (
-              b.level < Math.min(townHallLevel, b.maxLevel ?? 5) &&
-              (b.type === "blockhutbuilder" || b.level + 1 <= maxBuilderLevel)
+          ? (
+              b.level + 1 <= maxBuilderLevel &&
+              unbuiltPlaceableCount === 0 &&
+              b.level < (b.maxLevel ?? 5)
             )
+          : b.type === "blockhutbuilder"
+            ? b.level < Math.min(townHallLevel + 1, b.maxLevel ?? 5)
+            : (
+                b.level < Math.min(townHallLevel, b.maxLevel ?? 5) &&
+                b.level + 1 <= maxBuilderLevel
+              )
       ) {
         // maxLevel comes from /status (building.getMaxBuildingLevel()) - e.g.
         // Colonial tavern caps at 3, postbox at 1; offering those upgrades
