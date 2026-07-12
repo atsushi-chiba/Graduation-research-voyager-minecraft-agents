@@ -4678,16 +4678,15 @@ public class VoyagerBridge {
                     blockId, colonyId, dryX, dryY, dryZ, drySpread);
             return new int[]{dryX, dryY, dryZ};
         }
-        //   (b) no dry site anywhere in the disc -> old behaviour (flattest of
-        //       any kind, possibly on water). Anchor Y is still OCEAN_FLOOR so it
-        //       sits on the seabed, not the water surface, but it needs water
-        //       handling to be usable.
+        //   (b) no dry site anywhere in the disc. REFUSE to build on water - a
+        //       water-placed hut (submerged/flooded) is worse than an unplaced one
+        //       (user 2026-07-12: shepherd/beekeeper in water). Placement fails, so
+        //       the mayor just doesn't add this building until the colony has dry
+        //       land (terraform or a larger dry footprint would unblock it).
         if (haveWet) {
-            LOGGER.warn("placeNext[{}]: no dry buildable site for colony {}; "
-                    + "falling back to flattest candidate at ({},{},{}) with spread {} "
-                    + "- TERRAFORM/water handling needed (Agent C, not yet implemented)",
-                    blockId, colonyId, wetX, wetY, wetZ, wetSpread);
-            return new int[]{wetX, wetY, wetZ};
+            LOGGER.warn("placeNext[{}]: no dry buildable site for colony {} - "
+                    + "refusing to place on water (needs terraform / more dry land); skipping",
+                    blockId, colonyId);
         }
         return null;
     }
