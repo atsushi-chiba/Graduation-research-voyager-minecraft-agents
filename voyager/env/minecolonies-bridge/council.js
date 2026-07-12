@@ -240,8 +240,32 @@ const SCALE_RULES = {
 };
 const targetCount = (regKey, ctx) => (SCALE_RULES[regKey] ? SCALE_RULES[regKey](ctx) : 1);
 
+// Buildings whose CONSTRUCTION is gated behind completed University research.
+// Mirror of RESEARCH_GATED_BUILDINGS in the bridge Java (VoyagerBridge.java,
+// the source of truth) - the same static list drives both the /status
+// "researchUnlocked" array and requestBuild's "requires university research"
+// rejection. A gated type is placeable iff its path appears in
+// colony.researchUnlocked (bridge only lists a gated type there once its
+// unlock-effect strength > 0). Non-gated types are always placeable. Keeping
+// this list in sync with the Java is required whenever that set changes.
+const RESEARCH_GATED_BUILDINGS = new Set([
+  "blockhutalchemist", "blockhutarchery", "blockhutbarracks",
+  "blockhutblacksmith", "blockhutcombatacademy", "blockhutcomposter",
+  "blockhutconcretemixer", "blockhutcrusher", "blockhutdyer",
+  "blockhutenchanter", "blockhutfletcher", "blockhutflorist",
+  "blockhutglassblower", "blockhutgraveyard", "blockhuthospital",
+  "blockhutlibrary", "blockhutmechanic", "blockhutmysticalsite",
+  "blockhutnetherworker", "blockhutplantation", "blockhutsawmill",
+  "blockhutschool", "blockhutsifter", "blockhutsmeltery",
+  "blockhutstonemason", "blockhutstonesmeltery",
+]);
+
 function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
   const candidates = [{ label: "wait(様子見。建設中で他にやることがない時のみ)", action: { action: "wait" } }];
+  // Set when some wanted building can't be placed/built yet because its
+  // University research is incomplete; read after the colony block to drive
+  // University-first pinning.
+  let researchBlockedPending = false;
   const colony = status[0];
   if (colony) {
     // Only offer the spawn cheat while there are free beds - gemma otherwise
@@ -277,6 +301,21 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
     // already has (the hut itself may self-upgrade one level ahead). Doomed
     // upgrade candidates are filtered out entirely - the model otherwise keeps
     // picking them and collecting level-gate errors.
+    // Research placement gate (user 2026-07-12): stop the mayor placing
+    // research-locked buildings (sawmill/stonemason/blacksmith/hospital/...)
+    // that requestBuild then refuses with "requires university research",
+    // leaving empty shells and idle builders. colony.researchUnlocked lists
+    // the gated types whose unlock research the bridge has confirmed complete
+    // (effect strength > 0); any other gated type is currently unplaceable.
+    // researchBlockedPending records that something WOULD be built but for a
+    // missing research, which drives University-first below. (Missing field =>
+    // empty set => gated types held back; requires the bridge that emits
+    // researchUnlocked, already deployed.)
+    const researchUnlocked = new Set(colony.researchUnlocked || []);
+    const researchLocked = (block) => {
+      const p = String(block).replace(/^minecolonies:/, "");
+      return RESEARCH_GATED_BUILDINGS.has(p) && !researchUnlocked.has(p);
+    };
     const buildings = colony.buildings || [];
     const maxBuilderLevel = Math.max(
       0,
@@ -309,6 +348,9 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
       if (backlogFull) break;
       if (b.pending || !b.inTerritory) continue;
       if (!b.operational) {
+        // Research-locked shell: requestBuild would just error. Don't offer it
+        // (and flag the block so University gets prioritized to unlock it).
+        if (researchLocked(b.type)) { researchBlockedPending = true; continue; }
         candidates.push({
           label: `requestBuild ${b.type} @(${b.x},${b.y},${b.z}) 未着工→着工させる(重要)`,
           action: { action: "requestBuild", x: b.x, y: b.y, z: b.z },
@@ -369,11 +411,20 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
     // placed luxury buildings as readily as farms - 2026-07-11.)
     if (!backlogFull) {
       const tierOf = (v) => (typeof v.tier === "number" ? v.tier : 4);
-      const wanted = (regKey, v) =>
+      // "wanted by count" ignoring the research gate - used to detect types the
+      // mayor would place if the research were done (drives University-first).
+      const wantedByCount = (regKey, v) =>
         v.blueprint !== null &&
         v.block !== "minecolonies:blockhuttownhall" &&
         regKey !== "citizen" &&
         (countByType[regKey] || 0) < targetCount(regKey, scaleCtx);
+      // Placeable now = wanted AND not research-locked. activeTier is computed
+      // from this set, so a tier isn't considered "filled" by a type that can't
+      // actually be placed yet, and locked types never surface as candidates.
+      const wanted = (regKey, v) => wantedByCount(regKey, v) && !researchLocked(v.block);
+      for (const [regKey, v] of Object.entries(BUILDING_REGISTRY)) {
+        if (wantedByCount(regKey, v) && researchLocked(v.block)) { researchBlockedPending = true; break; }
+      }
       let activeTier = Infinity;
       for (const [regKey, v] of Object.entries(BUILDING_REGISTRY)) {
         if (wanted(regKey, v) && tierOf(v) < activeTier) activeTier = tierOf(v);
@@ -402,12 +453,24 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
   // alchemist placements (2026-07-07 post-mortem). Randomizing the order
   // spreads the bias uniformly so no building type is systematically
   // favored; the dedup/backlog governors bound the damage of any one pick.
-  const rest = candidates.slice(1);
+  // University-first when research-blocked (user 2026-07-12). When something is
+  // stuck waiting on research, pin any University build/upgrade candidate to the
+  // front - out of the shuffle and emphatically labeled - so the mayor invests
+  // in research slots (concurrent research = University level) instead of
+  // placing more empty shells. If no University candidate exists (not yet
+  // placeable under the tier gate, or already at cap) this is a no-op.
+  let pinned = [];
+  let rest = candidates.slice(1);
+  if (researchBlockedPending) {
+    const isUni = (c) => typeof c.label === "string" && c.label.includes("blockhutuniversity");
+    pinned = rest.filter(isUni).map((c) => ({ ...c, label: `【研究待ち→最優先】${c.label}` }));
+    rest = rest.filter((c) => !isUni(c));
+  }
   for (let i = rest.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [rest[i], rest[j]] = [rest[j], rest[i]];
   }
-  return [candidates[0], ...rest];
+  return [candidates[0], ...pinned, ...rest];
 }
 
 function askLLM(model, messages, { format = null } = {}) {
