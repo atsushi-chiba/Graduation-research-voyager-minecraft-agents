@@ -177,9 +177,21 @@ function housingCapacity(colony) {
   }, 0);
 }
 
-// Map of buildingKey -> {research, level} for researches blocked ONLY by an
-// unmet building requirement (from /research "blocked"). Lets the menu tell
-// the governor "upgrading this also unlocks research X".
+// Research requirements name a building as "minecolonies:<schematic>". Every
+// name already equals the blockhut<name> key used elsewhere in the menu EXCEPT
+// the residence: research calls it "residence" but its hut block is
+// blockhutcitizen (key "citizen"). Alias it so a residence-level research
+// prerequisite (e.g. outpost=residence4, hamlet=residence5) matches the
+// residence upgrade candidate. Verified against the mod's research data
+// (2026-07-12): residence is the only mismatch among ~30 requirement buildings.
+const RESEARCH_BUILDING_ALIAS = { residence: "citizen" };
+
+// Map of buildingKey -> {research, level} for start-imminent researches whose
+// ONLY unmet requirement(s) are building levels (from /research "blocked").
+// "blocked" already implies canResearch = parent complete AND depth <=
+// university level, so these are the researches the University could start next
+// if the prerequisite building were tall enough. Drives both the "upgrading
+// this also unlocks research X" label and the research-prerequisite pin.
 async function getResearchNeeds() {
   try {
     const res = await httpRequest("GET", `/research?colonyId=${COLONY_ID}`);
@@ -187,10 +199,19 @@ async function getResearchNeeds() {
     const d = JSON.parse(res.body);
     const map = {};
     for (const blk of d.blocked || []) {
-      for (const need of blk.requirements || []) {
+      const reqs = blk.requirements || [];
+      // Skip researches that also need something non-building (alternate-building
+      // etc.): upgrading a building alone wouldn't start them, so pinning that
+      // upgrade would mislead the mayor. Non-building requirements arrive without
+      // a "building" field (the bridge emits "desc" for them instead).
+      if (reqs.some((n) => !n.met && !n.building)) continue;
+      for (const need of reqs) {
         if (need.met || !need.building) continue;
-        const key = need.building.split(":").pop().replace(/^blockhut/, "");
+        const raw = need.building.split(":").pop().replace(/^blockhut/, "");
+        const key = RESEARCH_BUILDING_ALIAS[raw] || raw;
         const research = blk.id.split("/").pop();
+        // Keep the nearest (lowest) required level, so the label/pin always aim
+        // at the next research this building would unlock, not a distant one.
         if (!map[key] || need.level < map[key].level) {
           map[key] = { research, level: need.level };
         }
@@ -392,7 +413,11 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
         const effect = upgradeEffect(b.type);
         const key = b.type.replace(/^blockhut/, "");
         const rn = researchNeeds[key];
-        const unlock = rn && b.level < rn.level
+        // This upgrade satisfies a research building-level prerequisite while the
+        // building is still below the required level - flag it so the pin below
+        // can lift it out of the shuffle (user 2026-07-12 req 1).
+        const isResearchPrereq = !!(rn && b.level < rn.level);
+        const unlock = isResearchPrereq
           ? `(さらに lv${rn.level} で研究「${rn.research}」が解禁される)` : "";
         const dem = demandRank[key];
         const demand = dem ? `【需要↑ ${dem.rank}位: この生産を増強すべき】` : "";
@@ -402,6 +427,11 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
           // Residence lv+1 = +1 bed, tavern lv+1 = +4 beds: both raise the
           // population ceiling, so mark them as population levers to be pinned.
           pop: b.type === "blockhutcitizen" || b.type === "blockhuttavern",
+          // Existing-building upgrade (lv->lv+1); upgradeType drives the
+          // builder-first ordering of the idle fallback pin below.
+          upgrade: true,
+          upgradeType: b.type,
+          researchPrereq: isResearchPrereq,
         });
       }
     }
@@ -484,8 +514,24 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
   // worker-less colony can't run research either. Respects housingFrozen
   // (populationNeeded is false when the jobless surplus is high, so a job
   // backlog never triggers more population). No-op if no pop lever qualifies.
+  // Research-prerequisite upgrades (user 2026-07-12 req 1). A start-imminent
+  // research is stuck only because a building is under-leveled; pin the upgrade
+  // that raises it to the required level so research doesn't stall on it. These
+  // candidates already passed the level-following gate (min(townHall,
+  // maxBuilder)) when created, so pinning only reorders - it never bypasses a
+  // gate or invents an upgrade beyond the town-hall level. Sits BELOW the
+  // University pin (raising University widens research capacity in general) and
+  // ABOVE the idle fallback.
+  // Idle fallback (user 2026-07-12 req 2). When nothing new can be placed (no
+  // placeNext survived the tier/count/research gates), stop the mayor idling on
+  // "wait" and pour effort into upgrading what exists - builder hut FIRST (a
+  // higher builder level means faster builds and a higher level cap for every
+  // other building), then core buildings, then the rest. When the backlog is
+  // full there are no upgrade candidates either, so this is a no-op then.
   let popPinned = [];
   let uniPinned = [];
+  let prereqPinned = [];
+  let upgradePinned = [];
   let rest = candidates.slice(1);
   if (populationNeeded) {
     const isPop = (c) => c.pop === true;
@@ -497,11 +543,28 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
     uniPinned = rest.filter(isUni).map((c) => ({ ...c, label: `【研究待ち→最優先】${c.label}` }));
     rest = rest.filter((c) => !isUni(c));
   }
+  {
+    const isPrereq = (c) => c.researchPrereq === true;
+    prereqPinned = rest.filter(isPrereq).map((c) => ({ ...c, label: `【研究前提→優先】${c.label}` }));
+    rest = rest.filter((c) => !isPrereq(c));
+  }
+  const hasNewBuild = candidates.some((c) => c.action && c.action.action === "placeNext");
+  if (!hasNewBuild) {
+    const CORE_ORDER = {
+      blockhutbuilder: 0, blockhuttownhall: 1, blockhutwarehouse: 2, blockhutuniversity: 3,
+    };
+    const rank = (c) => (c.upgradeType in CORE_ORDER ? CORE_ORDER[c.upgradeType] : 9);
+    upgradePinned = rest
+      .filter((c) => c.upgrade === true)
+      .sort((a, b) => rank(a) - rank(b))
+      .map((c) => ({ ...c, label: `【新規建設なし→アップグレード優先】${c.label}` }));
+    rest = rest.filter((c) => c.upgrade !== true);
+  }
   for (let i = rest.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [rest[i], rest[j]] = [rest[j], rest[i]];
   }
-  return [candidates[0], ...popPinned, ...uniPinned, ...rest];
+  return [candidates[0], ...popPinned, ...uniPinned, ...prereqPinned, ...upgradePinned, ...rest];
 }
 
 function askLLM(model, messages, { format = null } = {}) {
