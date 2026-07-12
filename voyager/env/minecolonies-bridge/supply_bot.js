@@ -665,6 +665,85 @@ async function autoResearch(colony, cycle) {
   return 0;
 }
 
+// Population ceiling = available beds + research. The base MineColonies cap is
+// 25 citizens; the only way past it is the civilian research chain
+// keen -> outpost -> hamlet -> village -> city (each adds a citizencapaddition
+// effect). autoResearch already starts these when reachable, but it competes
+// with every other shallow research for the limited slots (= university level);
+// when the colony is pushing against the cap AND still has empty workplaces we
+// give this chain an explicit head start (user 2026-07-12).
+const POP_CAP_BRANCH = "minecolonies:civilian";
+// Ordered shallow->deep; outpost needs residence lv4, hamlet residence lv5,
+// village town-hall lv4, city town-hall lv5 (verified against the mod jar).
+const POP_CAP_CHAIN = [
+  "minecolonies:civilian/keen",
+  "minecolonies:civilian/outpost",
+  "minecolonies:civilian/hamlet",
+  "minecolonies:civilian/village",
+  "minecolonies:civilian/city",
+];
+async function prioritizePopulationResearch(colony, cycle) {
+  if (cycle % 10 !== 6) return 0; // offset a few ticks from autoResearch (cycle%10==1)
+  const buildings = colony.buildings || [];
+  const pop = (colony.citizens || []).length;
+  const jobBuildings = buildings.filter(
+    (b) => b.operational && b.type !== "blockhuttownhall" && b.type !== "blockhutcitizen"
+  ).length;
+  const unfilledJobs = Math.max(0, jobBuildings - pop);
+  // Only near the ceiling (approaching the base cap of 25) with jobs still to
+  // fill - otherwise more beds/spawns raise the population without any research.
+  if (unfilledJobs <= 0 || pop < 23) return 0;
+  try {
+    const res = await httpRequest("GET", `/research?colonyId=${colony.id}`);
+    if (res.status !== 200) return 0; // no university yet
+    const d = JSON.parse(res.body);
+    const uniLevel = d.universityLevel || 0;
+    if (uniLevel <= 0) return 0;
+    const branch = (d.branches || []).find((b) => b.branch === POP_CAP_BRANCH);
+    if (!branch) return 0;
+    const byId = new Map((branch.researches || []).map((r) => [r.id, r]));
+    // Walk the chain in order. Skip FINISHED, stop on the first NOT_STARTED that
+    // is actually startable (parent finished by the loop invariant, depth within
+    // university level, building requirements met). The direct startResearch
+    // path skips vanilla's depth/requirement checks, so we enforce them here.
+    for (const id of POP_CAP_CHAIN) {
+      const r = byId.get(id);
+      if (!r) continue;
+      if (r.state === "FINISHED") continue;
+      if (r.state !== "NOT_STARTED") return 0; // IN_PROGRESS: chain already advancing
+      if (r.depth > uniLevel) {
+        console.log(
+          `[supply #${cycle}] pop-cap research ${id} needs university lv${r.depth} (have ${uniLevel}); upgrade University`
+        );
+        return 0;
+      }
+      const unmet = (r.requirements || []).filter((rq) => !rq.met);
+      if (unmet.length > 0) {
+        console.log(
+          `[supply #${cycle}] pop-cap research ${id} blocked by: ` +
+            unmet.map((rq) => rq.desc || rq.building || "requirement").join(", ")
+        );
+        return 0;
+      }
+      const sr = await httpRequest(
+        "POST",
+        `/startResearch?colonyId=${colony.id}&branch=${encodeURIComponent(POP_CAP_BRANCH)}&id=${encodeURIComponent(id)}`
+      );
+      if (sr.status === 200) {
+        console.log(
+          `[supply #${cycle}] started population-cap research ${id} (pop ${pop}, unfilled jobs ${unfilledJobs})`
+        );
+        return 1;
+      }
+      console.log(`[supply #${cycle}] startResearch ${id} failed: ${sr.body}`);
+      return 0;
+    }
+  } catch {
+    // transient - retry next round
+  }
+  return 0;
+}
+
 // Keep the restaurant's racks stocked with every menu food so the cook can
 // serve arrivals immediately (the built-in MinimumStock pipeline is too slow
 // at 10x and citizens loiter at the restaurant waiting to be fed).
@@ -854,6 +933,7 @@ async function loop() {
         totalResolved += await feedHungryCitizens(colony, cycle);
         totalResolved += await stockRestaurants(colony, cycle);
         totalResolved += await autoResearch(colony, cycle);
+        totalResolved += await prioritizePopulationResearch(colony, cycle);
         totalResolved += await seedFarmFields(colony, cycle);
         totalResolved += await autoAssignJobs(colony, cycle);
         totalResolved += await optimizeHomes(colony, cycle);

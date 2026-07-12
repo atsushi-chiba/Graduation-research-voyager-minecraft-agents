@@ -266,6 +266,10 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
   // University research is incomplete; read after the colony block to drive
   // University-first pinning.
   let researchBlockedPending = false;
+  // Set when workplaces outnumber citizens (unfilled job slots) so the
+  // population levers get pinned to the front of the menu; read after the
+  // colony block alongside researchBlockedPending.
+  let populationNeeded = false;
   const colony = status[0];
   if (colony) {
     // Only offer the spawn cheat while there are free beds - gemma otherwise
@@ -291,10 +295,18 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
     ).length;
     const HOUSING_UNEMPLOYMENT_CAP = 12;
     const housingFrozen = unemployedCount > HOUSING_UNEMPLOYMENT_CAP;
+    // Unfilled job slots: operational workplaces (jobBuildings) minus people.
+    // Only a genuine head-count shortfall counts - unemployed citizens auto-hire
+    // into empty workplaces, so pop<jobBuildings is the real "need more people"
+    // signal (user 2026-07-12: 就ける職場があるのに住民が足りないなら住民増を最優先).
+    // Frozen (jobless surplus high) => it's an assignment problem, not a pop one.
+    const unfilledJobs = Math.max(0, jobBuildings - pop);
+    populationNeeded = unfilledJobs > 0 && !housingFrozen;
     if (pop < housing && !housingFrozen) {
       candidates.push({
         label: `spawnCitizen(市民を1人追加。住居容量 ${housing} に空きあり)`,
         action: { action: "spawnCitizen", colonyId: COLONY_ID },
+        pop: true,
       });
     }
     // A building can only be upgraded to a level some operational builder hut
@@ -387,6 +399,9 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
         candidates.push({
           label: `requestBuild ${b.type} @(${b.x},${b.y},${b.z}) lv${b.level}→lv${b.level + 1}にアップグレード${effect ? "(効果: " + effect + ")" : ""}${unlock}${demand}`,
           action: { action: "requestBuild", x: b.x, y: b.y, z: b.z },
+          // Residence lv+1 = +1 bed, tavern lv+1 = +4 beds: both raise the
+          // population ceiling, so mark them as population levers to be pinned.
+          pop: b.type === "blockhutcitizen" || b.type === "blockhuttavern",
         });
       }
     }
@@ -398,6 +413,7 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
       candidates.push({
         label: `placeNext minecolonies:blockhutcitizen(住居の新設。容量${housing}<目標${targetPop}[就労建物${jobBuildings}]なので最優先級)`,
         action: { action: "placeNext", block: "minecolonies:blockhutcitizen" },
+        pop: true,
       });
     }
     // New buildings: what to place, in priority order. Two gates combine:
@@ -442,6 +458,8 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
         candidates.push({
           label: `placeNext ${v.block}(T${tierOf(v)}${countTag} ${v.job || "-"}: ${(v.role || "").slice(0, 40)}) 新設を配置${unlock}${demand}`,
           action: { action: "placeNext", block: v.block },
+          // A new tavern adds 4 beds (population lever), so it can be pinned too.
+          pop: v.block === "minecolonies:blockhuttavern",
         });
       }
     }
@@ -459,18 +477,31 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
   // in research slots (concurrent research = University level) instead of
   // placing more empty shells. If no University candidate exists (not yet
   // placeable under the tier gate, or already at cap) this is a no-op.
-  let pinned = [];
+  // Population-first when workplaces outnumber citizens (user 2026-07-12).
+  // Pull every population lever (spawn / new or upgraded residence / new or
+  // upgraded tavern) out of the shuffle and pin it to the very front, so beds
+  // lead and empty workplaces get staffed. Sits ABOVE the University pin - a
+  // worker-less colony can't run research either. Respects housingFrozen
+  // (populationNeeded is false when the jobless surplus is high, so a job
+  // backlog never triggers more population). No-op if no pop lever qualifies.
+  let popPinned = [];
+  let uniPinned = [];
   let rest = candidates.slice(1);
+  if (populationNeeded) {
+    const isPop = (c) => c.pop === true;
+    popPinned = rest.filter(isPop).map((c) => ({ ...c, label: `【職不足→住民増最優先】${c.label}` }));
+    rest = rest.filter((c) => !isPop(c));
+  }
   if (researchBlockedPending) {
     const isUni = (c) => typeof c.label === "string" && c.label.includes("blockhutuniversity");
-    pinned = rest.filter(isUni).map((c) => ({ ...c, label: `【研究待ち→最優先】${c.label}` }));
+    uniPinned = rest.filter(isUni).map((c) => ({ ...c, label: `【研究待ち→最優先】${c.label}` }));
     rest = rest.filter((c) => !isUni(c));
   }
   for (let i = rest.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [rest[i], rest[j]] = [rest[j], rest[i]];
   }
-  return [candidates[0], ...pinned, ...rest];
+  return [candidates[0], ...popPinned, ...uniPinned, ...rest];
 }
 
 function askLLM(model, messages, { format = null } = {}) {
