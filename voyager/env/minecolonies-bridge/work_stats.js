@@ -10,6 +10,10 @@ const http = require("http");
 
 const SAMPLES = parseInt(process.argv[2] || "12", 10);
 const INTERVAL_MS = parseInt(process.argv[3] || "20000", 10);
+// Brief mode (WORK_STATS_BRIEF=1): print ONE machine-parseable line instead of
+// the human report, so colony_watch.sh can grep the idle count out cheaply:
+//   BRIEF total=<workplaces> idle=<ratio<0.2 count> <type@x,z> <type@x,z> ...
+const BRIEF = process.env.WORK_STATS_BRIEF === "1";
 
 function get(path) {
   return new Promise((resolve, reject) => {
@@ -75,6 +79,20 @@ async function main() {
     ratio: a.workerSamples ? a.workingSamples / a.workerSamples : 0,
   }));
   rows.sort((x, y) => x.ratio - y.ratio || x.type.localeCompare(y.type));
+
+  if (BRIEF) {
+    // "idle" = staffed workplace whose workers were working <20% of samples
+    // (0% dead ones included). Detail lists type@x,z for each offender.
+    const idle = rows.filter((r) => r.ratio < 0.2);
+    const detail = idle
+      .map((r) => {
+        const [x, , z] = r.pos.split(",");
+        return `${r.type.replace("blockhut", "")}@${x},${z}`;
+      })
+      .join(" ");
+    console.log(`BRIEF total=${rows.length} idle=${idle.length} ${detail}`.trimEnd());
+    return;
+  }
 
   console.log(`\nwork activity over ${SAMPLES} samples x ${INTERVAL_MS / 1000}s`);
   const dead = rows.filter((r) => r.ratio === 0);

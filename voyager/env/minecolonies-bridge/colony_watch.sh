@@ -6,6 +6,7 @@ BRIDGE=http://localhost:8089
 DIR=/root/Voyager/voyager/env/minecolonies-bridge
 POLL=120
 HEARTBEAT_EVERY=30   # polls -> 30*120s = 60 min
+IDLE_THRESHOLD=3     # emit an event only when >= this many staffed-but-idle workplaces
 bridge_down=0
 n=0
 
@@ -63,10 +64,29 @@ except Exception:
     echo "PROBLEM: keepColoniesActive failing (unattended colony will freeze)"
   fi
 
+  # --- idle-workplace check (staffed citizens who aren't actually working) ---
+  # work_stats.js samples /status a few times (~6s of blocking), so this runs
+  # only on the heartbeat cadence, not every poll. Emits an event only when the
+  # idle count crosses IDLE_THRESHOLD (quiet under Monitor). idle_n is also fed
+  # into the heartbeat line below. timeout + || true so a slow/failed sample
+  # never kills the watcher.
+  idle_n="-"
+  if [ $((n % HEARTBEAT_EVERY)) -eq 1 ]; then
+    idle_line=$(cd $DIR && WORK_STATS_BRIEF=1 timeout 45 node work_stats.js 3 3000 2>/dev/null | grep '^BRIEF ' || true)
+    if [ -n "$idle_line" ]; then
+      idle_n=$(echo "$idle_line" | sed -n 's/^BRIEF total=[0-9]* idle=\([0-9]*\).*/\1/p')
+      [ -z "$idle_n" ] && idle_n="-"
+      if [ "$idle_n" != "-" ] && [ "$idle_n" -ge "$IDLE_THRESHOLD" ] 2>/dev/null; then
+        detail=$(echo "$idle_line" | cut -d' ' -f4- | tr ' ' '\n' | head -6 | tr '\n' ' ')
+        echo "IDLE WORKPLACES: $idle_n staffed but not working (${detail%% })"
+      fi
+    fi
+  fi
+
   # --- hourly heartbeat with audit summary ---
   if [ $((n % HEARTBEAT_EVERY)) -eq 1 ]; then
     audit=$(cd $DIR && node verify_suite.js 2>/dev/null | sed -n 2p)
-    echo "HEARTBEAT: citizens=$citizens sick=$sick starving=$starving | $audit"
+    echo "HEARTBEAT: citizens=$citizens sick=$sick starving=$starving | $audit | idle-workplaces=$idle_n"
   fi
 
   sleep $POLL
