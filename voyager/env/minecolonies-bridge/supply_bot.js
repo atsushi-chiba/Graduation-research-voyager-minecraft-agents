@@ -647,6 +647,107 @@ async function seedFarmFields(colony, cycle) {
   return 0;
 }
 
+// University staffing guarantee. Research only advances while a researcher
+// works the University down; an UNSTAFFED University freezes every in-progress
+// research at its current progress, so research-gated buildings never unlock
+// and the builders that would build them sit idle - the whole colony stalls.
+// Observed live (2026-07-11): University workers:[] with research progress 0;
+// unblocked only after a builder was hand-moved to the University (0 -> 24).
+// MineColonies auto-hire only draws from the JOBLESS pool, so a full colony
+// with no unemployed never fills the University itself. This step fixes that:
+//   (a) if a jobless citizen exists, assign it (free labour, no trade-off);
+//   (b) else, ONLY when research is the active bottleneck, reassign one
+//       SURPLUS worker - a spare builder (keeping >=1 builder), or failing that
+//       a non-core worker - never a core producer (farmer/cook/lumberjack/...).
+// Core economy jobs are never poached to staff research.
+const CORE_JOBS = new Set([
+  "farmer", "cook", "baker", "lumberjack", "fisherman", "miner",
+  "deliveryman", "warehouse", "cowboy", "shepherd", "swineherder",
+  "chickenherder", "composter", "researcher",
+]);
+
+// Research is the active bottleneck iff some research is already IN PROGRESS:
+// MineColonies begins the research (creative path, no worker needed) but only a
+// University researcher advances it, so inProgress>0 with an unstaffed
+// University means research is frozen - the exact live symptom, and precisely
+// when pulling a worker onto research pays off. If nothing is in progress there
+// is nothing for a researcher to do, so we do NOT poach anyone. One existing
+// endpoint (/research.inProgress), fully deterministic.
+async function isResearchLimited(colony) {
+  try {
+    const res = await httpRequest("GET", `/research?colonyId=${colony.id}`);
+    if (res.status !== 200) return false;
+    const d = JSON.parse(res.body);
+    return (d.inProgress || 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function staffUniversities(colony, cycle) {
+  if (cycle % 5 !== 3) return 0; // offset from autoAssignJobs(%5==1)/seedFarmFields(%5==2)
+  const empty = (colony.buildings || []).filter(
+    (b) => b.type === "blockhutuniversity" && b.operational && !(b.workers || []).length
+  );
+  if (empty.length === 0) return 0; // no University, or all already staffed
+
+  const citizens = colony.citizens || [];
+  const healthy = (c) => !c.sick;
+  const unemployed = citizens.filter((c) => c.job === "unemployed" && healthy(c));
+  // Sorted so the LAST builder (highest id, usually the most recently hired /
+  // most surplus) is the one pulled; pop() keeps at least one builder building.
+  const builders = citizens
+    .filter((c) => c.job === "builder" && healthy(c))
+    .sort((a, b) => a.id - b.id);
+  const nonCore = citizens.filter(
+    (c) => c.job !== "unemployed" && c.job !== "builder" && !CORE_JOBS.has(c.job) && healthy(c)
+  );
+
+  let staffed = 0;
+  let researchChecked = false;
+  let researchLimited = false;
+
+  for (const uni of empty) {
+    // (a) prefer a jobless citizen - no worker is displaced.
+    let pick = unemployed.shift();
+    let reason = "assigned unemployed";
+    if (!pick) {
+      // (b) no jobless: only poach when research is the active bottleneck.
+      if (!researchChecked) {
+        researchLimited = await isResearchLimited(colony);
+        researchChecked = true;
+      }
+      if (!researchLimited) break; // not worth pulling anyone off their job
+      if (builders.length >= 2) {
+        pick = builders.pop(); // spare builder; >=1 builder stays on construction
+        reason = "reassigned builder";
+      } else {
+        pick = nonCore.shift(); // else a non-core worker (guard/rabbithutch/...)
+        reason = "reassigned worker";
+      }
+      if (!pick) break; // no surplus worker to spare - leave core jobs intact
+    }
+    const res = await httpRequest(
+      "POST",
+      `/assignWorker?x=${uni.x}&y=${uni.y}&z=${uni.z}&colonyId=${colony.id}&citizenId=${pick.id}`
+    );
+    if (res.status === 200) {
+      console.log(
+        `[supply #${cycle}] staffed university @(${uni.x},${uni.y},${uni.z}): ` +
+        `${reason} ${pick.name} (id ${pick.id}) -> researcher`
+      );
+      staffed++;
+    } else {
+      console.log(
+        `[supply #${cycle}] staff university @(${uni.x},${uni.y},${uni.z}) failed ` +
+        `(citizen ${pick.id}): ${res.body}`
+      );
+    }
+    await sleep(RESOLVE_DELAY_MS);
+  }
+  return staffed;
+}
+
 async function autoResearch(colony, cycle) {
   if (cycle % 10 !== 1) return 0;
   try {
@@ -936,6 +1037,7 @@ async function loop() {
         totalResolved += await prioritizePopulationResearch(colony, cycle);
         totalResolved += await seedFarmFields(colony, cycle);
         totalResolved += await autoAssignJobs(colony, cycle);
+        totalResolved += await staffUniversities(colony, cycle);
         totalResolved += await optimizeHomes(colony, cycle);
         totalResolved += await teachCrafterRecipes(colony, cycle);
         totalResolved += await warehouseJanitor(colony, cycle);
@@ -1062,4 +1164,4 @@ if (require.main === module) {
   loop().catch((e) => console.error("FATAL", e));
 }
 
-module.exports = { shouldTaper, computeTapered, colonyAgeDays, recordProducerActivity, producerActive };
+module.exports = { shouldTaper, computeTapered, colonyAgeDays, recordProducerActivity, producerActive, staffUniversities, isResearchLimited, CORE_JOBS };
