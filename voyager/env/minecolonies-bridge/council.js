@@ -248,6 +248,15 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
     // picks it every single turn and the population runs away past housing.
     const housing = housingCapacity(colony);
     const pop = (colony.citizens || []).length;
+    // Population should track the number of job slots the colony has built, so
+    // workplaces don't sit worker-less (user 2026-07-12: "職場が増える毎に+1人").
+    // Count operational job-providing buildings (~1 worker each; exclude the town
+    // hall and residences). Housing is then driven to stay a bit ahead of this
+    // target so citizens can be recruited/spawned to fill the jobs.
+    const jobBuildings = (colony.buildings || []).filter(
+      (b) => b.operational && b.type !== "blockhuttownhall" && b.type !== "blockhutcitizen"
+    ).length;
+    const targetPop = jobBuildings + 2; // small buffer for builder/courier churn
     // Population balance: every residence built OR upgraded adds a citizen, so
     // housing growth IS population growth. When too many are already jobless,
     // freeze all population levers (spawn, new residence, residence upgrade) -
@@ -339,9 +348,13 @@ function buildCandidates(status, researchNeeds = {}, demandRank = {}) {
         });
       }
     }
-    if (pop > housing && !backlogFull && !housingFrozen) {
+    // Build housing proactively until capacity reaches the job-driven target,
+    // not just when population already overflows - otherwise pop lags the job
+    // slots and workplaces stay empty. Freeze still applies when too many are
+    // jobless (housing running ahead of actually-filled jobs).
+    if (housing < targetPop && !backlogFull && !housingFrozen) {
       candidates.push({
-        label: `placeNext minecolonies:blockhutcitizen(住居の新設。市民${pop}人>容量${housing}人なので最優先級)`,
+        label: `placeNext minecolonies:blockhutcitizen(住居の新設。容量${housing}<目標${targetPop}[就労建物${jobBuildings}]なので最優先級)`,
         action: { action: "placeNext", block: "minecolonies:blockhutcitizen" },
       });
     }

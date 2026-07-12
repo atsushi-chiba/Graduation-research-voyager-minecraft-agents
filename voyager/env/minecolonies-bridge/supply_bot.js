@@ -610,6 +610,43 @@ async function optimizeHomes(colony, cycle) {
 // works it down), but finished research frees slots and unlocks children -
 // periodically ask the bridge to start whatever is startable next. Item
 // costs are cheated (creative path); progression order stays vanilla.
+// Farmer huts don't work until each field has a seed assigned (normally a GUI
+// step). Fields also increase as the farmer hut levels up, so unseeded fields
+// keep appearing. Auto-assign a rotating crop to any empty field - this makes
+// new farmers start working with no manual setup and covers higher-level huts'
+// extra fields (user asks 2026-07-12). Rotating crops also feeds the citizen
+// food-diversity rule (see colony-diag).
+const FIELD_CROPS = [
+  "minecraft:wheat_seeds", "minecraft:potato", "minecraft:carrot",
+  "minecraft:beetroot_seeds",
+];
+async function seedFarmFields(colony, cycle) {
+  if (cycle % 5 !== 2) return 0; // a few times a minute, offset from other steps
+  try {
+    const res = await httpRequest("GET", `/fields?colonyId=${colony.id}`);
+    if (res.status !== 200) return 0;
+    const fields = JSON.parse(res.body);
+    const empty = fields.filter((f) => !f.seed);
+    let seeded = 0;
+    for (let i = 0; i < empty.length; i++) {
+      const f = empty[i];
+      const crop = FIELD_CROPS[(seeded + fields.length) % FIELD_CROPS.length];
+      const r = await httpRequest(
+        "POST",
+        `/setFieldSeed?x=${f.x}&y=${f.y}&z=${f.z}&seed=${encodeURIComponent(crop)}`
+      );
+      if (r.status === 200) seeded++;
+    }
+    if (seeded > 0) {
+      console.log(`[supply #${cycle}] seeded ${seeded} empty farm field(s)`);
+    }
+    return seeded;
+  } catch {
+    // transient - retry next round
+  }
+  return 0;
+}
+
 async function autoResearch(colony, cycle) {
   if (cycle % 10 !== 1) return 0;
   try {
@@ -817,6 +854,7 @@ async function loop() {
         totalResolved += await feedHungryCitizens(colony, cycle);
         totalResolved += await stockRestaurants(colony, cycle);
         totalResolved += await autoResearch(colony, cycle);
+        totalResolved += await seedFarmFields(colony, cycle);
         totalResolved += await autoAssignJobs(colony, cycle);
         totalResolved += await optimizeHomes(colony, cycle);
         totalResolved += await teachCrafterRecipes(colony, cycle);
