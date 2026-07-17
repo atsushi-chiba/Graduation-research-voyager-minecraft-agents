@@ -107,6 +107,7 @@ public class VoyagerBridge {
         keepBuildSitesLoaded();
         tickrateGovernor();
         rescueVoidFallers();
+        tickCitizenOrders();
         int mult = tickMultiplier;
         if (mult <= 1 || server == null) return;
         java.lang.reflect.Field f = resolveNextTickTimeField(server);
@@ -470,6 +471,9 @@ public class VoyagerBridge {
             httpServer.createContext("/autoResearch", this::handleAutoResearch);
             httpServer.createContext("/surfaceY", this::handleSurfaceY);
             httpServer.createContext("/heightmap", this::handleHeightmap);
+            httpServer.createContext("/threats", this::handleThreats);
+            httpServer.createContext("/moveCitizen", this::handleMoveCitizen);
+            httpServer.createContext("/guardOrder", this::handleGuardOrder);
             httpServer.createContext("/ping", VoyagerBridge::handlePing);
             httpServer.setExecutor(null);
             httpServer.start();
@@ -802,6 +806,42 @@ public class VoyagerBridge {
                         sb.append("\"sick\":").append(sick).append(",")
                           .append("\"disease\":").append(diseaseId == null ? "null" : "\"" + diseaseId + "\"").append(",")
                           .append("\"cureItems\":[").append(cures).append("],");
+                        // Family graph for the persona/heredity daemon (P-D3/P-D4).
+                        // MineColonies records parents as NAMES (Tuple<String,String>,
+                        // set at child birth), children/siblings as citizen IDs and the
+                        // partner as ICitizenData - the Node side maps names to ids.
+                        boolean isChildCit = false;
+                        String parentA = null, parentB = null;
+                        StringBuilder kidsJson = new StringBuilder();
+                        StringBuilder sibsJson = new StringBuilder();
+                        Integer partnerId = null;
+                        try {
+                            if (cit instanceof com.minecolonies.core.colony.CitizenData cdc) isChildCit = cdc.isChild();
+                            com.minecolonies.api.util.Tuple<String, String> par = cit.getParents();
+                            if (par != null) {
+                                if (par.getA() != null && !par.getA().isEmpty()) parentA = par.getA();
+                                if (par.getB() != null && !par.getB().isEmpty()) parentB = par.getB();
+                            }
+                            java.util.List<Integer> kids = cit.getChildren();
+                            for (int k = 0; k < kids.size(); k++) {
+                                if (k > 0) kidsJson.append(",");
+                                kidsJson.append(kids.get(k));
+                            }
+                            java.util.List<Integer> sibs = cit.getSiblings();
+                            for (int k = 0; k < sibs.size(); k++) {
+                                if (k > 0) sibsJson.append(",");
+                                sibsJson.append(sibs.get(k));
+                            }
+                            ICitizenData partner = cit.getPartner();
+                            if (partner != null) partnerId = partner.getId();
+                        } catch (Exception ignored) {}
+                        sb.append("\"isChild\":").append(isChildCit).append(",")
+                          .append("\"parents\":[");
+                        if (parentA != null) sb.append("\"").append(escape(parentA)).append("\"");
+                        if (parentB != null) sb.append(parentA != null ? "," : "").append("\"").append(escape(parentB)).append("\"");
+                        sb.append("],\"children\":[").append(kidsJson).append("],")
+                          .append("\"siblings\":[").append(sibsJson).append("],")
+                          .append("\"partner\":").append(partnerId == null ? "null" : partnerId).append(",");
                         if (workBld != null) {
                             BlockPos wp = workBld.getPosition();
                             sb.append("\"workBuilding\":{")
@@ -5226,6 +5266,446 @@ public class VoyagerBridge {
                 respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
             } else {
                 respond(exchange, 200, outcome);
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // ==================== Persona-phase endpoints: /threats /moveCitizen /guardOrder ====================
+    //
+    // Backing for the citizen-persona reactor (DESIGN_DECISIONS_persona.md, Agent P0):
+    // a Node daemon polls /threats, lets each persona decide, then drives citizens
+    // with /moveCitizen and /guardOrder. HTTP threads only validate and (de)register
+    // orders in the maps below; ALL entity access happens on the server thread inside
+    // tickCitizenOrders(), which onServerTick calls every tick (same pattern as
+    // keepColoniesActive). Orders are in-memory only - a server restart clears them.
+
+    private static final class MoveOrder {
+        final int colonyId;
+        final int citizenId;
+        final BlockPos target;
+        final int range;          // arrival distance in blocks
+        final long deadlineTick;  // bridgeTick after which the order times out
+        volatile String status = "moving"; // moving -> arrived | timeout | lost | replaced
+        MoveOrder(int colonyId, int citizenId, BlockPos target, int range, long deadlineTick) {
+            this.colonyId = colonyId;
+            this.citizenId = citizenId;
+            this.target = target;
+            this.range = range;
+            this.deadlineTick = deadlineTick;
+        }
+    }
+
+    private static final class GuardOrder {
+        final int colonyId;
+        final int citizenId;
+        final String mode;     // engage | standdown
+        final BlockPos target; // engage: destination to fight at; standdown: anchor to hold
+        volatile String status = "active"; // active | lost (entity currently absent)
+        GuardOrder(int colonyId, int citizenId, String mode, BlockPos target) {
+            this.colonyId = colonyId;
+            this.citizenId = citizenId;
+            this.mode = mode;
+            this.target = target;
+        }
+    }
+
+    private final java.util.concurrent.ConcurrentHashMap<String, MoveOrder> moveOrders = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, GuardOrder> guardOrders = new java.util.concurrent.ConcurrentHashMap<>();
+    // Server tick counter for order deadlines. Tick-based (not wall clock) so the
+    // timeout tracks in-world time under the tick-rate governor.
+    private volatile long bridgeTick = 0;
+
+    private static String citizenKey(int colonyId, int citizenId) {
+        return colonyId + ":" + citizenId;
+    }
+
+    // Server thread only.
+    private com.minecolonies.core.entity.citizen.EntityCitizen resolveCitizenEntity(int colonyId, int citizenId) {
+        IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, server.overworld());
+        if (colony == null) return null;
+        ICitizenData cd = colony.getCitizenManager().getCivilian(citizenId);
+        if (cd == null) return null;
+        java.util.Optional<AbstractEntityCitizen> opt = cd.getEntity();
+        if (opt.isEmpty() || !(opt.get() instanceof com.minecolonies.core.entity.citizen.EntityCitizen ec)) return null;
+        return ec;
+    }
+
+    private void tickCitizenOrders() {
+        bridgeTick++;
+        if (server == null || (moveOrders.isEmpty() && guardOrders.isEmpty())) return;
+        for (MoveOrder o : moveOrders.values()) {
+            if (!"moving".equals(o.status)) continue;
+            try {
+                com.minecolonies.core.entity.citizen.EntityCitizen ent = resolveCitizenEntity(o.colonyId, o.citizenId);
+                if (ent == null) { o.status = "lost"; continue; }
+                if (bridgeTick > o.deadlineTick) {
+                    o.status = "timeout";
+                    ent.getNavigation().stop();
+                    continue;
+                }
+                // MineColonies has no citizen-pause API in 1.1.1231, so we win the
+                // navigator tug-of-war by re-issuing instead: walkToPos re-claims the
+                // navigation whenever the citizen's job AI stole it (it checks the
+                // current path job via PathJobMoveToLocation.isJobFor and re-paths if
+                // it is not ours), keeps walking when the path is already ours, and
+                // returns true + stops the navigator once within `range` blocks.
+                // Called every tick, this outpaces the work AI's own (much rarer)
+                // navigation calls without touching its state machine.
+                if (com.minecolonies.core.entity.pathfinding.navigation.EntityNavigationUtils.walkToPos(ent, o.target, o.range, true)) {
+                    o.status = "arrived";
+                }
+            } catch (Exception e) {
+                LOGGER.warn("moveCitizen tick failed for {}:{}: {}", o.colonyId, o.citizenId, e.toString());
+            }
+        }
+        for (GuardOrder g : guardOrders.values()) {
+            try {
+                com.minecolonies.core.entity.citizen.EntityCitizen ent = resolveCitizenEntity(g.colonyId, g.citizenId);
+                if (ent == null) { g.status = "lost"; continue; }
+                g.status = "active";
+                if ("standdown".equals(g.mode)) {
+                    tickStanddown(g, ent);
+                } else {
+                    tickEngage(g, ent);
+                }
+            } catch (Exception e) {
+                LOGGER.warn("guardOrder tick failed for {}:{}: {}", g.colonyId, g.citizenId, e.toString());
+            }
+        }
+    }
+
+    private static final double ENGAGE_SEEK_RADIUS = 24.0;  // enemy search radius around guard and around target pos
+    private static final double ENGAGE_LEASH_RADIUS = 40.0; // ignore enemies further than this from the guard
+
+    // engage: march to the ordered position, then feed enemies into the guard's own
+    // combat machinery. Guards acquire targets through their ThreatTable (EntityCitizen
+    // implements IThreatTableEntity), so injecting threat + entity target makes the
+    // native combat AI (Knight/Ranger/Druid) do the actual approach/strafe/attack -
+    // no need to reimplement fighting. Persists until mode=return or standdown.
+    private void tickEngage(GuardOrder g, com.minecolonies.core.entity.citizen.EntityCitizen ent) {
+        ServerLevel level = server.overworld();
+        net.minecraft.world.entity.LivingEntity enemy = nearestEnemy(level, ent.blockPosition(), ENGAGE_SEEK_RADIUS);
+        if (enemy == null) enemy = nearestEnemy(level, g.target, ENGAGE_SEEK_RADIUS);
+        if (enemy != null && ent.distanceTo(enemy) <= ENGAGE_LEASH_RADIUS) {
+            // Refresh every 10 ticks (or when the target died) so the combat AI keeps
+            // this enemy hot without us fighting the AI for control every tick.
+            if (bridgeTick % 10 == 0 || ent.getTarget() == null || !ent.getTarget().isAlive()) {
+                ent.getThreatTable().addThreat(enemy, 50);
+                ent.setTarget(enemy);
+            }
+        } else {
+            // No live enemy in reach: march to / hold the ordered position. Returns
+            // true (and stops pathing) once within 3 blocks; re-walks if the guard's
+            // job AI (patrol, return-to-tower) tries to drag it away.
+            com.minecolonies.core.entity.pathfinding.navigation.EntityNavigationUtils.walkToPos(ent, g.target, 3, true);
+        }
+    }
+
+    // standdown ("betrayal"): stay put and refuse combat. The guard AI re-acquires
+    // targets from its ThreatTable every AI tick, so we clear the table, the entity
+    // target AND the AI's internal `target` field (reflection, cached per AI class)
+    // every server tick for as long as the order stands.
+    private void tickStanddown(GuardOrder g, com.minecolonies.core.entity.citizen.EntityCitizen ent) {
+        if (ent.getTarget() != null) ent.setTarget(null);
+        try { ent.getThreatTable().resetTable(); } catch (Exception ignored) {}
+        clearGuardAITarget(ent);
+        if (com.minecolonies.api.util.BlockPosUtil.dist(ent.blockPosition(), g.target) > 3) {
+            com.minecolonies.core.entity.pathfinding.navigation.EntityNavigationUtils.walkToPos(ent, g.target, 2, true);
+        }
+    }
+
+    private static net.minecraft.world.entity.LivingEntity nearestEnemy(ServerLevel level, BlockPos around, double radius) {
+        net.minecraft.world.phys.AABB box = new net.minecraft.world.phys.AABB(
+            around.getX() - radius, around.getY() - radius, around.getZ() - radius,
+            around.getX() + radius, around.getY() + radius, around.getZ() + radius);
+        net.minecraft.world.entity.LivingEntity best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (net.minecraft.world.entity.LivingEntity e : level.getEntitiesOfClass(
+                net.minecraft.world.entity.LivingEntity.class, box,
+                le -> le.isAlive() && le instanceof net.minecraft.world.entity.monster.Enemy)) {
+            double d = e.distanceToSqr(around.getX() + 0.5, around.getY() + 0.5, around.getZ() + 0.5);
+            if (d < bestDist) { bestDist = d; best = e; }
+        }
+        return best;
+    }
+
+    // The guard AI keeps its current target in a protected LivingEntity field named
+    // `target` (declared on AbstractEntityAIFight / AbstractEntityAIGuard). Null it
+    // via reflection so a fight already in progress stops too.
+    private static final java.util.concurrent.ConcurrentHashMap<Class<?>, java.util.List<java.lang.reflect.Field>> aiTargetFieldCache =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    private void clearGuardAITarget(com.minecolonies.core.entity.citizen.EntityCitizen ent) {
+        try {
+            ICitizenData cd = ent.getCitizenData();
+            if (cd == null) return;
+            com.minecolonies.api.colony.jobs.IJob<?> job = cd.getJob();
+            if (!(job instanceof com.minecolonies.core.colony.jobs.AbstractJobGuard<?> guardJob)) return;
+            Object ai = guardJob.getWorkerAI();
+            if (ai == null) return;
+            java.util.List<java.lang.reflect.Field> fields = aiTargetFieldCache.computeIfAbsent(ai.getClass(), cls -> {
+                java.util.List<java.lang.reflect.Field> out = new java.util.ArrayList<>();
+                for (Class<?> c = cls; c != null; c = c.getSuperclass()) {
+                    for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                        if ("target".equals(f.getName())
+                                && net.minecraft.world.entity.LivingEntity.class.isAssignableFrom(f.getType())) {
+                            f.setAccessible(true);
+                            out.add(f);
+                        }
+                    }
+                }
+                return out;
+            });
+            for (java.lang.reflect.Field f : fields) f.set(ai, null);
+        } catch (Exception ignored) {}
+    }
+
+    // GET /threats?colonyId=1[&radius=200]
+    // Hostile entities within `radius` blocks (full height) of the colony center,
+    // plus the MineColonies raid state. Filter is `instanceof Enemy`, which catches
+    // both vanilla monsters (zombie etc.) and MineColonies raiders (barbarians,
+    // pirates... all implement net.minecraft.world.entity.monster.Enemy).
+    private void handleThreats(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+            int radius = Integer.parseInt(params.getOrDefault("radius", "200"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    ServerLevel level = server.overworld();
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, level);
+                    if (colony == null) { result.complete("ERROR: no colony with id " + colonyId); return; }
+                    BlockPos center = colony.getCenter();
+                    net.minecraft.world.phys.AABB box = new net.minecraft.world.phys.AABB(
+                        center.getX() - radius, level.getMinBuildHeight(), center.getZ() - radius,
+                        center.getX() + radius, level.getMaxBuildHeight(), center.getZ() + radius);
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("{\"colonyId\":").append(colonyId)
+                      .append(",\"center\":{\"x\":").append(center.getX())
+                      .append(",\"y\":").append(center.getY())
+                      .append(",\"z\":").append(center.getZ()).append("}")
+                      .append(",\"radius\":").append(radius)
+                      .append(",\"threats\":[");
+                    boolean first = true;
+                    for (net.minecraft.world.entity.LivingEntity e : level.getEntitiesOfClass(
+                            net.minecraft.world.entity.LivingEntity.class, box,
+                            le -> le.isAlive() && le instanceof net.minecraft.world.entity.monster.Enemy)) {
+                        if (!first) sb.append(",");
+                        first = false;
+                        ResourceLocation typeKey = ForgeRegistries.ENTITY_TYPES.getKey(e.getType());
+                        // Which citizen (if any) the mob is hunting - lets the reactor
+                        // warn/evacuate that specific citizen.
+                        Integer targetCitizenId = null;
+                        try {
+                            if (e instanceof net.minecraft.world.entity.Mob mob
+                                    && mob.getTarget() instanceof AbstractEntityCitizen tc
+                                    && tc.getCitizenData() != null) {
+                                targetCitizenId = tc.getCitizenData().getId();
+                            }
+                        } catch (Exception ignored) {}
+                        double dist = Math.sqrt(e.distanceToSqr(center.getX() + 0.5, e.getY(), center.getZ() + 0.5));
+                        sb.append("{\"id\":").append(e.getId())
+                          .append(",\"type\":\"").append(typeKey != null ? typeKey : "unknown").append("\"")
+                          .append(",\"x\":").append(String.format(java.util.Locale.ROOT, "%.1f", e.getX()))
+                          .append(",\"y\":").append(String.format(java.util.Locale.ROOT, "%.1f", e.getY()))
+                          .append(",\"z\":").append(String.format(java.util.Locale.ROOT, "%.1f", e.getZ()))
+                          .append(",\"health\":").append(String.format(java.util.Locale.ROOT, "%.1f", e.getHealth()))
+                          .append(",\"maxHealth\":").append(String.format(java.util.Locale.ROOT, "%.1f", e.getMaxHealth()))
+                          .append(",\"raider\":").append(e instanceof com.minecolonies.api.entity.mobs.AbstractEntityMinecoloniesRaider)
+                          .append(",\"distanceFromCenter\":").append(String.format(java.util.Locale.ROOT, "%.1f", dist))
+                          .append(",\"targetCitizenId\":").append(targetCitizenId == null ? "null" : targetCitizenId)
+                          .append("}");
+                    }
+                    sb.append("],\"raid\":{");
+                    try {
+                        com.minecolonies.api.colony.managers.interfaces.IRaiderManager rm = colony.getRaiderManager();
+                        sb.append("\"active\":").append(rm.isRaided())
+                          .append(",\"willRaidTonight\":").append(rm.willRaidTonight())
+                          .append(",\"raidLevel\":").append(rm.getColonyRaidLevel())
+                          .append(",\"nightsSinceLastRaid\":").append(rm.getNightsSinceLastRaid());
+                    } catch (Exception e) {
+                        sb.append("\"active\":false,\"error\":\"").append(escape(e.toString())).append("\"");
+                    }
+                    sb.append("}}");
+                    result.complete(sb.toString());
+                } catch (Exception e) {
+                    LOGGER.error("threats failed", e);
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, outcome);
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // POST /moveCitizen?colonyId=1&citizenId=5&x=..&y=..&z=..[&range=2][&timeout=60]
+    //   Walks the citizen to the position for real (see tickCitizenOrders for how the
+    //   job-AI conflict is handled). timeout is in seconds of GAME ticks (x20).
+    //   A new move order supersedes any previous move/guard order for that citizen.
+    // GET /moveCitizen?colonyId=1&citizenId=5
+    //   Status of the current/last order: moving | arrived | timeout | lost | replaced | none.
+    private void handleMoveCitizen(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+            int citizenId = Integer.parseInt(params.get("citizenId"));
+            String key = citizenKey(colonyId, citizenId);
+
+            if ("GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                MoveOrder o = moveOrders.get(key);
+                if (o == null) { respond(exchange, 200, "{\"status\":\"none\"}"); return; }
+                java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+                server.execute(() -> {
+                    double dist = -1;
+                    try {
+                        com.minecolonies.core.entity.citizen.EntityCitizen ent = resolveCitizenEntity(colonyId, citizenId);
+                        if (ent != null) {
+                            dist = Math.sqrt(ent.distanceToSqr(o.target.getX() + 0.5, o.target.getY() + 0.5, o.target.getZ() + 0.5));
+                        }
+                    } catch (Exception ignored) {}
+                    result.complete(String.format(java.util.Locale.ROOT,
+                        "{\"status\":\"%s\",\"target\":{\"x\":%d,\"y\":%d,\"z\":%d},\"distance\":%.1f}",
+                        o.status, o.target.getX(), o.target.getY(), o.target.getZ(), dist));
+                });
+                respond(exchange, 200, result.get());
+                return;
+            }
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                respond(exchange, 405, "{\"error\":\"use GET or POST\"}");
+                return;
+            }
+            int x = Integer.parseInt(params.get("x"));
+            int y = Integer.parseInt(params.get("y"));
+            int z = Integer.parseInt(params.get("z"));
+            int range = Integer.parseInt(params.getOrDefault("range", "2"));
+            int timeoutSec = Integer.parseInt(params.getOrDefault("timeout", "60"));
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, server.overworld());
+                    if (colony == null) { result.complete("ERROR: no colony with id " + colonyId); return; }
+                    ICitizenData cd = colony.getCitizenManager().getCivilian(citizenId);
+                    if (cd == null) { result.complete("ERROR: no citizen with id " + citizenId); return; }
+                    if (cd.getEntity().isEmpty()) {
+                        result.complete("ERROR: citizen " + citizenId + " has no live entity right now");
+                        return;
+                    }
+                    guardOrders.remove(key); // move supersedes any standing guard order
+                    MoveOrder prev = moveOrders.put(key,
+                        new MoveOrder(colonyId, citizenId, new BlockPos(x, y, z), range, bridgeTick + timeoutSec * 20L));
+                    if (prev != null && "moving".equals(prev.status)) prev.status = "replaced";
+                    result.complete("citizen " + citizenId + " moving to " + x + "," + y + "," + z
+                        + " (range " + range + ", timeout " + timeoutSec + "s)");
+                } catch (Exception e) {
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
+            }
+        } catch (Exception e) {
+            respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+        }
+    }
+
+    // POST /guardOrder?colonyId=1&citizenId=7&mode=engage|standdown|return[&x=&y=&z=]
+    //   engage:    x,y,z required - move there and fight enemies in reach (persists).
+    //   standdown: hold position and refuse combat (anchor = x,y,z if given, else the
+    //              guard's current position). Persists until return.
+    //   return:    drop any engage/standdown order and resume normal duty.
+    // GET /guardOrder?colonyId=1&citizenId=7 - current order, if any.
+    // Works on any citizen, but only guards (AbstractJobGuard) actually fight on
+    // engage; non-guards will just walk there.
+    private void handleGuardOrder(HttpExchange exchange) throws IOException {
+        try {
+            java.util.Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            int colonyId = Integer.parseInt(params.getOrDefault("colonyId", "1"));
+            int citizenId = Integer.parseInt(params.get("citizenId"));
+            String key = citizenKey(colonyId, citizenId);
+
+            if ("GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                GuardOrder g = guardOrders.get(key);
+                if (g == null) { respond(exchange, 200, "{\"mode\":\"none\"}"); return; }
+                respond(exchange, 200, String.format(java.util.Locale.ROOT,
+                    "{\"mode\":\"%s\",\"status\":\"%s\",\"target\":{\"x\":%d,\"y\":%d,\"z\":%d}}",
+                    g.mode, g.status, g.target.getX(), g.target.getY(), g.target.getZ()));
+                return;
+            }
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                respond(exchange, 405, "{\"error\":\"use GET or POST\"}");
+                return;
+            }
+            String mode = params.getOrDefault("mode", "");
+            if (!"engage".equals(mode) && !"standdown".equals(mode) && !"return".equals(mode)) {
+                respond(exchange, 400, "{\"error\":\"mode must be engage, standdown or return\"}");
+                return;
+            }
+
+            java.util.concurrent.CompletableFuture<String> result = new java.util.concurrent.CompletableFuture<>();
+            server.execute(() -> {
+                try {
+                    IColony colony = IColonyManager.getInstance().getColonyByWorld(colonyId, server.overworld());
+                    if (colony == null) { result.complete("ERROR: no colony with id " + colonyId); return; }
+                    ICitizenData cd = colony.getCitizenManager().getCivilian(citizenId);
+                    if (cd == null) { result.complete("ERROR: no citizen with id " + citizenId); return; }
+
+                    if ("return".equals(mode)) {
+                        GuardOrder prev = guardOrders.remove(key);
+                        MoveOrder mo = moveOrders.get(key);
+                        if (mo != null && "moving".equals(mo.status)) mo.status = "replaced";
+                        com.minecolonies.core.entity.citizen.EntityCitizen ent = resolveCitizenEntity(colonyId, citizenId);
+                        if (ent != null) ent.getNavigation().stop();
+                        result.complete(prev == null
+                            ? "citizen " + citizenId + " had no guard order; nothing to clear"
+                            : "citizen " + citizenId + " released from " + prev.mode + ", back to normal duty");
+                        return;
+                    }
+
+                    com.minecolonies.core.entity.citizen.EntityCitizen ent = resolveCitizenEntity(colonyId, citizenId);
+                    if (ent == null) {
+                        result.complete("ERROR: citizen " + citizenId + " has no live entity right now");
+                        return;
+                    }
+                    BlockPos target;
+                    if (params.containsKey("x") && params.containsKey("y") && params.containsKey("z")) {
+                        target = new BlockPos(Integer.parseInt(params.get("x")),
+                            Integer.parseInt(params.get("y")), Integer.parseInt(params.get("z")));
+                    } else if ("standdown".equals(mode)) {
+                        target = ent.blockPosition(); // hold where the guard stands now
+                    } else {
+                        result.complete("ERROR: engage requires x, y and z");
+                        return;
+                    }
+                    MoveOrder mo = moveOrders.get(key);
+                    if (mo != null && "moving".equals(mo.status)) mo.status = "replaced";
+                    guardOrders.put(key, new GuardOrder(colonyId, citizenId, mode, target));
+                    boolean isGuard = cd.getJob() instanceof com.minecolonies.core.colony.jobs.AbstractJobGuard<?>;
+                    result.complete("citizen " + citizenId + " " + mode + " at "
+                        + target.getX() + "," + target.getY() + "," + target.getZ()
+                        + (isGuard ? "" : " (warning: not a guard - will move but not fight)"));
+                } catch (Exception e) {
+                    result.complete("ERROR: " + e);
+                }
+            });
+            String outcome = result.get();
+            if (outcome.startsWith("ERROR")) {
+                respond(exchange, 500, "{\"error\":\"" + escape(outcome) + "\"}");
+            } else {
+                respond(exchange, 200, "{\"result\":\"" + escape(outcome) + "\"}");
             }
         } catch (Exception e) {
             respond(exchange, 400, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
