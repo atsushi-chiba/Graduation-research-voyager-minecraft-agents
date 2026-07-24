@@ -3,6 +3,8 @@
 const fs = require("fs");
 const path = require("path");
 const S = require("./social_graph.js");
+const D = require("./social_dynamics.js");
+const P = require("./personas.js");
 
 const POLL_MS = parseInt(process.env.SOCIAL_POLL_MS || "60000", 10);
 const EVENT_FILE = process.env.SOCIAL_EVENT_FILE ||
@@ -55,23 +57,33 @@ async function pollOnce(previous, opts) {
   const colony = await (opts && opts.fetchColony ? opts.fetchColony() : S.fetchColony());
   const result = reconcile(previous, colony, opts);
   S.saveGraph(result.graph, opts && opts.stateFile);
+  const personas = opts && opts.personas ? opts.personas : P.loadAll();
+  const dynamicState = D.reconcileState(
+    opts && Object.hasOwn(opts, "dynamicState") ? opts.dynamicState : D.loadState(),
+    result.graph,
+    personas
+  );
   for (const event of result.events) {
     appendEvent(event, opts && opts.eventFile, opts && opts.now, colony.gameTime);
+    D.applyEvent(dynamicState, event, personas, colony.gameTime);
   }
-  return result;
+  D.saveState(dynamicState, opts && opts.dynamicsFile);
+  return { ...result, dynamicState };
 }
 
 async function main() {
   acquirePidfile();
   let previous = S.loadGraph();
+  let dynamicState = D.loadState();
   appendEvent(
     { type: "observer_started", pollMs: POLL_MS, baselinePresent: !!previous },
     EVENT_FILE, undefined, previous && previous._meta.gameTime
   );
   for (;;) {
     try {
-      const result = await pollOnce(previous);
+      const result = await pollOnce(previous, { dynamicState });
       previous = result.graph;
+      dynamicState = result.dynamicState;
     } catch (error) {
       appendEvent({ type: "observer_error", message: String(error && error.message || error) });
     }

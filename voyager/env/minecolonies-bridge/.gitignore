@@ -34,3 +34,4 @@ persona_daemon.pid
 social_state.json
 social_graph_events.jsonl
 social_observer.pid
+social_dynamics.json
