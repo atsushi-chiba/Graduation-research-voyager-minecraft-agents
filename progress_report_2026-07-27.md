@@ -85,6 +85,7 @@ P1は比較的固定な個体差として維持し、後続を以下へ再編し
 | 定期observer | 5秒周期の短時間検証を3poll実施、安定状態の架空差分0件。現在60秒周期 |
 | 動的状態 | 34市民・108関係、全員active。満足度0.5、実効忠誠度0.15〜0.95 |
 | 健康イベント | ライブ1pollでnutrition帯変化19件。fed→hungry 2人へstress/satisfaction変化を確認 |
+| 発病・回復 | 市民20・33でsickness_started/recoveredをライブ記録し、動的状態への反映を確認 |
 
 ライブ関係の内訳:
 
@@ -122,14 +123,17 @@ P1は比較的固定な個体差として維持し、後続を以下へ再編し
 - Phase 1検証中にsupply_botを停止したまま適応40倍で長時間動かし、
   35人中starving 11 / hungry 8 / sick 1まで悪化した。supply_bot復帰20秒後に
   starving 2 / hungry 2 / fed 31まで回復。この変化が健康イベントのライブ検証にもなった。
+- 市民33（Lacey G. Magic、knight）はinfluenza・満腹度0・`WAIT_FOR_FOOD`で停止し、
+  carrot/potato、steak_dinner、cooked_beef、単発`/moveCitizen`では復旧しなかった。
+  正常なサーバー再起動でAIキャッシュを初期化すると満腹度5.4・`WORKING`・病気falseへ回復。
+  observerも市民20・33の`recovered`を次pollで記録した。
 
 ## 6. 未解決事項
 
 - trust・affinity・debtは永続化したが中立初期値のみ。援助などによる更新規則は未実装。
 - 転職規則の係数（+0.10/+0.02、−0.15/−0.03）は初期仮説であり、比較実験前に固定する必要がある。
-- 市民33（Lacey G. Magic、knight）がinfluenza・満腹度0・`WAIT_FOR_FOOD`で停止。
-  carrot/potato、steak_dinner、cooked_beefは全て配達成功したが食事・自己治療へ遷移しない。
-  座席なし食堂とguardのEATING優先が重なった既知ウェッジ。感染抑制のためtickrateを10倍へ下げた。
+- 座席なし食堂とguardのEATING優先が重なる`WAIT_FOR_FOOD`ウェッジは再起動で復旧できるが、
+  自動検知・局所AIリセットによる恒久対策は未実装。
 - 近隣距離48ブロックは初期仮説。感度分析またはゲーム内移動時間による妥当性確認が必要。
 - happinessがほぼ全員10であり、現在のコロニーでは遺伝の選択圧として差が小さい。
 - council / supply_bot / colony_watchを通常運用へ戻すタイミングを決める必要がある。
@@ -137,7 +141,7 @@ P1は比較的固定な個体差として維持し、後続を以下へ再編し
 
 ## 7. 次の一週間
 
-1. 病気guardの`WAIT_FOR_FOOD`を安全なAIリセットまたは恒久修正で解消する。
+1. 病気guardの`WAIT_FOR_FOOD`を安全な局所AIリセットで解消する恒久策を検討する。
 2. P1の死亡確定イベントをPhase 2へ接続し、一時的なstatus欠落と死亡を区別する。
 3. 関係グラフと動的状態の集計を週次レポート向けに出力する。
 4. Phase 3の援助要請を、まず空腹市民1人・支援者1人の限定シナリオで設計する。
@@ -151,3 +155,4 @@ P1は比較的固定な個体差として維持し、後続を以下へ再編し
 | `5a9ca00` | Phase 1関係グラフ、homeBuilding、週次報告運用 |
 | `881f53c` | Phase 1定期observer、構造差分JSONL |
 | `772762d` | Phase 2動的状態、転職イベントreducer、永続化テスト |
+| `143e464` | 空腹・発病・回復イベント、stress/satisfaction更新 |
