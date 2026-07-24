@@ -1,0 +1,108 @@
+// Offline unit tests for social_graph.js. No bridge or world access.
+const assert = require("assert");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const S = require("./social_graph.js");
+
+function citizen(id, name, extra) {
+  return {
+    id,
+    name,
+    job: "unemployed",
+    isChild: false,
+    parents: [],
+    children: [],
+    siblings: [],
+    partner: null,
+    homeBuilding: null,
+    workBuilding: null,
+    ...extra,
+  };
+}
+
+function building(x, z, level = 1) {
+  return { x, y: 64, z, level };
+}
+
+function colony(citizens) {
+  return { id: 1, name: "Fixture", gameTime: 1234, citizens };
+}
+
+let passed = 0;
+function test(label, fn) {
+  fn();
+  passed++;
+  console.log(`PASS ${label}`);
+}
+
+test("family fields resolve to de-duplicated structural edges", () => {
+  const graph = S.buildSocialGraph(colony([
+    citizen(1, "Parent A", { partner: 2, children: [3] }),
+    citizen(2, "Parent B", { partner: 1, children: [3] }),
+    citizen(3, "Child", { parents: ["Parent A", "Parent B"] }),
+  ]));
+  assert.deepStrictEqual(graph.edges["1:2"].sources, ["partner"]);
+  assert.deepStrictEqual(graph.edges["1:3"].sources, ["parent_child"]);
+  assert.deepStrictEqual(graph.edges["2:3"].sources, ["parent_child"]);
+  assert.strictEqual(graph.metrics.edges, 3);
+});
+
+test("same home, same workplace and nearby homes add independent sources", () => {
+  const homeA = building(0, 0);
+  const homeB = building(30, 0);
+  const work = building(10, 10);
+  const graph = S.buildSocialGraph(colony([
+    citizen(1, "A", { homeBuilding: homeA, workBuilding: work }),
+    citizen(2, "B", { homeBuilding: homeA, workBuilding: work }),
+    citizen(3, "C", { homeBuilding: homeB }),
+  ]), { neighborDistance: 48 });
+  assert.deepStrictEqual(graph.edges["1:2"].sources, ["co_resident", "coworker"]);
+  assert.deepStrictEqual(graph.edges["1:3"].sources, ["neighbor"]);
+  assert.deepStrictEqual(graph.edges["2:3"].sources, ["neighbor"]);
+  assert.ok(graph.edges["1:2"].familiarity > graph.edges["1:3"].familiarity);
+});
+
+test("unhoused citizens are not guessed as neighbors", () => {
+  const graph = S.buildSocialGraph(colony([
+    citizen(1, "Housed", { homeBuilding: building(0, 0) }),
+    citizen(2, "Unhoused"),
+  ]));
+  assert.strictEqual(graph.metrics.edges, 0);
+  assert.deepStrictEqual(graph.metrics.isolatedCitizenIds, [1, 2]);
+});
+
+test("rebuild removes stale links after death, move and job change", () => {
+  const home = building(0, 0);
+  const work = building(5, 5);
+  const before = S.buildSocialGraph(colony([
+    citizen(1, "A", { homeBuilding: home, workBuilding: work }),
+    citizen(2, "B", { homeBuilding: home, workBuilding: work }),
+  ]));
+  assert.ok(before.edges["1:2"]);
+  const after = S.buildSocialGraph(colony([
+    citizen(1, "A", { homeBuilding: building(100, 100) }),
+  ]));
+  assert.strictEqual(after.metrics.edges, 0);
+  assert.deepStrictEqual(Object.keys(after.nodes), ["1"]);
+});
+
+test("output and atomic save are deterministic", () => {
+  const input = colony([
+    citizen(3, "C", { siblings: [2] }),
+    citizen(1, "A", { partner: 2 }),
+    citizen(2, "B", { partner: 1, siblings: [3] }),
+  ]);
+  const a = S.buildSocialGraph(input);
+  const b = S.buildSocialGraph(input);
+  assert.deepStrictEqual(a, b);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "social-graph-test-"));
+  const file = path.join(dir, "social_state.json");
+  S.saveGraph(a, file);
+  assert.ok(!fs.existsSync(`${file}.tmp`));
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, "utf8")), a);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+console.log(`\nALL PASS (${passed} tests)`);

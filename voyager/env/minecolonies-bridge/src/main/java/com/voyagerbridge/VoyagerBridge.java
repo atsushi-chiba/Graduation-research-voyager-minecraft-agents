@@ -860,6 +860,18 @@ public class VoyagerBridge {
                         } else {
                             sb.append("\"workBuilding\":null");
                         }
+                        IBuilding homeBld = cit.getHomeBuilding();
+                        if (homeBld != null) {
+                            BlockPos hp = homeBld.getPosition();
+                            sb.append(",\"homeBuilding\":{")
+                              .append("\"x\":").append(hp.getX()).append(",")
+                              .append("\"y\":").append(hp.getY()).append(",")
+                              .append("\"z\":").append(hp.getZ()).append(",")
+                              .append("\"level\":").append(homeBld.getBuildingLevel())
+                              .append("}");
+                        } else {
+                            sb.append(",\"homeBuilding\":null");
+                        }
                         sb.append("}");
                     }
                     sb.append("]}");

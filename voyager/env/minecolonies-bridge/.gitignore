@@ -31,3 +31,4 @@ taper_state.json
 *.log
 personas.json
 persona_daemon.pid
+social_state.json
