@@ -780,6 +780,13 @@ public class VoyagerBridge {
                           // Saturation (0-20). Citizens stop working to hunt for food
                           // when this runs low, so supply agents feed them proactively.
                           .append("\"saturation\":").append(String.format(java.util.Locale.ROOT, "%.1f", cit.getSaturation())).append(",");
+                        // Happiness (roughly 0-10) is the fitness signal for the
+                        // persona heredity daemon; guard against handler quirks so
+                        // /status never breaks over an optional field.
+                        try {
+                            double happiness = cit.getCitizenHappinessHandler().getHappiness(c, cit);
+                            sb.append("\"happiness\":").append(String.format(java.util.Locale.ROOT, "%.2f", happiness)).append(",");
+                        } catch (Exception ignored) {}
                         // Disease info so supply agents can deliver cure items. A sick
                         // citizen's EntityAISickTask self-cures (APPLY_CURE) once every
                         // cure item is present in the citizen's own inventory - the same
