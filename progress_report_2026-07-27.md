@@ -137,3 +137,4 @@ P1は比較的固定な個体差として維持し、後続を以下へ再編し
 | `35ee929` | happinessライブ統合、段階ロードマップ、配備手順更新 |
 | `5a9ca00` | Phase 1関係グラフ、homeBuilding、週次報告運用 |
 | `881f53c` | Phase 1定期observer、構造差分JSONL |
+| `772762d` | Phase 2動的状態、転職イベントreducer、永続化テスト |
