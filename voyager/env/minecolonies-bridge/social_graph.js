@@ -166,6 +166,72 @@ function saveGraph(graph, file) {
   fs.renameSync(tmp, target);
 }
 
+function loadGraph(file) {
+  const target = file || SOCIAL_STATE_FILE;
+  if (!fs.existsSync(target)) return null;
+  return JSON.parse(fs.readFileSync(target, "utf8"));
+}
+
+// Structural changes between two complete graph snapshots. Events contain no
+// wall-clock timestamp so fixtures remain deterministic; the observer adds it.
+function diffGraphs(previous, next) {
+  if (!previous) return [];
+  const events = [];
+  const oldNodes = previous.nodes || {};
+  const newNodes = next.nodes || {};
+  const oldEdges = previous.edges || {};
+  const newEdges = next.edges || {};
+
+  for (const id of Object.keys(newNodes).sort((a, b) => Number(a) - Number(b))) {
+    if (!oldNodes[id]) {
+      events.push({ type: "citizen_added", citizenId: Number(id), name: newNodes[id].name });
+      continue;
+    }
+    const before = oldNodes[id];
+    const after = newNodes[id];
+    if (before.job !== after.job) {
+      events.push({ type: "job_changed", citizenId: Number(id), from: before.job, to: after.job });
+    }
+    const beforeHome = buildingKey(before.homeBuilding);
+    const afterHome = buildingKey(after.homeBuilding);
+    if (beforeHome !== afterHome) {
+      events.push({ type: "home_changed", citizenId: Number(id), from: beforeHome, to: afterHome });
+    }
+    const beforeWork = buildingKey(before.workBuilding);
+    const afterWork = buildingKey(after.workBuilding);
+    if (beforeWork !== afterWork) {
+      events.push({ type: "work_changed", citizenId: Number(id), from: beforeWork, to: afterWork });
+    }
+  }
+  for (const id of Object.keys(oldNodes).sort((a, b) => Number(a) - Number(b))) {
+    if (!newNodes[id]) {
+      events.push({ type: "citizen_removed", citizenId: Number(id), name: oldNodes[id].name });
+    }
+  }
+  for (const key of Object.keys(newEdges).sort()) {
+    if (!oldEdges[key]) {
+      events.push({
+        type: "edge_added", edge: key, a: newEdges[key].a, b: newEdges[key].b,
+        sources: newEdges[key].sources,
+      });
+    } else if (JSON.stringify(oldEdges[key].sources) !== JSON.stringify(newEdges[key].sources)) {
+      events.push({
+        type: "edge_sources_changed", edge: key,
+        from: oldEdges[key].sources, to: newEdges[key].sources,
+      });
+    }
+  }
+  for (const key of Object.keys(oldEdges).sort()) {
+    if (!newEdges[key]) {
+      events.push({
+        type: "edge_removed", edge: key, a: oldEdges[key].a, b: oldEdges[key].b,
+        sources: oldEdges[key].sources,
+      });
+    }
+  }
+  return events;
+}
+
 async function fetchColony() {
   const res = await fetch(`${BRIDGE}/status`);
   if (!res.ok) throw new Error(`/status HTTP ${res.status}`);
@@ -188,6 +254,9 @@ module.exports = {
   edgeKey,
   buildSocialGraph,
   saveGraph,
+  loadGraph,
+  diffGraphs,
+  fetchColony,
 };
 
 if (require.main === module) {

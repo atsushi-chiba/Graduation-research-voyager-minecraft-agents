@@ -32,3 +32,5 @@ taper_state.json
 personas.json
 persona_daemon.pid
 social_state.json
+social_graph_events.jsonl
+social_observer.pid

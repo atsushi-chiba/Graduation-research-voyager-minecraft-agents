@@ -4,6 +4,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const S = require("./social_graph.js");
+const O = require("./social_observer.js");
 
 function citizen(id, name, extra) {
   return {
@@ -102,6 +103,53 @@ test("output and atomic save are deterministic", () => {
   S.saveGraph(a, file);
   assert.ok(!fs.existsSync(`${file}.tmp`));
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, "utf8")), a);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("diffGraphs reports citizen, assignment and structural edge changes", () => {
+  const oldGraph = S.buildSocialGraph(colony([
+    citizen(1, "A", {
+      job: "farmer",
+      homeBuilding: building(0, 0),
+      workBuilding: building(10, 10),
+      partner: 2,
+    }),
+    citizen(2, "B", { homeBuilding: building(0, 0), partner: 1 }),
+  ]));
+  const newGraph = S.buildSocialGraph(colony([
+    citizen(1, "A", {
+      job: "builder",
+      homeBuilding: building(100, 100),
+      workBuilding: building(20, 20),
+    }),
+    citizen(3, "C", { homeBuilding: building(100, 100) }),
+  ]));
+  const types = S.diffGraphs(oldGraph, newGraph).map((e) => e.type);
+  for (const expected of [
+    "citizen_added", "citizen_removed", "job_changed", "home_changed",
+    "work_changed", "edge_added", "edge_removed",
+  ]) {
+    assert.ok(types.includes(expected), `missing ${expected}: ${types.join(",")}`);
+  }
+  assert.deepStrictEqual(S.diffGraphs(newGraph, newGraph), []);
+});
+
+test("observer reconcile and JSONL append are deterministic and replayable", () => {
+  const first = O.reconcile(null, colony([citizen(1, "A")]));
+  assert.deepStrictEqual(first.events, [], "initial baseline must not invent changes");
+  const second = O.reconcile(first.graph, colony([
+    citizen(1, "A", { job: "builder" }),
+    citizen(2, "B"),
+  ]));
+  assert.ok(second.events.some((e) => e.type === "citizen_added" && e.citizenId === 2));
+  assert.ok(second.events.some((e) => e.type === "job_changed" && e.citizenId === 1));
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "social-event-test-"));
+  const file = path.join(dir, "events.jsonl");
+  const record = O.appendEvent(
+    second.events[0], file, "2026-07-24T00:00:00.000Z", 999
+  );
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, "utf8").trim()), record);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
