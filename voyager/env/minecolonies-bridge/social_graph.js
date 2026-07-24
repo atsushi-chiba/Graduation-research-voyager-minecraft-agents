@@ -35,6 +35,13 @@ function edgeKey(a, b) {
   return a < b ? `${a}:${b}` : `${b}:${a}`;
 }
 
+function nutritionBand(saturation) {
+  if (typeof saturation !== "number") return "unknown";
+  if (saturation <= 2.5) return "starving";
+  if (saturation <= 6) return "hungry";
+  return "fed";
+}
+
 function pairwise(ids, fn) {
   const unique = [...new Set(ids)].sort((a, b) => a - b);
   for (let i = 0; i < unique.length; i++) {
@@ -143,6 +150,9 @@ function buildSocialGraph(colony, opts) {
       name: c.name,
       isChild: !!c.isChild,
       job: c.job || null,
+      nutritionBand: nutritionBand(c.saturation),
+      sick: !!c.sick,
+      disease: c.disease || null,
       homeBuilding: c.homeBuilding || null,
       workBuilding: c.workBuilding || null,
     }])),
@@ -191,6 +201,25 @@ function diffGraphs(previous, next) {
     const after = newNodes[id];
     if (before.job !== after.job) {
       events.push({ type: "job_changed", citizenId: Number(id), from: before.job, to: after.job });
+    }
+    // Missing fields mean an older persisted graph is being migrated. Save the
+    // new baseline without emitting one fake health event per citizen.
+    if (before.nutritionBand != null && before.nutritionBand !== after.nutritionBand) {
+      events.push({
+        type: "nutrition_changed", citizenId: Number(id),
+        from: before.nutritionBand, to: after.nutritionBand,
+      });
+    }
+    if (before.sick != null && before.sick !== after.sick) {
+      events.push({
+        type: after.sick ? "sickness_started" : "recovered",
+        citizenId: Number(id), disease: after.sick ? after.disease : before.disease,
+      });
+    } else if (before.sick && after.sick && before.disease !== after.disease) {
+      events.push({
+        type: "disease_changed", citizenId: Number(id),
+        from: before.disease, to: after.disease,
+      });
     }
     const beforeHome = buildingKey(before.homeBuilding);
     const afterHome = buildingKey(after.homeBuilding);
@@ -252,6 +281,7 @@ module.exports = {
   SOURCE_FAMILIARITY,
   buildingKey,
   edgeKey,
+  nutritionBand,
   buildSocialGraph,
   saveGraph,
   loadGraph,

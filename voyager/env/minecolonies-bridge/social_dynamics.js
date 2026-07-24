@@ -52,11 +52,17 @@ function ensureCitizen(state, node, personas) {
       stress: 0,
       satisfaction: 0.5,
       actualLoyalty: initialLoyalty(personaFor(personas, node.citizenId)),
+      nutritionBand: node.nutritionBand || "unknown",
+      sick: !!node.sick,
+      disease: node.disease || null,
       lastEventGameTime: null,
     };
   } else {
     state.citizens[key].name = node.name;
     state.citizens[key].active = true;
+    state.citizens[key].nutritionBand = node.nutritionBand || "unknown";
+    state.citizens[key].sick = !!node.sick;
+    state.citizens[key].disease = node.disease || null;
   }
   return state.citizens[key];
 }
@@ -120,6 +126,10 @@ function jobPreferenceEffect(persona, job) {
   return { satisfaction: 0, loyalty: 0, preference: "neutral" };
 }
 
+function nutritionSeverity(band) {
+  return band === "starving" ? 2 : band === "hungry" ? 1 : 0;
+}
+
 // Apply one observer event deterministically. Missing from one graph poll is
 // inactivity, not death; P1 retains its separate three-poll confirmation.
 function applyEvent(state, event, personas, gameTime) {
@@ -138,6 +148,35 @@ function applyEvent(state, event, personas, gameTime) {
     effect.preference = delta.preference;
     effect.satisfactionDelta = delta.satisfaction;
     effect.loyaltyDelta = delta.loyalty;
+  } else if (event.type === "nutrition_changed" && citizen) {
+    const severityDelta = nutritionSeverity(event.to) - nutritionSeverity(event.from);
+    const stressDelta = 0.1 * severityDelta;
+    const satisfactionDelta = -0.05 * severityDelta;
+    citizen.stress = round3(citizen.stress + stressDelta);
+    citizen.satisfaction = round3(citizen.satisfaction + satisfactionDelta);
+    citizen.nutritionBand = event.to;
+    citizen.lastEventGameTime = gameTime == null ? null : gameTime;
+    effect.stressDelta = stressDelta;
+    effect.satisfactionDelta = satisfactionDelta;
+  } else if (event.type === "sickness_started" && citizen) {
+    citizen.stress = round3(citizen.stress + 0.15);
+    citizen.satisfaction = round3(citizen.satisfaction - 0.1);
+    citizen.sick = true;
+    citizen.disease = event.disease || null;
+    citizen.lastEventGameTime = gameTime == null ? null : gameTime;
+    effect.stressDelta = 0.15;
+    effect.satisfactionDelta = -0.1;
+  } else if (event.type === "recovered" && citizen) {
+    citizen.stress = round3(citizen.stress - 0.1);
+    citizen.satisfaction = round3(citizen.satisfaction + 0.05);
+    citizen.sick = false;
+    citizen.disease = null;
+    citizen.lastEventGameTime = gameTime == null ? null : gameTime;
+    effect.stressDelta = -0.1;
+    effect.satisfactionDelta = 0.05;
+  } else if (event.type === "disease_changed" && citizen) {
+    citizen.disease = event.to || null;
+    citizen.lastEventGameTime = gameTime == null ? null : gameTime;
   } else if (event.type === "edge_added") {
     ensureRelation(state, event);
   } else if (event.type === "edge_removed") {
@@ -170,6 +209,7 @@ module.exports = {
   initialLoyalty,
   reconcileState,
   jobPreferenceEffect,
+  nutritionSeverity,
   applyEvent,
   loadState,
   saveState,

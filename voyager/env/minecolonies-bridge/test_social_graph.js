@@ -11,6 +11,9 @@ function citizen(id, name, extra) {
     id,
     name,
     job: "unemployed",
+    saturation: 10,
+    sick: false,
+    disease: null,
     isChild: false,
     parents: [],
     children: [],
@@ -132,6 +135,28 @@ test("diffGraphs reports citizen, assignment and structural edge changes", () =>
     assert.ok(types.includes(expected), `missing ${expected}: ${types.join(",")}`);
   }
   assert.deepStrictEqual(S.diffGraphs(newGraph, newGraph), []);
+});
+
+test("health diffs use nutrition bands and ignore raw saturation noise", () => {
+  const oldGraph = S.buildSocialGraph(colony([
+    citizen(1, "A", { saturation: 5.5, sick: false }),
+    citizen(2, "B", { saturation: 10, sick: true, disease: "flu" }),
+  ]));
+  const sameBands = S.buildSocialGraph(colony([
+    citizen(1, "A", { saturation: 4.5, sick: false }),
+    citizen(2, "B", { saturation: 9, sick: true, disease: "flu" }),
+  ]));
+  assert.deepStrictEqual(S.diffGraphs(oldGraph, sameBands), []);
+
+  const changed = S.buildSocialGraph(colony([
+    citizen(1, "A", { saturation: 2, sick: true, disease: "measles" }),
+    citizen(2, "B", { saturation: 9, sick: false }),
+  ]));
+  const events = S.diffGraphs(oldGraph, changed);
+  assert.ok(events.some((e) => e.type === "nutrition_changed" &&
+    e.citizenId === 1 && e.from === "hungry" && e.to === "starving"));
+  assert.ok(events.some((e) => e.type === "sickness_started" && e.citizenId === 1));
+  assert.ok(events.some((e) => e.type === "recovered" && e.citizenId === 2));
 });
 
 test("observer reconcile and JSONL append are deterministic and replayable", () => {

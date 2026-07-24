@@ -45,6 +45,9 @@ test("initial state uses persona loyalty and neutral dynamic values", () => {
     stress: 0,
     satisfaction: 0.5,
     actualLoyalty: 0.8,
+    nutritionBand: "unknown",
+    sick: false,
+    disease: null,
     lastEventGameTime: null,
   });
 });
@@ -89,6 +92,38 @@ test("citizen removal is inactivity, not an unconfirmed death", () => {
   D.applyEvent(state, { type: "citizen_removed", citizenId: 1 }, null, 123);
   assert.strictEqual(state.citizens["1"].active, false);
   assert.ok(!Object.hasOwn(state.citizens["1"], "deceased"));
+});
+
+test("nutrition band transitions update stress without per-poll noise", () => {
+  const state = D.reconcileState(null, graph([{ citizenId: 1, name: "A" }]), null);
+  const worse = D.applyEvent(
+    state, { type: "nutrition_changed", citizenId: 1, from: "fed", to: "starving" },
+    null, 100
+  );
+  assert.strictEqual(worse.stressDelta, 0.2);
+  assert.strictEqual(state.citizens["1"].stress, 0.2);
+  assert.strictEqual(state.citizens["1"].satisfaction, 0.4);
+  const better = D.applyEvent(
+    state, { type: "nutrition_changed", citizenId: 1, from: "starving", to: "fed" },
+    null, 200
+  );
+  assert.strictEqual(better.stressDelta, -0.2);
+  assert.strictEqual(state.citizens["1"].stress, 0);
+  assert.strictEqual(state.citizens["1"].satisfaction, 0.5);
+});
+
+test("sickness and recovery update state with bounded partial recovery", () => {
+  const state = D.reconcileState(null, graph([{ citizenId: 1, name: "A" }]), null);
+  D.applyEvent(
+    state, { type: "sickness_started", citizenId: 1, disease: "flu" }, null, 100
+  );
+  assert.strictEqual(state.citizens["1"].stress, 0.15);
+  assert.strictEqual(state.citizens["1"].satisfaction, 0.4);
+  assert.strictEqual(state.citizens["1"].disease, "flu");
+  D.applyEvent(state, { type: "recovered", citizenId: 1, disease: "flu" }, null, 200);
+  assert.strictEqual(state.citizens["1"].stress, 0.05);
+  assert.strictEqual(state.citizens["1"].satisfaction, 0.45);
+  assert.strictEqual(state.citizens["1"].sick, false);
 });
 
 test("atomic save/load round trip", () => {
