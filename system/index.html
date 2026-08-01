@@ -447,14 +447,32 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#3-llm-counciljs-supply_botjs" class="md-nav__link">
+  <a href="#3" class="md-nav__link">
     <span class="md-ellipsis">
-      3. LLM 市長 (council.js) と供給デーモン (supply_bot.js)
+      3. 外部エージェント層
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="3. LLM 市長 (council.js) と供給デーモン (supply_bot.js)">
+    <nav class="md-nav" aria-label="3. 外部エージェント層">
       <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#_10" class="md-nav__link">
+    <span class="md-ellipsis">
+      社会シミュレーション層
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#llm-counciljs-supply_botjs" class="md-nav__link">
+    <span class="md-ellipsis">
+      LLM 市長 (council.js) と供給デーモン (supply_bot.js)
+    </span>
+  </a>
+  
+</li>
         
           <li class="md-nav__item">
   <a href="#counciljs-llm" class="md-nav__link">
@@ -498,7 +516,7 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#_10" class="md-nav__link">
+  <a href="#_11" class="md-nav__link">
     <span class="md-ellipsis">
       ソースの在処 (要点)
     </span>
@@ -663,14 +681,32 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#3-llm-counciljs-supply_botjs" class="md-nav__link">
+  <a href="#3" class="md-nav__link">
     <span class="md-ellipsis">
-      3. LLM 市長 (council.js) と供給デーモン (supply_bot.js)
+      3. 外部エージェント層
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="3. LLM 市長 (council.js) と供給デーモン (supply_bot.js)">
+    <nav class="md-nav" aria-label="3. 外部エージェント層">
       <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#_10" class="md-nav__link">
+    <span class="md-ellipsis">
+      社会シミュレーション層
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#llm-counciljs-supply_botjs" class="md-nav__link">
+    <span class="md-ellipsis">
+      LLM 市長 (council.js) と供給デーモン (supply_bot.js)
+    </span>
+  </a>
+  
+</li>
         
           <li class="md-nav__item">
   <a href="#counciljs-llm" class="md-nav__link">
@@ -714,7 +750,7 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#_10" class="md-nav__link">
+  <a href="#_11" class="md-nav__link">
     <span class="md-ellipsis">
       ソースの在処 (要点)
     </span>
@@ -828,6 +864,14 @@
 <td>全コロニーの建物・市民・在庫を JSON で返却</td>
 </tr>
 <tr>
+<td><code>/citizenInventory</code></td>
+<td>指定市民が実際に所持するアイテムと個数を集計</td>
+</tr>
+<tr>
+<td><code>/transferCitizenItem</code></td>
+<td>距離・在庫・受取容量を検証し、市民間で既存アイテムを移転</td>
+</tr>
+<tr>
 <td><code>/place</code></td>
 <td>指定座標に小屋ブロックを設置 (既存建物との衝突を事前チェック)</td>
 </tr>
@@ -865,6 +909,7 @@
 </tr>
 </tbody>
 </table>
+<p><code>/status</code>の市民情報には、社会行動の身体性を検証するためライブ位置も含まれます。</p>
 <p>エンドポイント全体像は <code>IMPLEMENTATION_NOTES.md</code> またはメモリ <code>minecolonies-bridge-api</code> を参照してください。</p>
 <h3 id="_9">特殊対応<a class="headerlink" href="#_9" title="Permanent link">&para;</a></h3>
 <p>MineColonies 本体のバグや癖に対して、bridge 側で以下のような補正を入れています。</p>
@@ -875,7 +920,19 @@
 <li>適応 tickrate ガバナー — サーバー負荷 (mspt) を測定して自動で tick 倍率を調整</li>
 </ul>
 <hr />
-<h2 id="3-llm-counciljs-supply_botjs">3. LLM 市長 (council.js) と供給デーモン (supply_bot.js)<a class="headerlink" href="#3-llm-counciljs-supply_botjs" title="Permanent link">&para;</a></h2>
+<h2 id="3">3. 外部エージェント層<a class="headerlink" href="#3" title="Permanent link">&para;</a></h2>
+<h3 id="_10">社会シミュレーション層<a class="headerlink" href="#_10" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>persona_daemon.js</code>: 安定した個体IDにP1ペルソナと家系を対応させる</li>
+<li><code>social_observer.js</code>: 同居・親子・職場などの関係グラフと、感情・信頼・義理の動的状態を更新する</li>
+<li><code>social_help_daemon.js</code>: 困窮を検出し、関係者から援助者を選び、appraisalの判断根拠を保存する。実行時は
+  援助者を相手まで歩かせ、所持している食料だけを移転する</li>
+<li><code>social_action_queue.js</code>: 行動結果をappend-onlyで受け渡し、observerがoffsetにより一度だけ関係へ反映する</li>
+</ul>
+<p>関係は対称な辺だけでなく、AからBへのtrust/affinity/obligationとBからAへの値を別々に持ちます。
+これにより、援助を受けた側だけが強い信頼や返礼義務を持つ状態を表現できます。現在、援助daemonは
+限定試験のみで、連続自動実行は係数較正前のため停止しています。</p>
+<h3 id="llm-counciljs-supply_botjs">LLM 市長 (council.js) と供給デーモン (supply_bot.js)<a class="headerlink" href="#llm-counciljs-supply_botjs" title="Permanent link">&para;</a></h3>
 <p>サーバー外部で常駐する 2 つの Node.js プロセスが実際の "統治" を担います。</p>
 <h3 id="counciljs-llm">council.js — LLM 市長<a class="headerlink" href="#counciljs-llm" title="Permanent link">&para;</a></h3>
 <ul>
@@ -907,7 +964,7 @@
 4. supply_bot.js が /openRequests を巡回 → 不足資材を /giveToCitizen で補充
    (生産経路が稼働していれば、そのアイテムはスキップ = テーパー)
 5. サーバー tick が進み、次サイクルへ</code></p>
-<h2 id="_10">ソースの在処 (要点)<a class="headerlink" href="#_10" title="Permanent link">&para;</a></h2>
+<h2 id="_11">ソースの在処 (要点)<a class="headerlink" href="#_11" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
 <tr>
