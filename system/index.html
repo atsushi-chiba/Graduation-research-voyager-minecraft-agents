@@ -928,10 +928,14 @@
 <li><code>social_help_daemon.js</code>: 困窮を検出し、関係者から援助者を選び、appraisalの判断根拠を保存する。実行時は
   援助者を相手まで歩かせ、所持している食料だけを移転する</li>
 <li><code>social_action_queue.js</code>: 行動結果をappend-onlyで受け渡し、observerがoffsetにより一度だけ関係へ反映する</li>
+<li><code>social_experiment.js</code>: 同じ市民ペアを全員同一／ペルソナ／関係／時間的記憶の4条件で比較する</li>
+<li><code>social_information.js</code>: 脅威警報を社会グラフ上で局所伝播し、受容・再伝達・経路を記録する</li>
+<li><code>social_information_daemon.js</code>: <code>/threats</code>を読むshadow層。現段階では移動・戦闘命令を出さない</li>
 </ul>
 <p>関係は対称な辺だけでなく、AからBへのtrust/affinity/obligationとBからAへの値を別々に持ちます。
 これにより、援助を受けた側だけが強い信頼や返礼義務を持つ状態を表現できます。現在、援助daemonは
-限定試験のみで、連続自動実行は係数較正前のため停止しています。</p>
+限定試験のみで、連続自動実行は係数較正前のため停止しています。Phase 3.5以降は相手別のgratitude、
+resentment、援助・拒否履歴も保持し、感情はgameTimeに基づいて減衰、恩義は返礼行動で消費します。</p>
 <h3 id="llm-counciljs-supply_botjs">LLM 市長 (council.js) と供給デーモン (supply_bot.js)<a class="headerlink" href="#llm-counciljs-supply_botjs" title="Permanent link">&para;</a></h3>
 <p>サーバー外部で常駐する 2 つの Node.js プロセスが実際の "統治" を担います。</p>
 <h3 id="counciljs-llm">council.js — LLM 市長<a class="headerlink" href="#counciljs-llm" title="Permanent link">&para;</a></h3>
